@@ -182,7 +182,6 @@ export class Relay extends TypedEmitter<RelayEvents> {
   private streamInfo?: StreamInfo;
   private startPromise?: Promise<void>;
   private pullAbort?: AbortController;
-  private pumpPromise?: Promise<void>;
   private idleTimer?: ReturnType<typeof setTimeout>;
 
   /**
@@ -407,9 +406,6 @@ export class Relay extends TypedEmitter<RelayEvents> {
     this.state = 'stopping';
 
     this.pullAbort?.abort();
-    // Let the pump loop unwind before closing the source: closing the underlying
-    // demuxer while it is still being iterated can crash the native layer.
-    await this.settlePump();
     await Promise.all([...this.channels].map((c) => c.close()));
 
     try {
@@ -421,31 +417,8 @@ export class Relay extends TypedEmitter<RelayEvents> {
     this.streamInfo = undefined;
     this.videoIndexes.clear();
     this.startPromise = undefined;
-    this.pumpPromise = undefined;
     this.state = 'idle';
     this.emit('stop');
-  }
-
-  /**
-   * Wait for the pump loop to finish after an abort, bounded by a timeout.
-   *
-   * The pump only breaks once the source yields (or its read unblocks), so a
-   * stalled upstream could otherwise hold teardown open indefinitely; the timeout
-   * caps that wait and lets teardown proceed.
-   *
-   * @returns A promise that resolves when the pump settles or the timeout elapses
-   *
-   * @internal
-   */
-  private async settlePump(): Promise<void> {
-    if (!this.pumpPromise) return;
-    let timer: ReturnType<typeof setTimeout>;
-    const guard = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, 2_000);
-      timer.unref?.();
-    });
-    await Promise.race([this.pumpPromise.catch(() => undefined), guard]);
-    clearTimeout(timer!);
   }
 
   /**
@@ -517,7 +490,6 @@ export class Relay extends TypedEmitter<RelayEvents> {
     this.streamInfo = undefined;
     this.videoIndexes.clear();
     this.startPromise = undefined;
-    this.pumpPromise = undefined;
     this.state = 'idle';
     this.emit('stop');
   }
@@ -557,7 +529,7 @@ export class Relay extends TypedEmitter<RelayEvents> {
       );
       this.state = 'running';
       this.emit('start', info);
-      this.pumpPromise = this.pumpLoop();
+      void this.pumpLoop();
     } catch (error) {
       this.startPromise = undefined;
       this.state = 'idle';
