@@ -89,7 +89,14 @@ jobs:
           if [ -n "$PREV_TAG" ]; then
             echo "### Changes since $PREV_TAG" >> release_notes.md
             echo "" >> release_notes.md
-            git log --pretty=format:"- %s (%h)" "${PREV_TAG}..${VERSION}" >> release_notes.md
+            # Prefer the GitHub API so each commit is credited to its @user; fall back to git log.
+            CHANGES=$(gh api --paginate "repos/${{ github.repository }}/compare/${PREV_TAG}...${VERSION}" \
+              --jq '.commits[] | "- \(.commit.message | split("\n")[0]) (\(.sha[:7])) - \(if .author then "@\(.author.login)" else (.commit.author.name | if test("^[A-Za-z0-9-]+$") then "@\(.)" else . end) end)"' 2>/dev/null | tac)
+            if [ -n "$CHANGES" ]; then
+              echo "$CHANGES" >> release_notes.md
+            else
+              git log --pretty=format:"- %s (%h) - %an" "${PREV_TAG}..${VERSION}" >> release_notes.md
+            fi
             echo "" >> release_notes.md
           fi
 
