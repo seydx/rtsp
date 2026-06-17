@@ -47,7 +47,7 @@
     "node-av": "^6.0.0"
   },
   "devDependencies": {
-    "@eslint/js": "^9.39.2",
+    "@eslint/js": "^10.0.1",
     "@stylistic/eslint-plugin": "^5.10.0",
     "@types/node": "25.9.3",
     "@typescript-eslint/parser": "^8.61.0",
