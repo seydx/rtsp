@@ -1,6 +1,6 @@
 {
   "name": "@seydx/rtsp",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "RTSP media relay that fans out a single upstream source to many consumers (RTSP server, FFmpeg, raw callbacks) with two-way audio support",
   "author": "seydx (https://github.com/seydx/rtsp)",
   "type": "module",
