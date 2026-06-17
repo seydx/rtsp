@@ -32,10 +32,10 @@ All codec and protocol heavy-lifting is delegated to [`node-av`](https://github.
 ## Installation
 
 ```bash
-npm install @seydx/rtsp
+npm install @seydx/rtsp node-av
 ```
 
-`node-av` is pulled in automatically and ships the prebuilt FFmpeg binaries, so no separate FFmpeg install is needed. Requires Node.js 22+.
+_It ships the prebuilt FFmpeg binaries, so no separate FFmpeg install is needed._
 
 ## Quick Start
 
