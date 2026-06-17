@@ -3,8 +3,10 @@ import { Demuxer } from 'node-av';
 import { wrapAvPacket } from '../av-packet.js';
 import { toTrackInfo } from './stream-info.js';
 
-import type { Logger, MediaPacket, Source, StreamInfo, TrackInfo } from '../types.js';
 import type { Readable } from 'node:stream';
+import type { Logger, MediaPacket, Source, StreamInfo, TrackInfo } from '../types.js';
+
+const RAW_ES_PROBE = { analyzeduration: '500000', probesize: '65536' } as const;
 
 /**
  * Configuration for a single input of a {@link MultiSource}.
@@ -123,13 +125,30 @@ export class MultiSource implements Source {
    * ```
    */
   async open(): Promise<StreamInfo> {
+    // Open every input concurrently so probe latency overlaps instead of summing.
+    // For multiple realtime raw streams (e.g. separate video + audio), sequential
+    // opening would add each input's find_stream_info wall-clock wait in series.
+    const results = await Promise.allSettled(
+      this.inputs.map((input) =>
+        Demuxer.open(input.input as never, {
+          format: input.format as never,
+          // Explicit-format inputs get fast-probe defaults, overridable per input.
+          options: { ...(input.format ? RAW_ES_PROBE : undefined), ...input.options } as never,
+        }),
+      ),
+    );
+
+    const demuxers = results.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+    const failed = results.find((r) => r.status === 'rejected');
+    if (failed) {
+      // Don't leak the inputs that did open before one failed.
+      await Promise.all(demuxers.map((d) => d.close().catch(() => undefined)));
+      throw failed.reason;
+    }
+
     const tracks: TrackInfo[] = [];
     let offset = 0;
-    for (const input of this.inputs) {
-      const demuxer = await Demuxer.open(input.input as never, {
-        format: input.format as never,
-        options: input.options as never,
-      });
+    for (const demuxer of demuxers) {
       this.opened.push({ demuxer, offset });
       for (const stream of demuxer.streams) tracks.push(toTrackInfo(stream, offset + stream.index));
       offset += demuxer.streams.length;
