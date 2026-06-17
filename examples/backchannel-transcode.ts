@@ -43,5 +43,5 @@ server.on('viewer:removed', (count) => console.log(`viewer left (${count} active
 // and the upstream camera connection.
 process.on('SIGINT', () => {
   console.log('\nShutting down...');
-  void relay.stop().then(() => process.exit(0));
+  relay.stop().then(() => process.exit(0));
 });

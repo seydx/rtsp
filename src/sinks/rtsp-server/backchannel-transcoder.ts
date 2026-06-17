@@ -260,7 +260,7 @@ export class BackchannelTranscoder {
     this.active = true;
 
     // Drive the pipeline in the background; it runs until close() flips active off.
-    void this.process();
+    this.process();
   }
 
   /**

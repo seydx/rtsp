@@ -2,10 +2,10 @@ import { randomBytes } from 'node:crypto';
 
 import { buildResponse, RtspParser } from './protocol.js';
 
+import type { Socket } from 'node:net';
+import type { Logger, TrackKind } from '../../types.js';
 import type { RtspAuth } from './auth.js';
 import type { RtspRequest } from './protocol.js';
-import type { Logger, TrackKind } from '../../types.js';
-import type { Socket } from 'node:net';
 
 /**
  * Server-side hooks a session relies on from its owning server.
@@ -252,7 +252,7 @@ export class RtspSession {
     }
     for (const message of messages) {
       if (message.type === 'request') {
-        void this.handle(message.request);
+        this.handle(message.request);
       } else if (message.frame.channel === this.backchannelChannel) {
         // Talkback RTP from the client → forward upstream.
         this.host.onBackchannelRtp(message.frame.data);

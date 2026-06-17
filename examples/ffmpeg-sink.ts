@@ -18,8 +18,8 @@
  */
 
 import { Relay } from '../src/index.js';
-import { AvSource } from '../src/sources/index.js';
 import { FfmpegSink } from '../src/sinks/index.js';
+import { AvSource } from '../src/sources/index.js';
 
 const url = process.argv[2] ?? 'rtsp://localhost:8554/stream';
 const output = process.argv[3] ?? 'out.ts';
@@ -41,7 +41,7 @@ relay.on('error', (error) => console.error('Relay error:', error));
 // SIGINT must await stop() so the muxer writes its trailer and the file stays playable.
 process.on('SIGINT', () => {
   console.log('\nStopping...');
-  void relay.stop().then(() => process.exit(0));
+  relay.stop().then(() => process.exit(0));
 });
 
 await relay.start();

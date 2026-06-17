@@ -31,5 +31,5 @@ console.log('RTSP relay ready at', server.url);
 
 // Tear the relay (and its server sink) down cleanly on Ctrl+C.
 process.on('SIGINT', () => {
-  void relay.stop().then(() => process.exit(0));
+  relay.stop().then(() => process.exit(0));
 });

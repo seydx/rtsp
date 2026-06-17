@@ -12,8 +12,8 @@
  */
 
 import { Relay } from '../src/index.js';
-import { AvSource } from '../src/sources/index.js';
 import { CallbackSink } from '../src/sinks/index.js';
+import { AvSource } from '../src/sources/index.js';
 
 import type { MediaPacket, StreamInfo } from '../src/types.js';
 
@@ -49,5 +49,5 @@ console.log(`relaying ${url} — press Ctrl+C to stop`);
 
 // Graceful shutdown: tear down sinks and close the upstream connection on Ctrl+C.
 process.on('SIGINT', () => {
-  void relay.stop().then(() => process.exit(0));
+  relay.stop().then(() => process.exit(0));
 });

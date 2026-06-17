@@ -1,15 +1,15 @@
-import { createServer } from 'node:net';
 import { Muxer, StreamingUtils } from 'node-av';
+import { createServer } from 'node:net';
 
-import { RtspSession } from './session.js';
 import { TypedEmitter } from '../../util/emitter.js';
+import { RtspSession } from './session.js';
 
 import type { Packet, Stream } from 'node-av';
 import type { Server } from 'node:net';
-import type { RtspAuth } from './auth.js';
-import type { RtspSessionHost } from './session.js';
 import type { Relay } from '../../relay.js';
 import type { Logger, MediaPacket, Sink, StreamInfo, TrackKind } from '../../types.js';
+import type { RtspAuth } from './auth.js';
+import type { RtspSessionHost } from './session.js';
 
 /**
  * Configuration for an {@link RtspServerSink}.
@@ -508,7 +508,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     }
     if (this.sessions.size === 0 && this.piped) {
       // No clients left — let the relay (and thus the upstream) go idle.
-      void this.relay.unpipe(this);
+      this.relay.unpipe(this);
     }
   }
 

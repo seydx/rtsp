@@ -43,5 +43,5 @@ relay.on('start', (info) => {
 
 // Drain and stop the relay (and every input demuxer) on Ctrl+C so the process exits cleanly.
 process.on('SIGINT', () => {
-  void relay.stop().then(() => process.exit(0));
+  relay.stop().then(() => process.exit(0));
 });

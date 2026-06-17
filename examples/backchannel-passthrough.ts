@@ -39,5 +39,5 @@ if (!source.backchannel) {
 
 // Tear the relay (and its server sink) down cleanly on Ctrl+C.
 process.on('SIGINT', () => {
-  void relay.stop().then(() => process.exit(0));
+  relay.stop().then(() => process.exit(0));
 });

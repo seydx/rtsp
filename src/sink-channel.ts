@@ -145,7 +145,7 @@ export class SinkChannel {
     }
 
     this.queue.push(packet);
-    void this.drain();
+    this.drain();
   }
 
   /**
@@ -276,7 +276,7 @@ export class SinkChannel {
         } catch (error) {
           this.options.logger?.error?.('[rtsp] sink write failed — closing channel:', error);
           packet.free();
-          void this.close();
+          this.close();
           return;
         }
         packet.free();
