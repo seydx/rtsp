@@ -1,4 +1,4 @@
-import { Muxer, StreamingUtils } from 'node-av';
+import { AV_PKT_DATA_NEW_EXTRADATA, BitStreamFilterAPI, Muxer, StreamingUtils } from 'node-av';
 import { createServer } from 'node:net';
 
 import { TypedEmitter } from '../../util/emitter.js';
@@ -6,7 +6,7 @@ import { RtspSession } from './session.js';
 
 import type { Server } from 'node:net';
 import type { Relay } from '../../relay.js';
-import type { Logger, MediaPacket, Sink, StreamInfo, TrackKind } from '../../types.js';
+import type { Logger, MediaPacket, Sink, StreamInfo, TrackInfo, TrackKind } from '../../types.js';
 import type { RtspAuth } from './auth.js';
 import type { RtspSessionHost } from './session.js';
 
@@ -134,6 +134,8 @@ interface TrackMuxer {
   sourceIndex: number;
   sdpStreamId: number;
   kind: TrackKind;
+  bsf?: BitStreamFilterAPI;
+  extradataInjected?: boolean;
 }
 
 /**
@@ -205,6 +207,33 @@ function rtpmapName(codec: string): string {
     default:
       return codec.toUpperCase();
   }
+}
+
+/**
+ * Pick the bitstream filter a track needs to be muxable into RTP, if any.
+ *
+ * Raw elementary streams that carry their codec configuration in-band rather than
+ * as global headers must be adapted before the RTP muxer can emit a header and
+ * SDP. The canonical case is ADTS AAC (every frame self-describes, no extradata):
+ * the RTP muxer rejects it with "AAC with no global headers", which fails SDP
+ * generation. `aac_adtstoasc` strips the ADTS headers and emits the
+ * AudioSpecificConfig as `AV_PKT_DATA_NEW_EXTRADATA` packet side data, which is
+ * lifted onto the output stream in {@link RtspServerSink.writeFiltered}.
+ * H.264/HEVC in Annex B need no filter — the RTP muxer reads their in-band
+ * SPS/PPS directly.
+ *
+ * @param track - The upstream track to inspect.
+ *
+ * @returns The bitstream filter name to apply, or `null` to mux as-is.
+ *
+ * @internal
+ */
+function bsfForTrack(track: TrackInfo): string | null {
+  if (track.kind === 'audio' && track.codec === 'aac') {
+    const extradata = track.native?.codecpar.extradata;
+    if (!extradata || extradata.length === 0) return 'aac_adtstoasc';
+  }
+  return null;
 }
 
 /**
@@ -543,6 +572,16 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
       );
       const muxIndex = muxer.addStream(track.native!);
       const entry: TrackMuxer = { muxer, muxIndex, sourceIndex: track.index, sdpStreamId: id, kind: track.kind };
+
+      // Raw elementary streams (e.g. ADTS AAC) need a bitstream filter before the
+      // RTP muxer can write its header / generate SDP. The output stream is
+      // adapted lazily once the filter has produced its parameters (see write()).
+      const bsfName = bsfForTrack(track);
+      if (bsfName) {
+        entry.bsf = BitStreamFilterAPI.create(bsfName, track.native!);
+        this.logger?.debug?.(`[rtsp] applying ${bsfName} to ${track.kind} track #${track.index}`);
+      }
+
       this.muxers.push(entry);
       this.muxerBySource.set(track.index, entry);
       this.pendingHeaders.add(id);
@@ -581,11 +620,54 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     if (!entry || !packet.av) return;
     // Remember the current packet's keyframe flag so onRtp can gate viewers on an IDR.
     this.currentKeyframe = packet.isKeyframe;
-    await entry.muxer.writePacket(packet.av, entry.muxIndex);
+
+    if (entry.bsf) {
+      await this.writeFiltered(entry, packet);
+    } else {
+      await entry.muxer.writePacket(packet.av, entry.muxIndex);
+    }
 
     // The SDP can only be built once every track's muxer has emitted its header.
     if (!this.sdpResolved && this.pendingHeaders.delete(entry.sdpStreamId) && this.pendingHeaders.size === 0) {
       this.resolveSdp();
+    }
+  }
+
+  /**
+   * Run a packet through the track's bitstream filter and mux the results.
+   *
+   * A filter that adapts a raw elementary stream (e.g. `aac_adtstoasc`) emits the
+   * codec's global headers as `AV_PKT_DATA_NEW_EXTRADATA` side data on its first
+   * output packet. That extradata is lifted onto the output stream before the
+   * first packet writes the muxer header, so the header — and thus the SDP — is
+   * built with the configuration the RTP muxer requires.
+   *
+   * @param entry - The track muxer whose `bsf` is set.
+   *
+   * @param packet - The raw upstream packet to filter and write.
+   *
+   * @internal
+   */
+  private async writeFiltered(entry: TrackMuxer, packet: MediaPacket): Promise<void> {
+    const filtered = await entry.bsf!.filterAll(packet.av!);
+    if (filtered.length === 0) return; // filter needs more data before it emits anything
+
+    for (const out of filtered) {
+      try {
+        // The filter signals fresh global headers via NEW_EXTRADATA side data;
+        // copy it onto the output stream before its first packet writes the header.
+        if (!entry.extradataInjected) {
+          const extradata = out.getSideData(AV_PKT_DATA_NEW_EXTRADATA);
+          const outStream = entry.muxer.getStream(entry.muxIndex);
+          if (extradata && outStream?.codecpar.extradataSize === 0) {
+            outStream.codecpar.extradata = extradata;
+            entry.extradataInjected = true;
+          }
+        }
+        await entry.muxer.writePacket(out, entry.muxIndex);
+      } finally {
+        out.free();
+      }
     }
   }
 
@@ -604,6 +686,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    * ```
    */
   async close(): Promise<void> {
+    for (const m of this.muxers) m.bsf?.close();
     await Promise.all(this.muxers.map((m) => m.muxer.close().catch(() => undefined)));
     this.muxers.length = 0;
     this.muxerBySource.clear();
