@@ -1,0 +1,15 @@
+/eslint.config.*
+/.gitignore
+/.npmignore
+/.prettierignore
+/.prettierrc.*
+/tsconfig.json
+/updates.config.*
+/cameraui.config.*
+
+node_modules
+.github
+.vscode
+
+
+/src

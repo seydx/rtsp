@@ -1,0 +1,707 @@
+import { createServer } from 'node:net';
+import { Muxer, StreamingUtils } from 'node-av';
+
+import { RtspSession } from './session.js';
+import { TypedEmitter } from '../../util/emitter.js';
+
+import type { Packet, Stream } from 'node-av';
+import type { Server } from 'node:net';
+import type { RtspAuth } from './auth.js';
+import type { RtspSessionHost } from './session.js';
+import type { Relay } from '../../relay.js';
+import type { Logger, MediaPacket, Sink, StreamInfo, TrackKind } from '../../types.js';
+
+/**
+ * Configuration for an {@link RtspServerSink}.
+ *
+ * Controls the address the server binds to, the path viewers connect on, the RTP
+ * packetization size, optional authentication, and whether a talkback
+ * (ONVIF backchannel) media is advertised to clients. Every field is optional;
+ * sensible defaults are applied for a localhost-only server.
+ */
+export interface RtspServerSinkOptions {
+  /**
+   * Hostname or IP address the TCP listener binds to.
+   *
+   * Use a specific interface address to limit reachability, or `0.0.0.0` to
+   * accept connections on every interface.
+   *
+   * @default '127.0.0.1'
+   */
+  host?: string;
+
+  /**
+   * TCP port the RTSP server listens on.
+   *
+   * When omitted (or `0`), the operating system assigns a free ephemeral port;
+   * the chosen value is reflected by {@link RtspServerSink.url} after
+   * {@link RtspServerSink.listen} resolves.
+   *
+   * @default an ephemeral free port
+   */
+  port?: number;
+
+  /**
+   * Stream path that viewers append to the server URL (the portion after the
+   * port, e.g. `rtsp://host:port/live`).
+   *
+   * Any leading slashes are stripped, so `live` and `/live` are equivalent.
+   *
+   * @default 'live'
+   */
+  path?: string;
+
+  /**
+   * Authenticator that pulling clients must satisfy before they can DESCRIBE or
+   * play the stream.
+   *
+   * When provided, every request is challenged (Basic or Digest); when omitted
+   * the endpoint is open to any client that can reach it.
+   *
+   * @see {@link RtspAuth}
+   */
+  auth?: RtspAuth;
+
+  /**
+   * Maximum RTP packet size in bytes used by the underlying muxer.
+   *
+   * Larger payloads are fragmented to fit within this limit. The default keeps
+   * packets comfortably below typical network MTUs to avoid IP fragmentation.
+   *
+   * @default 1200
+   */
+  mtu?: number;
+
+  /**
+   * Advertise a talkback (ONVIF backchannel) media section to viewers so they can
+   * send audio back to the camera.
+   *
+   * Pass `true` to advertise the upstream's own backchannel codec verbatim, so
+   * inbound viewer RTP is forwarded straight through (pass-through). Pass a
+   * {@link BackchannelAdvertise} to advertise a specific codec instead, in which
+   * case the relay transcodes the viewer audio into the camera's native format.
+   * When the upstream advertises no backchannel, the request is ignored with a
+   * warning.
+   */
+  backchannel?: boolean | BackchannelAdvertise;
+
+  /**
+   * Logger used to emit diagnostics about the server lifecycle and per-request
+   * activity.
+   *
+   * When omitted no diagnostics are emitted.
+   */
+  logger?: Logger;
+}
+
+/**
+ * Talkback codec descriptor advertised to viewers in the DESCRIBE SDP.
+ *
+ * Describes the RTP payload format of the backchannel media so a viewer can
+ * SETUP a matching sendonly stream and push audio toward the camera.
+ */
+export interface BackchannelAdvertise {
+  /**
+   * Lower-case FFmpeg codec name used to derive the SDP rtpmap encoding
+   * (e.g. `pcm_mulaw`, `pcm_alaw`, `opus`, `aac`).
+   */
+  codec: string;
+
+  /**
+   * RTP payload type number announced for the talkback media in the SDP.
+   */
+  payloadType: number;
+
+  /**
+   * RTP clock rate in Hz announced in the rtpmap line (e.g. `8000` for G.711).
+   */
+  clockRate: number;
+
+  /**
+   * Number of audio channels; values greater than one append a `/N` suffix to
+   * the rtpmap encoding.
+   */
+  channels: number;
+}
+
+/**
+ * One node-av RTP muxer bound to a single source track.
+ *
+ * @internal
+ */
+interface TrackMuxer {
+  muxer: Muxer;
+  muxIndex: number;
+  sourceIndex: number;
+  sdpStreamId: number;
+  kind: TrackKind;
+}
+
+/**
+ * Events emitted by an {@link RtspServerSink}.
+ *
+ * Surfaces viewer connect/disconnect transitions and inbound talkback RTP from
+ * clients, allowing callers to track activity or route backchannel audio.
+ */
+export interface RtspServerEvents {
+  /**
+   * Emitted when a viewer transitions into the playing state.
+   *
+   * @param count - The current number of playing viewers.
+   */
+  'viewer:added': (count: number) => void;
+
+  /**
+   * Emitted when a playing viewer disconnects.
+   *
+   * @param count - The remaining number of playing viewers.
+   */
+  'viewer:removed': (count: number) => void;
+
+  /**
+   * Emitted for each inbound talkback RTP packet received from a viewer.
+   *
+   * The buffer is raw RTP in the advertised backchannel codec, ready to be
+   * forwarded (or transcoded) toward the camera.
+   *
+   * @param rtp - The raw RTP packet sent by the viewer.
+   */
+  backchannel: (rtp: Buffer) => void;
+}
+
+/**
+ * Derive a pass-through advertise format from the upstream's backchannel.
+ *
+ * @param info - Stream description from the relay's upstream.
+ *
+ * @returns The upstream backchannel mapped to an advertise descriptor, or `undefined` when the upstream advertises none.
+ *
+ * @internal
+ */
+function backchannelFromInfo(info: StreamInfo): BackchannelAdvertise | undefined {
+  const bc = info.backchannel;
+  if (!bc) return undefined;
+  return { codec: bc.codec, payloadType: bc.payloadType, clockRate: bc.clockRate, channels: bc.channels };
+}
+
+/**
+ * Map a lower-case codec name to its SDP rtpmap encoding name.
+ *
+ * @param codec - Lower-case FFmpeg codec name.
+ *
+ * @returns The encoding name expected in an SDP rtpmap line.
+ *
+ * @internal
+ */
+function rtpmapName(codec: string): string {
+  switch (codec) {
+    case 'pcm_mulaw':
+      return 'PCMU';
+    case 'pcm_alaw':
+      return 'PCMA';
+    case 'opus':
+      return 'opus';
+    case 'aac':
+      return 'MPEG4-GENERIC';
+    default:
+      return codec.toUpperCase();
+  }
+}
+
+/**
+ * A promise paired with its resolver for out-of-band completion.
+ *
+ * @internal
+ */
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}
+
+/**
+ * Create a deferred whose promise is resolved later by an external caller.
+ *
+ * @returns A deferred bundling the pending promise and its resolver.
+ *
+ * @internal
+ */
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => (resolve = r));
+  return { promise, resolve };
+}
+
+/**
+ * Sink that re-publishes a relayed stream as a multi-client RTSP server.
+ *
+ * Each track is packetized exactly once and the resulting RTP is fanned out to
+ * every playing viewer over interleaved TCP, so the upstream is pulled a single
+ * time regardless of how many clients are connected. The server is created lazily
+ * via the relay, attaching to it on the first client and detaching once the last
+ * viewer leaves, and can optionally advertise an ONVIF talkback channel and
+ * require authentication.
+ *
+ * @example
+ * ```typescript
+ * import { Relay } from '@seydx/rtsp';
+ *
+ * const relay = new Relay({ source });
+ * const server = await relay.serveRtsp({ port: 8554, path: 'live' });
+ * console.log('playing at', server.url);
+ * ```
+ *
+ * @example
+ * ```typescript
+ * import { Relay, RtspAuth } from '@seydx/rtsp';
+ *
+ * const relay = new Relay({ source });
+ * const server = await relay.serveRtsp({
+ *   port: 8554,
+ *   auth: new RtspAuth({ username: 'admin', password: 'secret' }),
+ *   backchannel: true,
+ * });
+ *
+ * server.on('viewer:added', (count) => console.log('viewers:', count));
+ * ```
+ *
+ * @see {@link Relay} For the relay that feeds this sink
+ *
+ * @see {@link RtspAuth} For securing the endpoint
+ */
+export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Sink, RtspSessionHost {
+  readonly auth?: RtspAuth;
+  readonly logger?: Logger;
+
+  private readonly host: string;
+  private readonly path: string;
+  private readonly mtu: number;
+  private port: number;
+
+  private server?: Server;
+  private readonly sessions = new Set<RtspSession>();
+  private readonly playing = new Set<RtspSession>();
+
+  private readonly muxers: TrackMuxer[] = [];
+  private readonly muxerBySource = new Map<number, TrackMuxer>();
+  private pendingHeaders = new Set<number>();
+  private sdp = deferred<string>();
+  private sdpResolved = false;
+  private currentKeyframe = false;
+  private piped = false;
+
+  private readonly backchannelOption?: boolean | BackchannelAdvertise;
+  private backchannelAdvertise?: BackchannelAdvertise;
+  backchannelStreamId?: number;
+
+  trackKinds: readonly TrackKind[] = [];
+
+  /**
+   * Create an RTSP server sink bound to a relay.
+   *
+   * Prefer {@link Relay.serveRtsp}, which constructs the sink, starts listening,
+   * and wires up backchannel handling for you.
+   *
+   * @param relay - The relay whose stream is re-published.
+   *
+   * @param options - Server configuration such as bind address, path, MTU, auth, and backchannel.
+   */
+  constructor(
+    private readonly relay: Relay,
+    options: RtspServerSinkOptions = {},
+  ) {
+    super();
+    this.host = options.host ?? '127.0.0.1';
+    this.port = options.port ?? 0;
+    this.path = (options.path ?? 'live').replace(/^\/+/, '');
+    this.mtu = options.mtu ?? 1200;
+    this.auth = options.auth;
+    this.logger = options.logger;
+    this.backchannelOption = options.backchannel;
+  }
+
+  /**
+   * The talkback codec actually advertised to viewers, once the upstream is
+   * known.
+   *
+   * Resolves to the negotiated format only after {@link init} has run and the
+   * upstream's backchannel (or the configured override) has been determined;
+   * otherwise `undefined`.
+   *
+   * @example
+   * ```typescript
+   * const format = server.backchannelFormat;
+   * if (format) console.log('talkback codec:', format.codec);
+   * ```
+   */
+  get backchannelFormat(): BackchannelAdvertise | undefined {
+    return this.backchannelAdvertise;
+  }
+
+  /**
+   * The fully qualified `rtsp://` URL viewers connect to.
+   *
+   * Includes the bound host and port (resolved after {@link listen}) and the
+   * stream path; when authentication is configured the username is shown with the
+   * password masked.
+   *
+   * @example
+   * ```typescript
+   * await server.listen();
+   * console.log('connect to', server.url);
+   * ```
+   */
+  get url(): string {
+    const cred = this.auth ? `${encodeURIComponent(this.auth.username)}:***@` : '';
+    return `rtsp://${cred}${this.host}:${this.port}/${this.path}`;
+  }
+
+  /**
+   * The number of viewers currently in the playing state.
+   *
+   * @example
+   * ```typescript
+   * console.log('active viewers:', server.viewers);
+   * ```
+   */
+  get viewers(): number {
+    return this.playing.size;
+  }
+
+  /**
+   * Start the TCP listener and begin accepting RTSP clients.
+   *
+   * Binding is idempotent: calling this again after the server is already
+   * listening returns immediately. When no explicit port was configured, the
+   * chosen ephemeral port is filled in and becomes visible via {@link url}.
+   *
+   * @returns This sink, once the socket is bound.
+   *
+   * @throws {Error} If the socket cannot bind (for example, the port is in use).
+   *
+   * @example
+   * ```typescript
+   * const server = new RtspServerSink(relay, { port: 8554 });
+   * await server.listen();
+   * console.log(server.url);
+   * ```
+   */
+  async listen(): Promise<this> {
+    if (this.server) return this;
+    const server = createServer((socket) => {
+      socket.setNoDelay(true);
+      const session = new RtspSession(socket, this);
+      this.sessions.add(session);
+    });
+    this.server = server;
+
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(this.port, this.host, () => {
+        const address = server.address();
+        if (address && typeof address === 'object') this.port = address.port;
+        server.off('error', reject);
+        resolve();
+      });
+    });
+    this.logger?.log?.(`[rtsp] serving ${this.url}`);
+    return this;
+  }
+
+  /**
+   * Fully tear the server down.
+   *
+   * Closes every connected viewer, stops the TCP listener, and detaches from the
+   * relay so the upstream can go idle. Safe to call even if the server was never
+   * started.
+   *
+   * @returns A promise that resolves once the listener is closed and the relay is detached.
+   *
+   * @example
+   * ```typescript
+   * await server.shutdown();
+   * ```
+   */
+  async shutdown(): Promise<void> {
+    for (const session of [...this.sessions]) session.close();
+    if (this.server) {
+      await new Promise<void>((resolve) => this.server!.close(() => resolve()));
+      this.server = undefined;
+    }
+    if (this.piped) await this.relay.unpipe(this);
+  }
+
+  /**
+   * Handle one inbound talkback RTP packet received from a viewer.
+   *
+   * Forwards the packet to listeners by re-emitting it as a `backchannel` event;
+   * the relay (or application) is responsible for routing it toward the camera.
+   *
+   * @param rtp - The raw RTP packet sent by the viewer.
+   *
+   * @example
+   * ```typescript
+   * server.on('backchannel', (rtp) => camera.sendAudio(rtp));
+   * ```
+   */
+  onBackchannelRtp(rtp: Buffer): void {
+    this.emit('backchannel', rtp);
+  }
+
+  /**
+   * Ensure the upstream is live and resolve the DESCRIBE SDP.
+   *
+   * Invoked by a session handling its first DESCRIBE. Attaches to the relay on
+   * the first call (which lazily opens the upstream) and returns a promise for the
+   * SDP, which resolves once headers for every track have been seen.
+   *
+   * @returns The SDP describing the available media, including any talkback section.
+   *
+   * @example
+   * ```typescript
+   * const sdp = await server.activate();
+   * ```
+   */
+  async activate(): Promise<string> {
+    if (!this.piped) {
+      this.piped = true;
+      this.relay.pipe(this);
+    }
+    return this.sdp.promise;
+  }
+
+  /**
+   * Register a session as actively playing.
+   *
+   * Tracks the session for fan-out and emits a `viewer:added` event with the new
+   * viewer count.
+   *
+   * @param session - The session that just entered the playing state.
+   *
+   * @example
+   * ```typescript
+   * server.sessionPlaying(session);
+   * ```
+   */
+  sessionPlaying(session: RtspSession): void {
+    this.playing.add(session);
+    this.emit('viewer:added', this.playing.size);
+  }
+
+  /**
+   * Deregister a session that has disconnected.
+   *
+   * Removes the session from the connected and playing sets, emitting
+   * `viewer:removed` if it was playing. When no sessions remain, the sink detaches
+   * from the relay so the upstream can go idle.
+   *
+   * @param session - The session that closed.
+   *
+   * @example
+   * ```typescript
+   * server.sessionClosed(session);
+   * ```
+   */
+  sessionClosed(session: RtspSession): void {
+    this.sessions.delete(session);
+    if (this.playing.delete(session)) {
+      this.emit('viewer:removed', this.playing.size);
+    }
+    if (this.sessions.size === 0 && this.piped) {
+      // No clients left — let the relay (and thus the upstream) go idle.
+      void this.relay.unpipe(this);
+    }
+  }
+
+  /**
+   * Initialize the sink for a freshly opened upstream.
+   *
+   * Creates one RTP muxer per source track, records the track kinds, and (when
+   * requested) resolves the talkback media to advertise. Called by the relay when
+   * the upstream stream description becomes available.
+   *
+   * @param info - Description of the upstream tracks and any backchannel it offers.
+   *
+   * @returns A promise that resolves once all per-track muxers are open.
+   *
+   * @example
+   * ```typescript
+   * await server.init(streamInfo);
+   * ```
+   */
+  async init(info: StreamInfo): Promise<void> {
+    this.trackKinds = info.tracks.map((t) => t.kind);
+    let sdpStreamId = 0;
+    for (const track of info.tracks) {
+      const id = sdpStreamId++;
+      const muxer = await Muxer.open(
+        {
+          write: (buffer: Buffer) => {
+            this.onRtp(id, buffer);
+            return buffer.length;
+          },
+        },
+        { format: 'rtp', maxPacketSize: this.mtu } as never,
+      );
+      const muxIndex = muxer.addStream(track.native as Stream);
+      const entry: TrackMuxer = { muxer, muxIndex, sourceIndex: track.index, sdpStreamId: id, kind: track.kind };
+      this.muxers.push(entry);
+      this.muxerBySource.set(track.index, entry);
+      this.pendingHeaders.add(id);
+    }
+
+    // Talkback media is advertised after the regular tracks so its streamid follows them.
+    if (this.backchannelOption) {
+      const advertise = this.backchannelOption === true ? backchannelFromInfo(info) : this.backchannelOption;
+      if (advertise) {
+        this.backchannelAdvertise = advertise;
+        this.backchannelStreamId = sdpStreamId;
+      } else {
+        this.logger?.warn?.('[rtsp] backchannel requested but the upstream advertises none');
+      }
+    }
+  }
+
+  /**
+   * Packetize and fan out one media packet to all playing viewers.
+   *
+   * Routes the packet to its track's muxer (which emits RTP via `onRtp`);
+   * packets for unknown tracks or without native data are dropped. Once the muxer
+   * for every track has produced its header, the deferred SDP is resolved.
+   *
+   * @param packet - The media packet to packetize and deliver.
+   *
+   * @returns A promise that resolves once the packet has been written to its muxer.
+   *
+   * @example
+   * ```typescript
+   * await server.write(packet);
+   * ```
+   */
+  async write(packet: MediaPacket): Promise<void> {
+    const entry = this.muxerBySource.get(packet.streamIndex);
+    if (!entry || !packet.av) return;
+    // Remember the current packet's keyframe flag so onRtp can gate viewers on an IDR.
+    this.currentKeyframe = packet.isKeyframe;
+    await entry.muxer.writePacket(packet.av as Packet, entry.muxIndex);
+
+    // The SDP can only be built once every track's muxer has emitted its header.
+    if (!this.sdpResolved && this.pendingHeaders.delete(entry.sdpStreamId) && this.pendingHeaders.size === 0) {
+      this.resolveSdp();
+    }
+  }
+
+  /**
+   * Release all per-track muxers and reset state for a fresh upstream.
+   *
+   * Closes every muxer, clears the track bookkeeping, and re-arms the deferred SDP
+   * so the sink can be reused when the relay reattaches. Called by the relay when
+   * the upstream ends or is detached.
+   *
+   * @returns A promise that resolves once all muxers are closed.
+   *
+   * @example
+   * ```typescript
+   * await server.close();
+   * ```
+   */
+  async close(): Promise<void> {
+    await Promise.all(this.muxers.map((m) => m.muxer.close().catch(() => undefined)));
+    this.muxers.length = 0;
+    this.muxerBySource.clear();
+    this.pendingHeaders = new Set();
+    this.sdpResolved = false;
+    this.sdp = deferred<string>();
+    this.backchannelAdvertise = undefined;
+    this.backchannelStreamId = undefined;
+    this.piped = false;
+  }
+
+  /**
+   * Fan one muxer-produced RTP/RTCP buffer out to all playing viewers.
+   *
+   * @param sdpStreamId - SDP streamid of the track the buffer belongs to.
+   *
+   * @param buffer - The packetized RTP or RTCP bytes from the muxer.
+   *
+   * @internal
+   */
+  private onRtp(sdpStreamId: number, buffer: Buffer): void {
+    // RTCP payload types fall in 72..76; everything else is treated as RTP.
+    const pt = buffer[1] & 0x7f;
+    const isRtcp = pt >= 72 && pt <= 76;
+    const isVideoKeyframe = !isRtcp && this.currentKeyframe && this.trackKinds[sdpStreamId] === 'video';
+    if (this.playing.size === 0) return;
+
+    const data = Buffer.from(buffer); // copy out — the muxer reuses its buffer
+    for (const session of this.playing) {
+      session.feed(sdpStreamId, isRtcp, isVideoKeyframe, data);
+    }
+  }
+
+  /**
+   * Build the DESCRIBE SDP from the open muxers and resolve the deferred.
+   *
+   * Generates the base SDP, normalizes the per-media control attributes, appends
+   * any talkback section, and resolves the promise returned by {@link activate}.
+   *
+   * @internal
+   */
+  private resolveSdp(): void {
+    const sdp = StreamingUtils.createSdp(this.muxers.map((m) => m.muxer.getFormatContext()));
+    if (!sdp) {
+      this.logger?.warn?.('[rtsp] SDP generation returned null');
+      return;
+    }
+    this.sdpResolved = true;
+    this.sdp.resolve(this.appendBackchannel(this.rewriteControl(sdp)));
+  }
+
+  /**
+   * Append a sendonly talkback media section so viewers can SETUP it.
+   *
+   * No-op when no backchannel is advertised; otherwise adds an audio media line
+   * with the advertised rtpmap and a control attribute matching its streamid.
+   *
+   * @param sdp - The base SDP for the regular media tracks.
+   *
+   * @returns The SDP with the talkback media section appended, or unchanged if none is advertised.
+   *
+   * @internal
+   */
+  private appendBackchannel(sdp: string): string {
+    const bc = this.backchannelAdvertise;
+    if (!bc || this.backchannelStreamId === undefined) return sdp;
+    const channels = bc.channels > 1 ? `/${bc.channels}` : '';
+    const lines = [
+      `m=audio 0 RTP/AVP ${bc.payloadType}`,
+      `a=rtpmap:${bc.payloadType} ${rtpmapName(bc.codec)}/${bc.clockRate}${channels}`,
+      'a=sendonly',
+      `a=control:streamid=${this.backchannelStreamId}`,
+    ];
+    return `${sdp.trimEnd()}\r\n${lines.join('\r\n')}\r\n`;
+  }
+
+  /**
+   * Rewrite each media's control attribute to a relative `a=control:streamid=N`.
+   *
+   * Normalizes whatever control URL the muxer emitted into the relative form
+   * clients use during SETUP, numbering media sections in order.
+   *
+   * @param sdp - The SDP whose control attributes are rewritten.
+   *
+   * @returns The SDP with relative per-media control attributes.
+   *
+   * @internal
+   */
+  private rewriteControl(sdp: string): string {
+    let media = -1;
+    return sdp
+      .split('\n')
+      .map((line) => {
+        if (line.startsWith('m=')) media++;
+        if (line.startsWith('a=control:')) return `a=control:streamid=${media}`;
+        return line;
+      })
+      .join('\n');
+  }
+}

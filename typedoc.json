@@ -1,0 +1,50 @@
+{
+  "plugin": [
+    "typedoc-plugin-markdown",
+    "typedoc-vitepress-theme"
+  ],
+  "entryPoints": [
+    "./src/index.ts"
+  ],
+  "exclude": [
+    "**/__tests__/**",
+    "**/*.spec.ts",
+    "**/examples/**"
+  ],
+  "externalPattern": [
+    "**/__tests__/**",
+    "**/*.spec.ts",
+    "**/examples/**",
+    "**/node_modules/**"
+  ],
+  "excludeExternals": true,
+  "intentionallyNotExported": [
+    "RtspSessionHost",
+    "RtspSession"
+  ],
+  "out": "./docs/api",
+  "docsRoot": "./docs",
+  "sidebar": {
+    "autoConfiguration": true,
+    "format": "vitepress",
+    "pretty": false,
+    "collapsed": true
+  },
+  "validation": {
+    "notExported": true,
+    "invalidLink": true,
+    "rewrittenLink": true,
+    "notDocumented": false,
+    "unusedMergeModuleWith": true
+  },
+  "externalSymbolLinkMappings": {
+    "global": {
+      "SymbolConstructor.dispose": "https://tc39.es/proposal-explicit-resource-management/#sec-disposable-interface",
+      "SymbolConstructor.asyncDispose": "https://tc39.es/proposal-explicit-resource-management/#table-asyncdisposable-interface-required-properties"
+    },
+    "typescript": {
+      "SymbolConstructor.dispose": "https://tc39.es/proposal-explicit-resource-management/#sec-disposable-interface",
+      "SymbolConstructor.asyncDispose": "https://tc39.es/proposal-explicit-resource-management/#table-asyncdisposable-interface-required-properties"
+    }
+  }
+}

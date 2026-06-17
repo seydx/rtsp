@@ -1,0 +1,101 @@
+import { execFile } from 'node:child_process';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+import { Demuxer } from 'node-av';
+import { ffmpegPath, isFfmpegAvailable } from 'node-av';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+import { Relay } from '../../../relay.js';
+import { AvSource } from '../../../sources/av.js';
+
+const execFileAsync = promisify(execFile);
+const suite = isFfmpegAvailable() ? describe : describe.skip;
+
+suite('RtspServerSink (integration)', () => {
+  let dir: string;
+  let sample: string;
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'rtsp-srv-'));
+    sample = join(dir, 'sample.mp4');
+    await execFileAsync(ffmpegPath(), [
+      '-y',
+      '-f',
+      'lavfi',
+      '-i',
+      'testsrc=size=320x240:rate=15',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=440:sample_rate=48000',
+      '-t',
+      '2',
+      '-c:v',
+      'libx264',
+      '-g',
+      '15',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'aac',
+      '-shortest',
+      sample,
+    ]);
+  }, 30_000);
+
+  afterAll(async () => {
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  it('serves a single upstream to a pulling ffmpeg client', async () => {
+    // Looped + paced so the source behaves like a live feed and the client
+    // reliably catches a keyframe after PLAY.
+    const relay = new Relay({ source: new AvSource(sample, { readrate: 1, loop: true }) });
+    const server = await relay.serveRtsp({ path: 'live' });
+
+    expect(server.url).toMatch(/^rtsp:\/\/127\.0\.0\.1:\d+\/live$/);
+
+    const out = join(dir, 'pulled.mp4');
+    try {
+      await execFileAsync(ffmpegPath(), ['-y', '-rtsp_transport', 'tcp', '-i', server.url, '-t', '1', '-c', 'copy', out], { timeout: 25_000 });
+
+      // The pulled file must be a real A/V recording.
+      expect((await stat(out)).size).toBeGreaterThan(0);
+      const demuxer = await Demuxer.open(out);
+      const codecs = demuxer.streams.map((s) => s.codecpar.codecId);
+      await demuxer.close();
+      expect(codecs.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      await server.shutdown();
+      await relay.stop();
+    }
+  }, 30_000);
+
+  it('keeps one upstream connection across two concurrent pullers', async () => {
+    const source = new AvSource(sample, { readrate: 1, loop: true });
+    const relay = new Relay({ source });
+    let opens = 0;
+    relay.on('start', () => opens++);
+
+    const server = await relay.serveRtsp({ path: 'live' });
+    const out1 = join(dir, 'a.mp4');
+    const out2 = join(dir, 'b.mp4');
+
+    try {
+      await Promise.all([
+        execFileAsync(ffmpegPath(), ['-y', '-rtsp_transport', 'tcp', '-i', server.url, '-t', '1', '-c', 'copy', out1], { timeout: 25_000 }),
+        execFileAsync(ffmpegPath(), ['-y', '-rtsp_transport', 'tcp', '-i', server.url, '-t', '1', '-c', 'copy', out2], { timeout: 25_000 }),
+      ]);
+
+      expect((await stat(out1)).size).toBeGreaterThan(0);
+      expect((await stat(out2)).size).toBeGreaterThan(0);
+      // Both clients were served from a single upstream open.
+      expect(opens).toBe(1);
+    } finally {
+      await server.shutdown();
+      await relay.stop();
+    }
+  }, 40_000);
+});
