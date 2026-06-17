@@ -11,3 +11,4 @@ updates:
     ignore:
       - dependency-name: eslint
       - dependency-name: typescript
+      - dependency-name: "@eslint/js"
