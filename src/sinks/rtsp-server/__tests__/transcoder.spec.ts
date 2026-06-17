@@ -83,6 +83,35 @@ suite('BackchannelTranscoder', () => {
     }
   }, 30_000);
 
+  it('selects the target encoder by codec name (no numeric codecId needed)', async () => {
+    const inbound = await toRtp(wav);
+
+    const out: Buffer[] = [];
+    const transcoder = new BackchannelTranscoder({
+      from: { codec: 'pcm_mulaw', payloadType: 0, clockRate: 8000, channels: 1 },
+      to: { codec: 'pcm_alaw', sampleRate: 8000, channels: 1, format: 'rtp' },
+      output: (rtp) => out.push(rtp),
+    });
+
+    try {
+      await transcoder.start();
+      for (const rtp of inbound) {
+        transcoder.push(rtp);
+        await sleep(5);
+      }
+      await sleep(500);
+
+      const media = out.filter((b) => {
+        const pt = b[1] & 0x7f;
+        return pt < 72 || pt > 76;
+      });
+      expect(media.length).toBeGreaterThan(0);
+      expect(media[0][1] & 0x7f).toBe(8); // PCMA payload type
+    } finally {
+      await transcoder.close();
+    }
+  }, 30_000);
+
   it('transcodes to raw container bytes (non-RTP) for a writable talkback', async () => {
     // Proves the codec-generic, non-RTP output path used for proprietary
     // talkback sinks (e.g. a Node writable). PCM is used for a deterministic
