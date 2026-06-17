@@ -1,3 +1,5 @@
+import type { AVCodecID, IRational, Packet, Stream } from 'node-av';
+
 /**
  * Minimal logger shape used throughout the relay.
  *
@@ -111,19 +113,19 @@ export interface TrackInfo {
    * Source-native stream handle.
    *
    * For AV-backed sources this is the underlying node-av `Stream`, which
-   * AV-backed sinks pass to `addStream()` when configuring a muxer. The value is
-   * opaque to the relay core and absent for sources that are not AV-backed.
+   * AV-backed sinks pass to `addStream()` when configuring a muxer. The relay
+   * core never inspects it; it is absent for sources that are not AV-backed.
    */
-  native?: unknown;
+  native?: Stream;
 
   /**
-   * Stream time base as a `{ num, den }` rational.
+   * Stream time base as a node-av `IRational` (`{ num, den }`).
    *
    * Present for AV-backed sources and describes the unit of the packet
    * timestamps in seconds (`num / den`). Used by sinks that need to rescale or
    * interpret PTS/DTS values.
    */
-  timeBase?: { num: number; den: number };
+  timeBase?: IRational;
 }
 
 /**
@@ -168,9 +170,9 @@ export interface BackchannelInfo {
    *
    * Provided so a transcoder can construct a matching encoder when the viewer
    * audio must be converted into the upstream's expected format. Absent when the
-   * numeric id is not available.
+   * id is not available.
    */
-  codecId?: number;
+  codecId?: AVCodecID;
 
   /**
    * RTP payload type advertised for the backchannel.
@@ -372,10 +374,10 @@ export interface MediaPacket {
    * Underlying node-av `Packet`.
    *
    * Present for AV-backed sources and carries the encoded payload AV-backed
-   * sinks need to write to a muxer. Opaque to the relay core and absent for
-   * plain (non-AV) packets.
+   * sinks need to write to a muxer. Never inspected by the relay core; absent
+   * for plain (non-AV) packets.
    */
-  readonly av?: unknown;
+  readonly av?: Packet;
 
   /**
    * Return an independently-owned copy of this packet for fan-out.

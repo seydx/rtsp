@@ -1,7 +1,7 @@
 import getPort from 'get-port';
 import { AV_SAMPLE_FMT_S16, avGetSampleFmtFromName, Codec, Decoder, Demuxer, Encoder, FilterAPI, FilterPreset, Muxer, StreamingUtils } from 'node-av';
 
-import type { RTPDemuxer } from 'node-av';
+import type { AVCodecID, FFDecoderCodec, FFEncoderCodec, RTPDemuxer } from 'node-av';
 import type { Logger } from '../../types.js';
 
 /**
@@ -64,9 +64,19 @@ export interface BackchannelTarget {
    * node-av `AVCodecID` of the encoder to produce.
    *
    * Identifies the codec the upstream camera expects on its backchannel; resolved
-   * to a concrete encoder at startup, with an unknown id aborting startup.
+   * to a concrete encoder at startup, with an unknown id aborting startup. Provide
+   * this or {@link codec}; when both are set, {@link codec} takes precedence.
    */
-  codecId: number;
+  codecId?: AVCodecID;
+
+  /**
+   * Encoder codec name as understood by FFmpeg (for example `aac`, `pcm_alaw`).
+   *
+   * A name-based alternative to {@link codecId}, letting callers select the target
+   * encoder without importing node-av's numeric `AVCodecID` constants. Resolved to
+   * a concrete encoder at startup, with an unknown name aborting startup.
+   */
+  codec?: string;
 
   /**
    * Output sample rate in hertz the audio is resampled and encoded at.
@@ -216,11 +226,13 @@ export class BackchannelTranscoder {
     if (this.active) return;
     const { from, to } = this.options;
 
-    const decoderCodec = Codec.findDecoderByName(from.codec as never);
+    // `codec` fields are plain runtime strings (often derived from SDP/config), so
+    // they are cast to node-av's branded codec-name types at the lookup boundary.
+    const decoderCodec = Codec.findDecoderByName(from.codec as FFDecoderCodec);
     if (!decoderCodec) throw new Error(`Unsupported talkback decoder: ${from.codec}`);
 
-    const encoderCodec = Codec.findEncoder(to.codecId as never);
-    if (!encoderCodec) throw new Error(`Unsupported talkback target codec id: ${to.codecId}`);
+    const encoderCodec = to.codec ? Codec.findEncoderByName(to.codec as FFEncoderCodec) : to.codecId !== undefined ? Codec.findEncoder(to.codecId) : undefined;
+    if (!encoderCodec) throw new Error(`Unsupported talkback target codec: ${to.codec ?? to.codecId}`);
 
     // A free local port is required to form a valid input SDP, even though no
     // socket is actually bound — packets are fed in directly via push().

@@ -82,5 +82,5 @@ export function requireAvPacket(packet: MediaPacket): Packet {
   if (!packet.av) {
     throw new Error('Sink requires an AV-backed source (packet has no node-av handle)');
   }
-  return packet.av as Packet;
+  return packet.av;
 }

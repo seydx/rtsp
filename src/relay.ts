@@ -447,7 +447,7 @@ export class Relay extends TypedEmitter<RelayEvents> {
         const camera = source.backchannel;
         transcoder = new BackchannelTranscoder({
           from: advertise,
-          to: { codecId: camera.codecId ?? 0, sampleRate: camera.clockRate, channels: camera.channels, format: 'rtp' },
+          to: { codec: camera.codec, codecId: camera.codecId, sampleRate: camera.clockRate, channels: camera.channels, format: 'rtp' },
           output: (buf) => source.sendBackchannel(buf),
           logger: this.logger,
         });

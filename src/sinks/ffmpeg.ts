@@ -1,7 +1,7 @@
 import { Muxer } from 'node-av';
 
 import type { Logger, MediaPacket, Sink, StreamInfo } from '../types.js';
-import type { IOOutputCallbacks, Packet, Stream } from 'node-av';
+import type { IOOutputCallbacks } from 'node-av';
 import type { Writable } from 'node:stream';
 
 /**
@@ -140,7 +140,7 @@ export class FfmpegSink implements Sink {
     for (const track of info.tracks) {
       // Only AV-backed tracks carry a native stream that can be copied through.
       if (!track.native) continue;
-      const muxIndex = this.muxer.addStream(track.native as Stream);
+      const muxIndex = this.muxer.addStream(track.native);
       this.map.set(track.index, { muxIndex, sourceIndex: track.index });
     }
   }
@@ -163,7 +163,7 @@ export class FfmpegSink implements Sink {
   async write(packet: MediaPacket): Promise<void> {
     const mapped = this.map.get(packet.streamIndex);
     if (!mapped || !this.muxer || !packet.av) return;
-    await this.muxer.writePacket(packet.av as Packet, mapped.muxIndex);
+    await this.muxer.writePacket(packet.av, mapped.muxIndex);
   }
 
   /**

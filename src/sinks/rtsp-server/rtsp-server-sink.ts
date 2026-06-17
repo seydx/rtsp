@@ -4,7 +4,6 @@ import { createServer } from 'node:net';
 import { TypedEmitter } from '../../util/emitter.js';
 import { RtspSession } from './session.js';
 
-import type { Packet, Stream } from 'node-av';
 import type { Server } from 'node:net';
 import type { Relay } from '../../relay.js';
 import type { Logger, MediaPacket, Sink, StreamInfo, TrackKind } from '../../types.js';
@@ -542,7 +541,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
         },
         { format: 'rtp', maxPacketSize: this.mtu } as never,
       );
-      const muxIndex = muxer.addStream(track.native as Stream);
+      const muxIndex = muxer.addStream(track.native!);
       const entry: TrackMuxer = { muxer, muxIndex, sourceIndex: track.index, sdpStreamId: id, kind: track.kind };
       this.muxers.push(entry);
       this.muxerBySource.set(track.index, entry);
@@ -582,7 +581,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     if (!entry || !packet.av) return;
     // Remember the current packet's keyframe flag so onRtp can gate viewers on an IDR.
     this.currentKeyframe = packet.isKeyframe;
-    await entry.muxer.writePacket(packet.av as Packet, entry.muxIndex);
+    await entry.muxer.writePacket(packet.av, entry.muxIndex);
 
     // The SDP can only be built once every track's muxer has emitted its header.
     if (!this.sdpResolved && this.pendingHeaders.delete(entry.sdpStreamId) && this.pendingHeaders.size === 0) {
