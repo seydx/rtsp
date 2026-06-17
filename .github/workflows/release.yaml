@@ -27,10 +27,12 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     permissions:
-      contents: read
+      contents: write
       id-token: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
@@ -63,3 +65,38 @@ jobs:
         run: |
           npm install -g npm@latest
           npm publish --provenance --access public --tag "${{ steps.tag.outputs.dist }}" --ignore-scripts
+
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION_NO_V="${VERSION#v}"
+          : > release_notes.md
+
+          if [[ "$VERSION_NO_V" == *"-beta."* ]]; then
+            echo "> Pre-release for testing. Install with: \`npm install @seydx/rtsp@beta\`" >> release_notes.md
+            echo "" >> release_notes.md
+          elif [ -f CHANGELOG.md ]; then
+            SECTION=$(sed -n "/## \[${VERSION_NO_V}\]/,/## \[/p" CHANGELOG.md | sed '$d')
+            if [ -n "$SECTION" ]; then
+              echo "$SECTION" | tail -n +2 >> release_notes.md
+              echo "" >> release_notes.md
+            fi
+          fi
+
+          PREV_TAG=$(git tag -l 'v*' | grep -v -- '-beta\.' | sort -V | grep -v "^${VERSION}$" | tail -1)
+          if [ -n "$PREV_TAG" ]; then
+            echo "### Changes since $PREV_TAG" >> release_notes.md
+            echo "" >> release_notes.md
+            git log --pretty=format:"- %s (%h)" "${PREV_TAG}..${VERSION}" >> release_notes.md
+            echo "" >> release_notes.md
+          fi
+
+          cat release_notes.md
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: release_notes.md
+          prerelease: ${{ steps.tag.outputs.dist == 'beta' }}
