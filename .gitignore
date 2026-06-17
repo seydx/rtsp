@@ -28,6 +28,7 @@ docs/index.md
 
 # Example scratch output
 examples/.tmp
+examples/internal
 
 # Editor directories and files
 .idea
