@@ -25,9 +25,7 @@ export default defineConfig({
       { text: 'Guide', link: '/' },
       { text: 'API Reference', link: '/api/' },
     ],
-    sidebar: {
-      '/api/': typedocSidebar,
-    },
+    sidebar: typedocSidebar,
     search: {
       provider: 'local',
     },
