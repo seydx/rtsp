@@ -6,6 +6,10 @@ export type { RelayEvents, RelayOptions, RelayState } from './relay.js';
 export { supportsBackchannel } from './types.js';
 export type { BackchannelInfo, BackchannelSource, Logger, MediaPacket, Sink, Source, StreamInfo, TrackInfo, TrackKind } from './types.js';
 
+// FFmpeg (node-av) log bridging
+export { installNativeLogging } from './native-logging.js';
+export type { NativeLoggingHandle, NativeLoggingOptions } from './native-logging.js';
+
 // Sources
 export { AvSource } from './sources/av.js';
 export type { AvInput, AvSourceOptions } from './sources/av.js';
