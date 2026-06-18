@@ -1,9 +1,9 @@
+import { AV_CODEC_ID_PCM_ALAW, AV_CODEC_ID_PCM_S16LE, Demuxer, ffmpegPath, isFfmpegAvailable, Muxer } from 'node-av';
 import { execFile } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { AV_CODEC_ID_PCM_ALAW, AV_CODEC_ID_PCM_S16LE, Demuxer, ffmpegPath, isFfmpegAvailable, Muxer } from 'node-av';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { BackchannelTranscoder } from '../backchannel-transcoder.js';
@@ -135,6 +135,34 @@ suite('BackchannelTranscoder', () => {
 
       // ~1s of 8 kHz mono s16 → raw PCM bytes (not RTP-framed).
       expect(Buffer.concat(chunks).length).toBeGreaterThan(0);
+    } finally {
+      await transcoder.close();
+    }
+  }, 30_000);
+
+  it('transcodes pcm_mulaw RTP to AAC (resamples s16 -> fltp)', async () => {
+    const inbound = await toRtp(wav);
+
+    const out: Buffer[] = [];
+    const transcoder = new BackchannelTranscoder({
+      from: { codec: 'pcm_mulaw', payloadType: 0, clockRate: 8000, channels: 1 },
+      to: { codec: 'aac', sampleRate: 16000, channels: 2, format: 'adts' },
+      output: (buf) => out.push(buf),
+    });
+
+    try {
+      await transcoder.start();
+      for (const rtp of inbound) {
+        transcoder.push(rtp);
+        await sleep(5);
+      }
+      await sleep(500);
+
+      // Encoded ADTS AAC bytes must be produced — every frame starts 0xFFFx.
+      const bytes = Buffer.concat(out);
+      expect(bytes.length).toBeGreaterThan(0);
+      expect(bytes[0]).toBe(0xff);
+      expect(bytes[1] & 0xf0).toBe(0xf0);
     } finally {
       await transcoder.close();
     }
