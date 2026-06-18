@@ -185,6 +185,12 @@ export class AvSource implements Source, BackchannelSource {
   private demuxer?: Demuxer;
   private _backchannel?: BackchannelInfo;
 
+  /** Aborts the demuxer reads on teardown so close() never frees the demuxer mid-read. */
+  private abort?: AbortController;
+
+  /** Resolves when the active packets() read loop has fully unwound; awaited by close(). */
+  private reading?: Promise<void>;
+
   /**
    * Create a source for the given input.
    *
@@ -237,6 +243,7 @@ export class AvSource implements Source, BackchannelSource {
    * ```
    */
   async open(): Promise<StreamInfo> {
+    this.abort = new AbortController();
     this.demuxer = await this.openDemuxer();
     if (this.opts.backchannel) this._backchannel = this.readBackchannel();
     return { tracks: this.demuxer.streams.map(toTrackInfo), backchannel: this._backchannel };
@@ -294,14 +301,29 @@ export class AvSource implements Source, BackchannelSource {
   async *packets(signal: AbortSignal): AsyncIterable<MediaPacket> {
     if (!this.demuxer) throw new Error('AvSource.open() must be called before packets()');
 
-    do {
-      yield* this.readOnce(signal);
-      if (signal.aborted || !this.opts.loop) break;
-      // Loop: reopen the input and keep streaming on the same wall clock.
-      await this.closeDemuxer();
-      if (signal.aborted) break;
-      this.demuxer = await this.openDemuxer();
-    } while (!signal.aborted);
+    // Tie the relay's pull signal to our internal abort so aborting either one
+    // stops the demuxer read (and lets close() unblock a stalled read).
+    const onAbort = (): void => this.abort?.abort();
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+
+    // Expose the read loop's lifetime so close() can wait for it to unwind before
+    // freeing the demuxer — closing a demuxer mid-read is a process-killing UAF.
+    let done!: () => void;
+    this.reading = new Promise<void>((resolve) => (done = resolve));
+    try {
+      do {
+        yield* this.readOnce(signal);
+        if (signal.aborted || !this.opts.loop) break;
+        // Loop: reopen the input and keep streaming on the same wall clock.
+        await this.closeDemuxer();
+        if (signal.aborted) break;
+        this.demuxer = await this.openDemuxer();
+      } while (!signal.aborted);
+    } finally {
+      done();
+      this.reading = undefined;
+    }
   }
 
   /**
@@ -319,6 +341,10 @@ export class AvSource implements Source, BackchannelSource {
    * ```
    */
   async close(): Promise<void> {
+    // Abort the read, wait for the packets() loop to fully unwind, then free the
+    // demuxer — never close it while a read is still in flight.
+    this.abort?.abort();
+    await this.reading;
     await this.closeDemuxer();
   }
 
@@ -347,6 +373,7 @@ export class AvSource implements Source, BackchannelSource {
     return Demuxer.open(input, {
       format: this.opts.format as never,
       options: options as never,
+      signal: this.abort?.signal,
     });
   }
 
@@ -399,31 +426,36 @@ export class AvSource implements Source, BackchannelSource {
     let baseSeconds = 0;
     let paced = false;
 
-    for await (const packet of demuxer.packets()) {
-      // node-av yields `null` as an end/flush sentinel — nothing to relay.
-      if (!packet) continue;
-      if (signal.aborted) {
-        packet.free();
-        return;
-      }
-
-      if (readrate && readrate > 0) {
-        const tb = packet.timeBase;
-        const dts = packet.dts;
-        if (tb && tb.den > 0 && dts >= 0n) {
-          const seconds = (Number(dts) * tb.num) / tb.den / readrate;
-          if (!paced) {
-            // Anchor the wall clock to the first paced packet so timing is relative, not absolute.
-            wallStart = Date.now();
-            baseSeconds = seconds;
-            paced = true;
-          }
-          const waitMs = (seconds - baseSeconds) * 1000 - (Date.now() - wallStart);
-          if (waitMs > 1) await delay(waitMs, signal);
+    try {
+      for await (const packet of demuxer.packets()) {
+        // node-av yields `null` as an end/flush sentinel — nothing to relay.
+        if (!packet) continue;
+        if (signal.aborted) {
+          packet.free();
+          return;
         }
-      }
 
-      yield wrapAvPacket(packet);
+        if (readrate && readrate > 0) {
+          const tb = packet.timeBase;
+          const dts = packet.dts;
+          if (tb && tb.den > 0 && dts >= 0n) {
+            const seconds = (Number(dts) * tb.num) / tb.den / readrate;
+            if (!paced) {
+              // Anchor the wall clock to the first paced packet so timing is relative, not absolute.
+              wallStart = Date.now();
+              baseSeconds = seconds;
+              paced = true;
+            }
+            const waitMs = (seconds - baseSeconds) * 1000 - (Date.now() - wallStart);
+            if (waitMs > 1) await delay(waitMs, signal);
+          }
+        }
+
+        yield wrapAvPacket(packet);
+      }
+    } catch (error) {
+      // A read aborted by teardown (close()/abort) is expected; only surface real errors.
+      if (!signal.aborted && !this.abort?.signal.aborted) throw error;
     }
   }
 
