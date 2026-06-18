@@ -218,6 +218,15 @@ export class SinkChannel {
     if (this.closed) return;
     this.closed = true;
     this.flushQueue();
+    // Wait for any in-flight write to finish before tearing the sink down. The
+    // drain loop's `!closed` check only stops the *next* write; a write already
+    // awaiting inside sink.write() would otherwise have its native resources
+    // (muxer, bitstream filter) freed by sink.close() mid-call, which surfaces as
+    // an "Invalid packet" error at best and a process-killing use-after-free at
+    // worst. draining always clears in drain()'s finally, so this can't hang.
+    while (this.draining) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
     try {
       await this.sink.close();
     } catch (error) {
