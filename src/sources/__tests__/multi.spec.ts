@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { ffmpegPath, isFfmpegAvailable } from 'node-av';
+import { AV_NOPTS_VALUE, ffmpegPath, isFfmpegAvailable } from 'node-av';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { Relay } from '../../relay.js';
@@ -82,5 +82,40 @@ suite('MultiSource (integration)', () => {
     // Packets arrived from both merged inputs, gated to start at a keyframe.
     expect(indices.size).toBe(2);
     expect(firstVideoKeyframe).toBe(true);
+  }, 30_000);
+
+  it('synthesizes a monotonic CFR timeline for the timeless raw video stream', async () => {
+    const source = new MultiSource([
+      { input: createReadStream(h264), format: 'h264' },
+      { input: createReadStream(aac), format: 'aac' },
+    ]);
+    const relay = new Relay({ source });
+
+    let videoIndex = -1;
+    const videoPts: bigint[] = [];
+
+    await new Promise<void>((resolve, reject) => {
+      relay.on('error', reject);
+      relay.on('stop', resolve);
+      relay.on('start', (info) => {
+        videoIndex = info.tracks.find((t) => t.kind === 'video')?.index ?? -1;
+      });
+      relay.pipe(
+        new CallbackSink({
+          onPacket: (p) => {
+            if (p.streamIndex === videoIndex && p.av) videoPts.push(p.av.pts);
+          },
+        }),
+      );
+    });
+
+    // Raw Annex-B H.264 carries no container timing; the source must reconstruct it.
+    expect(videoPts.length).toBeGreaterThan(2);
+    expect(videoPts.every((pts) => pts !== AV_NOPTS_VALUE)).toBe(true);
+
+    // Strictly increasing, and at a constant cadence (15fps source -> equal steps).
+    const steps = videoPts.slice(1).map((pts, i) => pts - videoPts[i]);
+    expect(steps.every((s) => s > 0n)).toBe(true);
+    expect(new Set(steps.map(String)).size).toBe(1);
   }, 30_000);
 });
