@@ -94,6 +94,16 @@ export interface BackchannelTarget {
   channels: number;
 
   /**
+   * Target encoder bitrate in bits per second.
+   *
+   * When omitted the encoder picks its own default, which for narrowband mono AAC
+   * can exceed the per-frame ceiling and be clamped with a warning. Set an
+   * explicit value (for example `32000`) to keep talkback frames small — important
+   * when the upstream multiplexes talkback onto a shared, rate-sensitive channel.
+   */
+  bitRate?: number;
+
+  /**
    * Output muxer format name.
    *
    * Defaults to `rtp`, which emits RTP packets ready to forward to the upstream
@@ -256,6 +266,8 @@ export class BackchannelTranscoder {
     this.encoder = await Encoder.create(encoderCodec, {
       decoder: this.decoder,
       filter: this.filter,
+      autoResample: true,
+      ...(to.bitRate ? { bitrate: to.bitRate } : {}),
       options: { sample_rate: to.sampleRate, channels: to.channels },
     });
 
