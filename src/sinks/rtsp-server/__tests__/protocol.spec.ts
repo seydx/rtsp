@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { RtspAuth } from '../auth.js';
 import { buildResponse, RtspParser } from '../protocol.js';
@@ -41,6 +41,24 @@ describe('RtspParser', () => {
     const out = parser.push(Buffer.from(a + b));
     expect(out).toHaveLength(2);
   });
+
+  it('rejects a request head that never terminates (buffer-growth DoS)', () => {
+    const parser = new RtspParser();
+    // No CRLFCRLF anywhere — the parser must bail instead of buffering forever.
+    expect(() => parser.push(Buffer.alloc(17 * 1024, 0x41))).toThrow(/head exceeds/);
+  });
+
+  it('rejects an oversized declared Content-Length', () => {
+    const parser = new RtspParser();
+    const msg = 'ANNOUNCE rtsp://h/live RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 999999999\r\n\r\n';
+    expect(() => parser.push(Buffer.from(msg))).toThrow(/Content-Length/);
+  });
+
+  it('rejects a malformed Content-Length', () => {
+    const parser = new RtspParser();
+    const msg = 'ANNOUNCE rtsp://h/live RTSP/1.0\r\nCSeq: 1\r\nContent-Length: -5\r\n\r\n';
+    expect(() => parser.push(Buffer.from(msg))).toThrow(/Content-Length/);
+  });
 });
 
 describe('buildResponse', () => {
@@ -54,17 +72,54 @@ describe('buildResponse', () => {
 });
 
 describe('RtspAuth (Digest)', () => {
+  const md5 = (s: string) => createHash('md5').update(s).digest('hex');
+
+  function digestHeader(nonce: string, uri = 'rtsp://h/live', method = 'DESCRIBE'): string {
+    const ha1 = md5('u:r:p');
+    const ha2 = md5(`${method}:${uri}`);
+    const response = md5(`${ha1}:${nonce}:${ha2}`);
+    return `Digest username="u", realm="r", nonce="${nonce}", uri="${uri}", response="${response}"`;
+  }
+
   it('verifies a correct digest response and rejects a wrong one', () => {
     const auth = new RtspAuth({ username: 'u', password: 'p', method: 'Digest', realm: 'r' });
     const nonce = /nonce="([^"]+)"/.exec(auth.challenge())![1];
-    const md5 = (s: string) => createHash('md5').update(s).digest('hex');
     const uri = 'rtsp://h/live';
-    const ha1 = md5('u:r:p');
-    const ha2 = md5(`DESCRIBE:${uri}`);
-    const response = md5(`${ha1}:${nonce}:${ha2}`);
-    const header = `Digest username="u", realm="r", nonce="${nonce}", uri="${uri}", response="${response}"`;
+    const header = digestHeader(nonce, uri);
+    const response = /response="([^"]+)"/.exec(header)![1];
     expect(auth.verify('DESCRIBE', uri, header)).toBe(true);
     expect(auth.verify('DESCRIBE', uri, header.replace(response, 'deadbeef'))).toBe(false);
     expect(auth.verify('DESCRIBE', uri, undefined)).toBe(false);
+  });
+
+  it('issues a fresh nonce per challenge and accepts every unexpired one', () => {
+    const auth = new RtspAuth({ username: 'u', password: 'p', method: 'Digest', realm: 'r' });
+    const first = /nonce="([^"]+)"/.exec(auth.challenge())![1];
+    const second = /nonce="([^"]+)"/.exec(auth.challenge())![1];
+    expect(first).not.toBe(second);
+    // A client mid-handshake keeps using the nonce it was challenged with.
+    expect(auth.verify('DESCRIBE', 'rtsp://h/live', digestHeader(first))).toBe(true);
+    expect(auth.verify('DESCRIBE', 'rtsp://h/live', digestHeader(second))).toBe(true);
+  });
+
+  it('rejects a nonce the server never issued (replay from another instance)', () => {
+    const auth = new RtspAuth({ username: 'u', password: 'p', method: 'Digest', realm: 'r' });
+    auth.challenge();
+    expect(auth.verify('DESCRIBE', 'rtsp://h/live', digestHeader('feedfacefeedface'))).toBe(false);
+  });
+
+  it('expires nonces after their time-to-live window', () => {
+    vi.useFakeTimers();
+    try {
+      const auth = new RtspAuth({ username: 'u', password: 'p', method: 'Digest', realm: 'r' });
+      const nonce = /nonce="([^"]+)"/.exec(auth.challenge())![1];
+      expect(auth.verify('DESCRIBE', 'rtsp://h/live', digestHeader(nonce))).toBe(true);
+
+      vi.advanceTimersByTime(6 * 60 * 1000);
+      // Beyond the 5-minute window a captured Authorization header is useless.
+      expect(auth.verify('DESCRIBE', 'rtsp://h/live', digestHeader(nonce))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

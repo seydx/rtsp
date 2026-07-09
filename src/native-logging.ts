@@ -12,7 +12,7 @@ export interface NativeLoggingOptions {
    *
    * Messages more verbose than this are dropped inside node-av before they ever
    * reach JavaScript, so they neither hit the logger nor leak to stderr. Defaults
-   * to {@link AV_LOG_WARNING}, which keeps only warnings and errors and silently
+   * to `AV_LOG_WARNING`, which keeps only warnings and errors and silently
    * discards the usual encoder/muxer chatter (e.g. `Qavg`, queue-flush notices).
    */
   maxLevel?: AVLogLevel;

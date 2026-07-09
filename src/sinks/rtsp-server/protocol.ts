@@ -88,6 +88,16 @@ const MAGIC = 0x24;
 // RTSP headers terminate with a blank line (CRLFCRLF), like HTTP.
 const HEADER_END = Buffer.from('\r\n\r\n');
 
+// Upper bound for a request head (request line + headers). Real RTSP requests
+// are well under 2 KiB; anything larger is a broken or hostile client, and
+// buffering it unbounded while waiting for CRLFCRLF would let a single
+// connection grow the parser buffer without limit.
+const MAX_HEAD_BYTES = 16 * 1024;
+
+// Upper bound for a declared request body (e.g. an ANNOUNCE SDP). Same
+// rationale: a huge Content-Length must not make the parser buffer megabytes.
+const MAX_BODY_BYTES = 64 * 1024;
+
 /**
  * Incremental parser for the RTSP control stream.
  *
@@ -127,6 +137,9 @@ export class RtspParser {
    *
    * @returns The complete messages decoded from the buffer, in order; empty when no message is yet complete
    *
+   * @throws {Error} If a request head exceeds 16 KiB or a declared body exceeds
+   * 64 KiB — protocol abuse that must not grow the parser buffer unbounded
+   *
    * @example
    * ```typescript
    * const messages = parser.push(socketChunk);
@@ -144,6 +157,7 @@ export class RtspParser {
 
       if (this.buffer[0] === MAGIC) {
         // Interleaved header is 4 bytes: '$', channel, then a big-endian length.
+        // The length field is a u16, so the payload is inherently bounded.
         if (this.buffer.length < 4) break;
         const channel = this.buffer[1];
         const length = this.buffer.readUInt16BE(2);
@@ -158,11 +172,22 @@ export class RtspParser {
 
       // Text request: cannot proceed until the full header block is present.
       const headEnd = this.buffer.indexOf(HEADER_END);
-      if (headEnd === -1) break;
+      if (headEnd === -1) {
+        if (this.buffer.length > MAX_HEAD_BYTES) {
+          throw new Error(`RTSP request head exceeds ${MAX_HEAD_BYTES} bytes`);
+        }
+        break;
+      }
+      if (headEnd > MAX_HEAD_BYTES) {
+        throw new Error(`RTSP request head exceeds ${MAX_HEAD_BYTES} bytes`);
+      }
 
       const head = this.buffer.subarray(0, headEnd).toString('utf8');
       const request = parseHead(head);
       const contentLength = Number(request.headers['content-length'] ?? 0);
+      if (!Number.isInteger(contentLength) || contentLength < 0 || contentLength > MAX_BODY_BYTES) {
+        throw new Error(`RTSP request declares an invalid Content-Length (max ${MAX_BODY_BYTES} bytes)`);
+      }
       const bodyStart = headEnd + HEADER_END.length;
 
       // Hold back the request until its declared body has fully arrived.
@@ -217,6 +242,7 @@ const STATUS_TEXT: Record<number, string> = {
   461: 'Unsupported Transport',
   500: 'Internal Server Error',
   501: 'Not Implemented',
+  503: 'Service Unavailable',
 };
 
 /**

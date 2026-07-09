@@ -12,7 +12,7 @@ export type { NativeLoggingHandle, NativeLoggingOptions } from './native-logging
 
 // Sources
 export { AvSource } from './sources/av.js';
-export type { AvInput, AvSourceOptions } from './sources/av.js';
+export type { AvInput, AvReconnectOptions, AvSourceOptions } from './sources/av.js';
 
 export { MultiSource } from './sources/multi.js';
 export type { MultiSourceInput } from './sources/multi.js';
@@ -24,8 +24,9 @@ export type { CallbackSinkHandlers } from './sinks/callback.js';
 export { FfmpegSink } from './sinks/ffmpeg.js';
 export type { FfmpegOutput, FfmpegSinkOptions } from './sinks/ffmpeg.js';
 
-export { BackchannelTranscoder, RtspAuth, RtspServerSink } from './sinks/rtsp-server/index.js';
+export { BackchannelTranscoder, ForwardAudioTranscoder, RtspAuth, RtspServerSink } from './sinks/rtsp-server/index.js';
 export type {
+  AudioTranscodeTarget,
   BackchannelAdvertise,
   BackchannelInput,
   BackchannelTarget,

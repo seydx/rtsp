@@ -1,6 +1,6 @@
 // AvSource
 export { AvSource } from './av.js';
-export type { AvInput, AvSourceOptions } from './av.js';
+export type { AvInput, AvReconnectOptions, AvSourceOptions } from './av.js';
 
 // MultiSource
 export { MultiSource } from './multi.js';

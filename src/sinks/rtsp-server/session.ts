@@ -109,6 +109,24 @@ interface Transport {
 
 const SUPPORTED_METHODS = 'OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER';
 
+// Session timeout advertised to clients in the SETUP response, in seconds.
+const ADVERTISED_TIMEOUT_S = 60;
+
+// Idle window after which a non-playing session is reaped. Playing sessions are
+// exempt: interleaved clients typically stop sending keep-alives once RTP flows,
+// and their liveness is enforced by the write backpressure limit instead.
+const IDLE_TIMEOUT_MS = 2 * ADVERTISED_TIMEOUT_S * 1000;
+
+// How often each session checks itself for idleness.
+const IDLE_CHECK_INTERVAL_MS = 30_000;
+
+// Upper bound on bytes queued in a viewer's socket before the session is
+// dropped. The per-sink relay queue only protects the relay→sink path; a slow
+// or half-dead client would otherwise grow the kernel-side socket buffer plus
+// Node's writable queue without limit. 8 MiB is several seconds of a typical
+// HD stream — a client that far behind cannot catch up on live media anyway.
+const MAX_SOCKET_BUFFER_BYTES = 8 * 1024 * 1024;
+
 /**
  * A single connected RTSP viewer.
  *
@@ -142,11 +160,21 @@ export class RtspSession {
   /** Whether the session has been torn down; guards against double-close and post-close writes. */
   private closed = false;
 
+  /** Serializes request handling so pipelined requests are answered strictly in order. */
+  private pending: Promise<void> = Promise.resolve();
+
+  /** Wall-clock time of the last inbound bytes, used to reap idle non-playing sessions. */
+  private lastActivity = Date.now();
+
+  /** Periodic idle check; unref'd so it never keeps the process alive. */
+  private readonly idleTimer: ReturnType<typeof setInterval>;
+
   /**
    * Create a session bound to an accepted client socket.
    *
    * Wires up the socket's `data`, `error` and `close` events so the session can
-   * parse incoming control messages and tear itself down on disconnect.
+   * parse incoming control messages and tear itself down on disconnect, and arms
+   * the periodic idle check that reaps abandoned non-playing sessions.
    *
    * @param socket - The accepted TCP socket for this client
    *
@@ -161,6 +189,8 @@ export class RtspSession {
     socket.on('data', (chunk: Buffer) => this.onData(chunk));
     socket.on('error', () => this.close());
     socket.on('close', () => this.close());
+    this.idleTimer = setInterval(() => this.checkIdle(), IDLE_CHECK_INTERVAL_MS);
+    this.idleTimer.unref?.();
   }
 
   /**
@@ -184,6 +214,15 @@ export class RtspSession {
    */
   feed(streamId: number, isRtcp: boolean, isVideoKeyframe: boolean, data: Buffer): void {
     if (!this.playing || this.closed) return;
+
+    // Backpressure: a viewer that stops reading (or reads too slowly) would
+    // otherwise buffer unbounded media in this socket's write queue. Live media
+    // that far behind is unrecoverable — drop the session instead.
+    if (this.socket.writableLength > MAX_SOCKET_BUFFER_BYTES) {
+      this.host.logger?.warn?.(`[rtsp] viewer ${this.id} is too slow (${this.socket.writableLength} bytes queued) — closing session`);
+      this.close();
+      return;
+    }
 
     if (!this.started) {
       if (this.requiresKeyframe) {
@@ -209,6 +248,7 @@ export class RtspSession {
     if (this.closed) return;
     this.closed = true;
     this.playing = false;
+    clearInterval(this.idleTimer);
     this.host.sessionClosed(this);
     this.socket.destroy();
   }
@@ -242,6 +282,7 @@ export class RtspSession {
    * @internal
    */
   private onData(chunk: Buffer): void {
+    this.lastActivity = Date.now();
     let messages;
     try {
       messages = this.parser.push(chunk);
@@ -252,11 +293,32 @@ export class RtspSession {
     }
     for (const message of messages) {
       if (message.type === 'request') {
-        this.handle(message.request);
+        // Chain requests so a slow handler (e.g. DESCRIBE waiting on the
+        // upstream) cannot be overtaken by a later pipelined request — RTSP
+        // clients expect responses in request order.
+        const { request } = message;
+        this.pending = this.pending.then(() => this.handle(request));
       } else if (message.frame.channel === this.backchannelChannel) {
         // Talkback RTP from the client → forward upstream.
         this.host.onBackchannelRtp(message.frame.data);
       }
+    }
+  }
+
+  /**
+   * Reap the session when a non-playing client has gone quiet.
+   *
+   * Playing sessions are exempt: once RTP flows over the interleaved
+   * connection, many clients stop sending keep-alive requests entirely, and
+   * their liveness is covered by the socket backpressure limit in `feed`.
+   *
+   * @internal
+   */
+  private checkIdle(): void {
+    if (this.playing) return;
+    if (Date.now() - this.lastActivity > IDLE_TIMEOUT_MS) {
+      this.host.logger?.warn?.(`[rtsp] session ${this.id} idle for ${IDLE_TIMEOUT_MS}ms without playing — closing`);
+      this.close();
     }
   }
 
@@ -317,9 +379,11 @@ export class RtspSession {
    * Handle a DESCRIBE request by returning the upstream SDP.
    *
    * Activates the upstream source to obtain the SDP, then replies with it and a
-   * `Content-Base` so the client resolves relative track URIs correctly.
-   * Activation is asynchronous, so the session may have closed in the meantime;
-   * if so, nothing is sent.
+   * `Content-Base` so the client resolves relative track URIs correctly. When
+   * activation fails (the upstream cannot be opened or is torn down before its
+   * SDP resolves), the client receives 503 Service Unavailable so it can retry
+   * instead of hanging. Activation is asynchronous, so the session may have
+   * closed in the meantime; if so, nothing is sent.
    *
    * @param req - The DESCRIBE request, used for its target URI
    *
@@ -328,7 +392,14 @@ export class RtspSession {
    * @internal
    */
   private async onDescribe(req: RtspRequest, cseq: string | undefined): Promise<void> {
-    const sdp = await this.host.activate();
+    let sdp: string;
+    try {
+      sdp = await this.host.activate();
+    } catch (error) {
+      this.host.logger?.warn?.('[rtsp] DESCRIBE failed — upstream unavailable:', error);
+      this.send(buildResponse({ status: 503, cseq }));
+      return;
+    }
     if (this.closed) return;
     this.send(
       buildResponse({
@@ -376,7 +447,7 @@ export class RtspSession {
         cseq,
         headers: {
           Transport: `RTP/AVP/TCP;unicast;interleaved=${rtp}-${rtcp}`,
-          Session: `${this.id};timeout=60`,
+          Session: `${this.id};timeout=${ADVERTISED_TIMEOUT_S}`,
         },
       }),
     );

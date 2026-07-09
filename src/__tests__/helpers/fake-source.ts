@@ -42,11 +42,12 @@ export class FakeSource implements Source {
 
   constructor(
     private readonly info: StreamInfo,
-    private readonly opts: { failOpen?: Error } = {},
+    private readonly opts: { failOpen?: Error; openDelay?: number } = {},
   ) {}
 
   async open(): Promise<StreamInfo> {
     this.openCount++;
+    if (this.opts.openDelay) await new Promise((resolve) => setTimeout(resolve, this.opts.openDelay));
     if (this.opts.failOpen) throw this.opts.failOpen;
     this.opened = true;
     return this.info;

@@ -108,9 +108,22 @@ export interface RelayEvents {
    * Fired when the relay encounters a non-recoverable error.
    *
    * Carries the offending error. Raised when the upstream fails to open or the
-   * pump loop throws; the relay tears itself down afterwards.
+   * pump loop throws; the relay tears itself down afterwards. Emitting this
+   * event without a registered listener is safe — unlike a raw Node.js
+   * EventEmitter it does not throw, so consumers may opt out of error handling
+   * without risking a process crash.
    */
   error: (error: unknown) => void;
+
+  /**
+   * Fired when an individual sink fails while being initialized or written to.
+   *
+   * Carries the offending {@link Sink} and the error it raised. The relay
+   * isolates the failure — the sink's channel is closed (followed by
+   * `sink:removed`) while the upstream and all other sinks keep running — but
+   * surfaces it here so consumers can react instead of only seeing a log line.
+   */
+  'sink:error': (sink: Sink, error: unknown) => void;
 
   /**
    * Fired immediately after a sink is piped onto the relay.
@@ -207,7 +220,9 @@ export class Relay extends TypedEmitter<RelayEvents> {
     this.idleTimeout = options.idleTimeout ?? 0;
     this.maxQueue = options.maxQueue ?? DEFAULT_MAX_QUEUE;
 
-    if (options.autoStart) this.start();
+    // Fire-and-forget: runStart() already logs and emits 'error' on failure, so
+    // an eager start must not surface as an unhandled rejection.
+    if (options.autoStart) void this.start().catch(() => undefined);
   }
 
   /**
@@ -281,11 +296,12 @@ export class Relay extends TypedEmitter<RelayEvents> {
       maxQueue: this.maxQueue,
       logger: this.logger,
       onClosed: (c) => this.handleChannelClosed(c),
+      onError: (c, error) => this.emit('sink:error', c.sink, error),
     });
     this.channels.add(channel);
     this.cancelIdleTimer();
     this.emit('sink:added', sink);
-    this.activateChannel(channel);
+    void this.activateChannel(channel);
     return sink;
   }
 
@@ -389,7 +405,10 @@ export class Relay extends TypedEmitter<RelayEvents> {
    *
    * Aborts the pump loop, closes all sink channels immediately (without draining
    * their backlog), closes the source, resets internal state to idle, and emits
-   * `stop`. A no-op when the relay is already idle or stopping.
+   * `stop`. Safe to call while a start is still in flight: the pending open is
+   * aborted (via the source's `close()`) and awaited before teardown, so the
+   * relay can never transition to `running` after this resolves. A no-op when
+   * the relay is already idle or stopping.
    *
    * @returns A promise that resolves once teardown is complete
    *
@@ -403,15 +422,28 @@ export class Relay extends TypedEmitter<RelayEvents> {
   async stop(): Promise<void> {
     this.cancelIdleTimer();
     if (this.state === 'idle' || this.state === 'stopping') return;
+    const inFlightStart = this.state === 'starting' ? this.startPromise : undefined;
     this.state = 'stopping';
 
     this.pullAbort?.abort();
-    await Promise.all([...this.channels].map((c) => c.close()));
-
-    try {
-      await this.source.close();
-    } catch (error) {
-      this.logger?.error?.('[rtsp] source close failed:', error);
+    if (inFlightStart) {
+      // A start is still in flight. Closing the source first aborts a pending
+      // open(); then wait for runStart to observe 'stopping' and unwind, so it
+      // cannot flip the relay to 'running' after this teardown completed.
+      try {
+        await this.source.close();
+      } catch (error) {
+        this.logger?.error?.('[rtsp] source close failed:', error);
+      }
+      await inFlightStart.catch(() => undefined);
+      await Promise.all([...this.channels].map((c) => c.close()));
+    } else {
+      await Promise.all([...this.channels].map((c) => c.close()));
+      try {
+        await this.source.close();
+      } catch (error) {
+        this.logger?.error?.('[rtsp] source close failed:', error);
+      }
     }
 
     this.streamInfo = undefined;
@@ -427,8 +459,9 @@ export class Relay extends TypedEmitter<RelayEvents> {
    * Subscribes to the sink's `backchannel` event and, on the first inbound RTP
    * packet, spins up a {@link BackchannelTranscoder} converting from the
    * advertised codec to whatever the source's backchannel expects, forwarding the
-   * result upstream. The transcoder is created lazily and torn down when the
-   * relay stops.
+   * result upstream. The transcoder is created lazily, torn down when the relay
+   * stops, and discarded on pipeline failure so the next inbound packet rebuilds
+   * it instead of pushing into a dead pipeline forever.
    *
    * @param sink - The RTSP server sink emitting inbound viewer talkback
    *
@@ -440,6 +473,14 @@ export class Relay extends TypedEmitter<RelayEvents> {
     let transcoder: BackchannelTranscoder | undefined;
     let starting: Promise<void> | undefined;
 
+    const reset = (): void => {
+      const closing = transcoder;
+      transcoder = undefined;
+      starting = undefined;
+      // Fire-and-forget: close() reports its own failures via the logger.
+      void closing?.close();
+    };
+
     sink.on('backchannel', (rtp) => {
       const source = this.source;
       if (!supportsBackchannel(source) || !source.backchannel) return;
@@ -449,18 +490,23 @@ export class Relay extends TypedEmitter<RelayEvents> {
           from: advertise,
           to: { codec: camera.codec, codecId: camera.codecId, sampleRate: camera.clockRate, channels: camera.channels, format: 'rtp' },
           output: (buf) => source.sendBackchannel(buf),
+          onError: (error) => {
+            this.logger?.error?.('[rtsp] backchannel transcoder failed:', error);
+            reset();
+          },
           logger: this.logger,
         });
         starting = transcoder.start();
+        starting.catch((error) => {
+          this.logger?.error?.('[rtsp] backchannel transcoder failed to start:', error);
+          reset();
+        });
       }
-      starting?.then(() => transcoder?.push(rtp)).catch((error) => this.logger?.error?.('[rtsp] backchannel transcoder failed:', error));
+      // Start failures are handled above; the push chain only needs to not throw.
+      starting?.then(() => transcoder?.push(rtp)).catch(() => undefined);
     });
 
-    this.on('stop', () => {
-      void transcoder?.close();
-      transcoder = undefined;
-      starting = undefined;
-    });
+    this.on('stop', reset);
   }
 
   /**
@@ -512,25 +558,38 @@ export class Relay extends TypedEmitter<RelayEvents> {
     this.state = 'starting';
     try {
       const info = await this.source.open();
+      // stop() may have been requested while the open was in flight; it owns
+      // the teardown, so unwind quietly instead of going live on a closed source.
+      if (this.state !== 'starting') return;
       this.streamInfo = info;
       this.videoIndexes.clear();
       for (const track of info.tracks) {
         if (track.kind === 'video') this.videoIndexes.add(track.index);
       }
+      const hadChannels = this.channels.size > 0;
       // Initialize sinks that are already attached before any packet flows —
       // otherwise a fast (non-realtime) source can drain before they're ready.
       await Promise.all(
         [...this.channels].map((c) =>
           c.init(info).catch((error) => {
             this.logger?.error?.('[rtsp] sink init failed:', error);
+            this.emit('sink:error', c.sink, error);
             return c.close();
           }),
         ),
       );
+      if (this.state !== 'starting') return;
       this.state = 'running';
       this.emit('start', info);
       void this.pumpLoop();
+      // Every attached sink may have died during init. Explicit start()/autoStart
+      // with no sinks keeps running (sinks are piped later), but when sinks were
+      // present and are all gone, fall back to the idle teardown path — otherwise
+      // the upstream would pump into the void forever.
+      if (hadChannels && this.channels.size === 0) this.scheduleIdleStop();
     } catch (error) {
+      // An open aborted by a concurrent stop() is deliberate, not a failure.
+      if ((this.state as RelayState) !== 'starting') return;
       this.startPromise = undefined;
       this.state = 'idle';
       this.emit('error', error);
@@ -563,13 +622,15 @@ export class Relay extends TypedEmitter<RelayEvents> {
       }
       if (!abort.signal.aborted) {
         this.emit('end');
-        this.gracefulStop();
+        // Fire-and-forget: gracefulStop() handles its own failures internally.
+        void this.gracefulStop();
       }
     } catch (error) {
       if (!abort.signal.aborted) {
         this.logger?.error?.('[rtsp] upstream pump failed:', error);
         this.emit('error', error);
-        this.stop();
+        // Fire-and-forget: stop() handles its own failures internally.
+        void this.stop();
       }
     }
   }
@@ -617,7 +678,16 @@ export class Relay extends TypedEmitter<RelayEvents> {
       return;
     }
     if (!this.channels.has(channel)) return;
-    if (this.streamInfo) await channel.init(this.streamInfo);
+    if (!this.streamInfo) return;
+    try {
+      await channel.init(this.streamInfo);
+    } catch (error) {
+      // A failing sink must not become an unhandled rejection (pipe() cannot
+      // await this); isolate it like any other sink failure.
+      this.logger?.error?.('[rtsp] sink init failed:', error);
+      this.emit('sink:error', channel.sink, error);
+      await channel.close();
+    }
   }
 
   /**

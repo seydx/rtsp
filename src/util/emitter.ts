@@ -105,7 +105,9 @@ export class TypedEmitter<Events extends Record<keyof Events, (...args: any[]) =
    * Emit an event, invoking all registered listeners synchronously.
    *
    * The arguments are type-checked against the listener signature for the
-   * given event.
+   * given event. Unlike a raw Node.js EventEmitter, emitting `error` without a
+   * registered listener does **not** throw — a consumer that opted out of error
+   * events must never crash the process over one.
    *
    * @param event - Name of the event to emit
    *
@@ -119,6 +121,9 @@ export class TypedEmitter<Events extends Record<keyof Events, (...args: any[]) =
    * ```
    */
   emit<E extends keyof Events>(event: E, ...args: Parameters<Events[E]>): boolean {
+    // Node treats 'error' specially: emitting it with no listener throws the
+    // payload. Swallow that case instead — this is a library-facing emitter.
+    if (event === 'error' && this.emitter.listenerCount('error') === 0) return false;
     return this.emitter.emit(event as string, ...args);
   }
 

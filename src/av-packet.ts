@@ -1,5 +1,23 @@
+import { AV_NOPTS_VALUE } from 'node-av';
+
 import type { MediaPacket } from './types.js';
 import type { Packet } from 'node-av';
+
+/**
+ * Convert a native packet timestamp to the {@link MediaPacket} number form.
+ *
+ * node-av reports timestamps as `bigint` with `AV_NOPTS_VALUE` marking "unset";
+ * the relay contract exposes them as optional numbers instead.
+ *
+ * @param value - The native `bigint` timestamp
+ *
+ * @returns The timestamp as a number, or `undefined` when unset
+ *
+ * @internal
+ */
+function toTimestamp(value: bigint): number | undefined {
+  return value === AV_NOPTS_VALUE ? undefined : Number(value);
+}
 
 /**
  * Wrap a node-av packet as a relay media packet.
@@ -40,6 +58,8 @@ export function wrapAvPacket(packet: Packet, streamIndex = packet.streamIndex): 
   return {
     streamIndex,
     isKeyframe: packet.isKeyframe,
+    pts: toTimestamp(packet.pts),
+    dts: toTimestamp(packet.dts),
     av: packet,
     clone: () => {
       const copy = packet.clone();

@@ -38,6 +38,15 @@ export interface SinkChannelOptions {
    * reference to this channel.
    */
   onClosed?: (channel: SinkChannel) => void;
+
+  /**
+   * Callback invoked when the underlying sink fails.
+   *
+   * Fired with the error raised by a failing `write()` before the channel closes
+   * itself, so the owning relay can surface the failure to its consumer instead
+   * of only logging it.
+   */
+  onError?: (channel: SinkChannel, error: unknown) => void;
 }
 
 /**
@@ -71,6 +80,7 @@ export class SinkChannel {
   private acceptOffers = true;
   private inited = false;
   private initPromise?: Promise<void>;
+  private idleWaiters: (() => void)[] = [];
 
   /**
    * Create a fan-out channel for one sink.
@@ -191,8 +201,8 @@ export class SinkChannel {
   async drainAndClose(): Promise<void> {
     if (this.closed) return;
     this.acceptOffers = false;
-    while ((this.queue.length > 0 || this.draining) && !this.closed) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
+    while (!this.closed && (this.queue.length > 0 || this.draining)) {
+      await this.whenDrainIdle();
     }
     await this.close();
   }
@@ -225,7 +235,7 @@ export class SinkChannel {
     // an "Invalid packet" error at best and a process-killing use-after-free at
     // worst. draining always clears in drain()'s finally, so this can't hang.
     while (this.draining) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await this.whenDrainIdle();
     }
     try {
       await this.sink.close();
@@ -285,14 +295,42 @@ export class SinkChannel {
         } catch (error) {
           this.options.logger?.error?.('[rtsp] sink write failed — closing channel:', error);
           packet.free();
-          this.close();
+          this.options.onError?.(this, error);
+          void this.close();
           return;
         }
         packet.free();
       }
     } finally {
       this.draining = false;
+      this.notifyDrainIdle();
     }
+  }
+
+  /**
+   * Resolve once the current drain pass has finished.
+   *
+   * Resolves on the next {@link notifyDrainIdle}, i.e. whenever `drain()` exits
+   * its loop (queue empty, channel closed, or write failure). Callers loop on
+   * their own condition, so a single resolution per drain pass is sufficient.
+   *
+   * @returns A promise that resolves when the in-flight drain settles
+   *
+   * @internal
+   */
+  private whenDrainIdle(): Promise<void> {
+    return new Promise((resolve) => this.idleWaiters.push(resolve));
+  }
+
+  /**
+   * Wake every caller waiting on the drain loop to settle.
+   *
+   * @internal
+   */
+  private notifyDrainIdle(): void {
+    const waiters = this.idleWaiters;
+    this.idleWaiters = [];
+    for (const resolve of waiters) resolve();
   }
 
   /**

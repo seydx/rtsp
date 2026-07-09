@@ -57,16 +57,6 @@ export interface FfmpegSinkOptions {
 }
 
 /**
- * Mapping between a source track index and its muxer stream index.
- *
- * @internal
- */
-interface MappedStream {
-  muxIndex: number;
-  sourceIndex: number;
-}
-
-/**
  * Sink that remuxes the relayed stream into another container.
  *
  * Pipes the relay's packets into a node-av muxer entirely in-process, with no
@@ -99,7 +89,8 @@ interface MappedStream {
  */
 export class FfmpegSink implements Sink {
   private muxer?: Muxer;
-  private readonly map = new Map<number, MappedStream>();
+  /** Source track index → muxer stream index. */
+  private readonly map = new Map<number, number>();
 
   /**
    * Create a new ffmpeg sink.
@@ -141,7 +132,7 @@ export class FfmpegSink implements Sink {
       // Only AV-backed tracks carry a native stream that can be copied through.
       if (!track.native) continue;
       const muxIndex = this.muxer.addStream(track.native);
-      this.map.set(track.index, { muxIndex, sourceIndex: track.index });
+      this.map.set(track.index, muxIndex);
     }
   }
 
@@ -161,9 +152,9 @@ export class FfmpegSink implements Sink {
    * ```
    */
   async write(packet: MediaPacket): Promise<void> {
-    const mapped = this.map.get(packet.streamIndex);
-    if (!mapped || !this.muxer || !packet.av) return;
-    await this.muxer.writePacket(packet.av, mapped.muxIndex);
+    const muxIndex = this.map.get(packet.streamIndex);
+    if (muxIndex === undefined || !this.muxer || !packet.av) return;
+    await this.muxer.writePacket(packet.av, muxIndex);
   }
 
   /**

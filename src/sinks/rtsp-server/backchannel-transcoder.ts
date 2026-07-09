@@ -152,6 +152,16 @@ export interface BackchannelTranscoderOptions {
   output: (data: Buffer) => void;
 
   /**
+   * Callback invoked when the running pipeline fails.
+   *
+   * Fired for runtime failures while the transcoder is active (never for
+   * teardown-induced errors). The pipeline is dead at that point — the owner
+   * should close this instance and, if talkback should keep working, create a
+   * fresh one for the next inbound packet.
+   */
+  onError?: (error: unknown) => void;
+
+  /**
    * Intermediate sample format name for the resample stage.
    *
    * Resolved via FFmpeg's sample-format names (for example `s16`, `fltp`).
@@ -203,6 +213,9 @@ export class BackchannelTranscoder {
   private streamIndex?: number;
   private active = false;
 
+  /** Resolves when the background process() loop has fully unwound; awaited by close(). */
+  private processing?: Promise<void>;
+
   /**
    * Create a backchannel transcoder.
    *
@@ -244,47 +257,54 @@ export class BackchannelTranscoder {
     const encoderCodec = to.codec ? Codec.findEncoderByName(to.codec as FFEncoderCodec) : to.codecId !== undefined ? Codec.findEncoder(to.codecId) : undefined;
     if (!encoderCodec) throw new Error(`Unsupported talkback target codec: ${to.codec ?? to.codecId}`);
 
-    // A free local port is required to form a valid input SDP, even though no
-    // socket is actually bound — packets are fed in directly via push().
-    const port = await getPort({ host: '127.0.0.1' });
-    const sdp = StreamingUtils.createInputSDP([
-      { port, codecId: decoderCodec.id, payloadType: from.payloadType, clockRate: from.clockRate, channels: from.channels, fmtp: from.fmtp },
-    ]);
+    try {
+      // A free local port is required to form a valid input SDP, even though no
+      // socket is actually bound — packets are fed in directly via push().
+      const port = await getPort({ host: '127.0.0.1' });
+      const sdp = StreamingUtils.createInputSDP([
+        { port, codecId: decoderCodec.id, payloadType: from.payloadType, clockRate: from.clockRate, channels: from.channels, fmtp: from.fmtp },
+      ]);
 
-    this.rtpInput = await Demuxer.openSDP(sdp);
-    const audio = this.rtpInput.input.audio();
-    if (!audio) throw new Error('No audio stream in talkback SDP');
+      this.rtpInput = await Demuxer.openSDP(sdp);
+      const audio = this.rtpInput.input.audio();
+      if (!audio) throw new Error('No audio stream in talkback SDP');
 
-    this.decoder = await Decoder.create(audio, { exitOnError: false });
+      this.decoder = await Decoder.create(audio, { exitOnError: false });
 
-    const layout = to.channels === 1 ? 'mono' : 'stereo';
-    const sampleFormat = this.options.sampleFormat ? avGetSampleFmtFromName(this.options.sampleFormat) : AV_SAMPLE_FMT_S16;
-    const chain = FilterPreset.chain();
-    chain.aformat(sampleFormat, to.sampleRate, layout);
-    this.filter = FilterAPI.create(chain.build());
+      const layout = to.channels === 1 ? 'mono' : 'stereo';
+      const sampleFormat = this.options.sampleFormat ? avGetSampleFmtFromName(this.options.sampleFormat) : AV_SAMPLE_FMT_S16;
+      const chain = FilterPreset.chain();
+      chain.aformat(sampleFormat, to.sampleRate, layout);
+      this.filter = FilterAPI.create(chain.build());
 
-    this.encoder = await Encoder.create(encoderCodec, {
-      decoder: this.decoder,
-      filter: this.filter,
-      autoResample: true,
-      ...(to.bitRate ? { bitrate: to.bitRate } : {}),
-      options: { sample_rate: to.sampleRate, channels: to.channels },
-    });
+      this.encoder = await Encoder.create(encoderCodec, {
+        decoder: this.decoder,
+        filter: this.filter,
+        autoResample: true,
+        ...(to.bitRate ? { bitrate: to.bitRate } : {}),
+        options: { sample_rate: to.sampleRate, channels: to.channels },
+      });
 
-    this.output = await Muxer.open(
-      {
-        write: (buffer: Buffer) => {
-          this.options.output(Buffer.from(buffer));
-          return buffer.length;
+      this.output = await Muxer.open(
+        {
+          write: (buffer: Buffer) => {
+            this.options.output(Buffer.from(buffer));
+            return buffer.length;
+          },
         },
-      },
-      { input: this.rtpInput, format: to.format ?? 'rtp', maxPacketSize: to.maxPacketSize ?? 1200 } as never,
-    );
-    this.streamIndex = this.output.addStream(this.encoder);
+        { input: this.rtpInput, format: to.format ?? 'rtp', maxPacketSize: to.maxPacketSize ?? 1200 } as never,
+      );
+      this.streamIndex = this.output.addStream(this.encoder);
+    } catch (error) {
+      // A partially built pipeline must not leak its native stages when a later
+      // stage fails to come up.
+      await this.release();
+      throw error;
+    }
     this.active = true;
 
-    // Drive the pipeline in the background; it runs until close() flips active off.
-    this.process();
+    // Drive the pipeline in the background; it runs until close() tears it down.
+    this.processing = this.process();
   }
 
   /**
@@ -308,9 +328,11 @@ export class BackchannelTranscoder {
   /**
    * Stop the transcoder and release all pipeline resources.
    *
-   * Marks the transcoder inactive, ending the background loop, then closes the
-   * input demuxer, decoder, filter, encoder, and output muxer. Safe to call when
-   * the transcoder was never started or is already closed.
+   * Marks the transcoder inactive, interrupts the blocked demuxer read so the
+   * background loop can unwind, waits for it to finish, and only then closes the
+   * input demuxer, decoder, filter, encoder, and output muxer — freeing a native
+   * stage while the loop still reads from it would be a use-after-free. Safe to
+   * call when the transcoder was never started or is already closed.
    *
    * @returns Resolves once all resources are released
    *
@@ -320,13 +342,37 @@ export class BackchannelTranscoder {
    * ```
    */
   async close(): Promise<void> {
-    if (!this.active) return;
     this.active = false;
+    // Unblock a read parked on the empty RTP queue and signal EOF so the
+    // process() loop drains and exits before anything is freed underneath it.
+    this.rtpInput?.input.interrupt();
+    await this.processing;
+    this.processing = undefined;
+    await this.release();
+  }
+
+  /**
+   * Close and drop every pipeline stage that has been created so far.
+   *
+   * Must only run when no read/process loop is using the stages — callers
+   * either never started the loop (failed start) or awaited its completion.
+   *
+   * @returns Resolves once all stages are released
+   *
+   * @internal
+   */
+  private async release(): Promise<void> {
     await this.rtpInput?.close();
     this.decoder?.close();
     this.filter?.close();
     this.encoder?.close();
     await this.output?.close();
+    this.rtpInput = undefined;
+    this.decoder = undefined;
+    this.filter = undefined;
+    this.encoder = undefined;
+    this.output = undefined;
+    this.streamIndex = undefined;
   }
 
   /**
@@ -334,8 +380,8 @@ export class BackchannelTranscoder {
    *
    * Pulls inbound packets through the chained node-av stages and writes each
    * encoded packet to the output muxer. Pipeline errors are reported through the
-   * configured logger, but only while the transcoder is still active so that
-   * teardown does not surface spurious failures.
+   * configured logger and `onError` callback, but only while the transcoder is
+   * still active so that teardown does not surface spurious failures.
    *
    * @returns Resolves when the loop ends (on close or after an error)
    *
@@ -351,8 +397,12 @@ export class BackchannelTranscoder {
       }
     } catch (error) {
       // Suppress errors raised by closing the pipeline mid-flight; only real
-      // runtime failures (still active) are worth reporting.
-      if (this.active) this.options.logger?.error?.('[rtsp] backchannel transcode failed:', error);
+      // runtime failures (still active) are worth reporting. The pipeline is
+      // dead after a failure — surface it so the owner can rebuild.
+      if (this.active) {
+        this.options.logger?.error?.('[rtsp] backchannel transcode failed:', error);
+        this.options.onError?.(error);
+      }
     }
   }
 }

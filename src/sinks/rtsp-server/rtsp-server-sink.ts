@@ -1,13 +1,16 @@
 import { AV_PKT_DATA_NEW_EXTRADATA, BitStreamFilterAPI, Muxer, StreamingUtils } from 'node-av';
 import { createServer } from 'node:net';
 
+import { deferred } from '../../util/deferred.js';
 import { TypedEmitter } from '../../util/emitter.js';
+import { ForwardAudioTranscoder } from './forward-audio-transcoder.js';
 import { RtspSession } from './session.js';
 
 import type { Server } from 'node:net';
 import type { Relay } from '../../relay.js';
 import type { Logger, MediaPacket, Sink, StreamInfo, TrackInfo, TrackKind } from '../../types.js';
 import type { RtspAuth } from './auth.js';
+import type { AudioTranscodeTarget } from './forward-audio-transcoder.js';
 import type { RtspSessionHost } from './session.js';
 
 /**
@@ -85,6 +88,20 @@ export interface RtspServerSinkOptions {
   backchannel?: boolean | BackchannelAdvertise;
 
   /**
+   * Normalize incoming audio by decoding and re-encoding it, instead of the
+   * default bitstream-filter passthrough.
+   *
+   * Some upstreams deliver unreliable or incompatible elementary audio (for
+   * example raw ADTS AAC whose header layout a passthrough bitstream filter
+   * cannot adapt), which otherwise fails the whole delivery channel. When set,
+   * every `audio` track is routed through a decode → resample → re-encode
+   * pipeline and the re-encoded packets are muxed, producing standards-compliant
+   * parameters the RTP muxer always accepts. Video and data tracks are never
+   * affected; omitted target fields preserve the decoded source's values.
+   */
+  audioTranscode?: AudioTranscodeTarget;
+
+  /**
    * Logger used to emit diagnostics about the server lifecycle and per-request
    * activity.
    *
@@ -135,6 +152,7 @@ interface TrackMuxer {
   sdpStreamId: number;
   kind: TrackKind;
   bsf?: BitStreamFilterAPI;
+  transcode?: ForwardAudioTranscoder;
   extradataInjected?: boolean;
 }
 
@@ -237,29 +255,6 @@ function bsfForTrack(track: TrackInfo): string | null {
 }
 
 /**
- * A promise paired with its resolver for out-of-band completion.
- *
- * @internal
- */
-interface Deferred<T> {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-}
-
-/**
- * Create a deferred whose promise is resolved later by an external caller.
- *
- * @returns A deferred bundling the pending promise and its resolver.
- *
- * @internal
- */
-function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((r) => (resolve = r));
-  return { promise, resolve };
-}
-
-/**
  * Sink that re-publishes a relayed stream as a multi-client RTSP server.
  *
  * Each track is packetized exactly once and the resulting RTP is fanned out to
@@ -318,6 +313,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
   private piped = false;
 
   private readonly backchannelOption?: boolean | BackchannelAdvertise;
+  private readonly audioTranscode?: AudioTranscodeTarget;
   private backchannelAdvertise?: BackchannelAdvertise;
   backchannelStreamId?: number;
 
@@ -345,6 +341,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     this.auth = options.auth;
     this.logger = options.logger;
     this.backchannelOption = options.backchannel;
+    this.audioTranscode = options.audioTranscode;
   }
 
   /**
@@ -431,6 +428,10 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
         resolve();
       });
     });
+    // Keep a handler attached for the server's lifetime: a later runtime error
+    // (e.g. EMFILE on accept) would otherwise crash the process as an
+    // unhandled 'error' event.
+    server.on('error', (error) => this.logger?.error?.('[rtsp] server error:', error));
     this.logger?.log?.(`[rtsp] serving ${this.url}`);
     return this;
   }
@@ -484,6 +485,9 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    *
    * @returns The SDP describing the available media, including any talkback section.
    *
+   * @throws {Error} If the sink is torn down (e.g. the upstream failed to start)
+   * before the SDP became available.
+   *
    * @example
    * ```typescript
    * const sdp = await server.activate();
@@ -536,20 +540,26 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     }
     if (this.sessions.size === 0 && this.piped) {
       // No clients left — let the relay (and thus the upstream) go idle.
-      this.relay.unpipe(this);
+      // Fire-and-forget: unpipe never rejects (channel close isolates errors).
+      void this.relay.unpipe(this);
     }
   }
 
   /**
    * Initialize the sink for a freshly opened upstream.
    *
-   * Creates one RTP muxer per source track, records the track kinds, and (when
-   * requested) resolves the talkback media to advertise. Called by the relay when
-   * the upstream stream description becomes available.
+   * Creates one RTP muxer per relayable source track, records the track kinds,
+   * and (when requested) resolves the talkback media to advertise. Data tracks
+   * and tracks without a native stream handle are skipped: they cannot be RTP
+   * packetized, and waiting for a header from a track that rarely (or never)
+   * produces packets would stall SDP generation and hang every DESCRIBE. Called
+   * by the relay when the upstream stream description becomes available.
    *
    * @param info - Description of the upstream tracks and any backchannel it offers.
    *
    * @returns A promise that resolves once all per-track muxers are open.
+   *
+   * @throws {Error} If the upstream carries no track that can be served over RTP.
    *
    * @example
    * ```typescript
@@ -557,10 +567,19 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    * ```
    */
   async init(info: StreamInfo): Promise<void> {
-    this.trackKinds = info.tracks.map((t) => t.kind);
+    const kinds: TrackKind[] = [];
     let sdpStreamId = 0;
     for (const track of info.tracks) {
+      if (track.kind === 'data') {
+        this.logger?.debug?.(`[rtsp] skipping data track #${track.index} (not RTP-servable)`);
+        continue;
+      }
+      if (!track.native) {
+        this.logger?.warn?.(`[rtsp] skipping ${track.kind} track #${track.index} — no native stream handle (non-AV source?)`);
+        continue;
+      }
       const id = sdpStreamId++;
+      kinds.push(track.kind);
       const muxer = await Muxer.open(
         {
           write: (buffer: Buffer) => {
@@ -570,21 +589,35 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
         },
         { format: 'rtp', maxPacketSize: this.mtu } as never,
       );
-      const muxIndex = muxer.addStream(track.native!);
-      const entry: TrackMuxer = { muxer, muxIndex, sourceIndex: track.index, sdpStreamId: id, kind: track.kind };
+      const entry: TrackMuxer = { muxer, muxIndex: -1, sourceIndex: track.index, sdpStreamId: id, kind: track.kind };
 
-      // Raw elementary streams (e.g. ADTS AAC) need a bitstream filter before the
-      // RTP muxer can write its header / generate SDP. The output stream is
-      // adapted lazily once the filter has produced its parameters (see write()).
-      const bsfName = bsfForTrack(track);
-      if (bsfName) {
-        entry.bsf = BitStreamFilterAPI.create(bsfName, track.native!);
-        this.logger?.debug?.(`[rtsp] applying ${bsfName} to ${track.kind} track #${track.index}`);
+      if (track.kind === 'audio' && this.audioTranscode) {
+        // Consumer opted into normalizing this audio: decode and re-encode it
+        // rather than passing an incompatible elementary stream through a
+        // bitstream filter. The transcoder owns the output stream (the encoder).
+        const transcoder = new ForwardAudioTranscoder(this.audioTranscode, this.logger);
+        entry.muxIndex = await transcoder.start(track.native, muxer);
+        entry.transcode = transcoder;
+      } else {
+        entry.muxIndex = muxer.addStream(track.native);
+
+        // Raw elementary streams (e.g. ADTS AAC) need a bitstream filter before the
+        // RTP muxer can write its header / generate SDP. The output stream is
+        // adapted lazily once the filter has produced its parameters (see write()).
+        const bsfName = bsfForTrack(track);
+        if (bsfName) {
+          entry.bsf = BitStreamFilterAPI.create(bsfName, track.native);
+          this.logger?.debug?.(`[rtsp] applying ${bsfName} to ${track.kind} track #${track.index}`);
+        }
       }
 
       this.muxers.push(entry);
       this.muxerBySource.set(track.index, entry);
       this.pendingHeaders.add(id);
+    }
+    this.trackKinds = kinds;
+    if (this.muxers.length === 0) {
+      throw new Error('RtspServerSink: upstream carries no RTP-servable (video/audio) track');
     }
 
     // Talkback media is advertised after the regular tracks so its streamid follows them.
@@ -621,7 +654,9 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     // Remember the current packet's keyframe flag so onRtp can gate viewers on an IDR.
     this.currentKeyframe = packet.isKeyframe;
 
-    if (entry.bsf) {
+    if (entry.transcode) {
+      await entry.transcode.write(packet.av, entry.muxer);
+    } else if (entry.bsf) {
       await this.writeFiltered(entry, packet);
     } else {
       await entry.muxer.writePacket(packet.av, entry.muxIndex);
@@ -687,11 +722,16 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    */
   async close(): Promise<void> {
     for (const m of this.muxers) m.bsf?.close();
+    await Promise.all(this.muxers.flatMap((m) => (m.transcode ? [m.transcode.close()] : [])));
     await Promise.all(this.muxers.map((m) => m.muxer.close().catch(() => undefined)));
     this.muxers.length = 0;
     this.muxerBySource.clear();
     this.pendingHeaders = new Set();
     this.sdpResolved = false;
+    // Fail any DESCRIBE still waiting on the old SDP — the upstream is gone
+    // (failed start or teardown), and leaving the promise pending would hang
+    // those viewers forever. A settled deferred ignores the reject.
+    this.sdp.reject(new Error('RTSP server sink closed before the SDP became available'));
     this.sdp = deferred<string>();
     this.backchannelAdvertise = undefined;
     this.backchannelStreamId = undefined;

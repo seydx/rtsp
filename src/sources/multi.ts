@@ -209,9 +209,10 @@ export class MultiSource implements Source {
    * Pumps all opened demuxers concurrently into a shared queue and emits their
    * packets as they arrive, rewriting each packet's stream index into the
    * flattened global space. Iteration ends when every input has been drained or
-   * the signal aborts; any unconsumed packets are released. If a demuxer fails
-   * while reading and the signal has not aborted, the failure surfaces once the
-   * iterator finishes.
+   * the signal aborts; any unconsumed packets are released. If any demuxer fails
+   * while reading and the signal has not aborted, the remaining inputs are
+   * aborted and the failure is thrown immediately — a combined source missing
+   * one of its inputs is treated as broken as a whole.
    *
    * @param signal - Abort signal that stops iteration and frees pending packets
    *
@@ -270,6 +271,11 @@ export class MultiSource implements Source {
           // failures should surface to the consumer.
           if (!signal.aborted && !this.abort?.signal.aborted) {
             failure = error instanceof Error ? error : new Error('MultiSource read failed');
+            // Fail fast: a combined source that silently lost one of its inputs
+            // (e.g. the audio leg of a split A/V camera) is broken as a whole.
+            // Abort the sibling pumps so the consumer sees the failure now
+            // instead of after the surviving inputs happen to end.
+            this.abort?.abort();
           }
         } finally {
           live--;
@@ -279,15 +285,22 @@ export class MultiSource implements Source {
     );
 
     try {
-      while (!signal.aborted) {
+      while (!signal.aborted && !failure) {
         if (queue.length > 0) {
           yield queue.shift()!;
           continue;
         }
         if (live === 0) break;
+        // Wake on the next queued packet or on abort — and drop the abort
+        // listener either way, otherwise every wait leaks one listener onto the
+        // long-lived relay signal.
         await new Promise<void>((resolve) => {
-          waiters.push(resolve);
-          signal.addEventListener('abort', () => resolve(), { once: true });
+          const onAbort = (): void => resolve();
+          waiters.push(() => {
+            signal.removeEventListener('abort', onAbort);
+            resolve();
+          });
+          signal.addEventListener('abort', onAbort, { once: true });
         });
       }
     } finally {

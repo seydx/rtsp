@@ -73,6 +73,21 @@ export interface AvSourceOptions {
   loop?: boolean;
 
   /**
+   * Automatically reopen the input after a read failure.
+   *
+   * Without this, a mid-stream error (camera reboot, network blip) ends the
+   * packet iterator and surfaces the error to the consumer. With reconnect
+   * enabled, the source instead closes and reopens the input with an
+   * exponential backoff, resuming packet delivery once the upstream answers
+   * again. An unexpected end-of-stream is also treated as a disconnect when
+   * {@link AvSourceOptions.loop} is not set. Pass `true` for the defaults or an
+   * {@link AvReconnectOptions} to tune the backoff. The reconnected input is
+   * assumed to expose the same stream layout as the original; downstream sinks
+   * are not re-initialized.
+   */
+  reconnect?: boolean | AvReconnectOptions;
+
+  /**
    * Request the ONVIF backchannel (talkback) on an RTSP input.
    *
    * When enabled, `backchannel=1` is appended to the RTSP URL and, once the
@@ -99,6 +114,84 @@ export interface AvSourceOptions {
    * silently.
    */
   logger?: Logger;
+}
+
+/**
+ * Backoff tuning for {@link AvSourceOptions.reconnect}.
+ *
+ * Controls how aggressively the source retries reopening its input after a
+ * read failure. Every field is optional; the defaults reconnect quickly at
+ * first and back off exponentially so an unreachable camera is not hammered.
+ */
+export interface AvReconnectOptions {
+  /**
+   * Initial delay before the first reopen attempt, in milliseconds.
+   *
+   * Doubled on every consecutive failed attempt up to
+   * {@link AvReconnectOptions.maxDelayMs}. Defaults to `1000`.
+   */
+  delayMs?: number;
+
+  /**
+   * Upper bound for the exponential backoff delay, in milliseconds.
+   *
+   * Defaults to `30000`.
+   */
+  maxDelayMs?: number;
+
+  /**
+   * Maximum number of consecutive failed attempts before giving up.
+   *
+   * Counts attempts since the last successfully delivered packet; once
+   * exceeded, the original error is thrown to the consumer. Defaults to
+   * unlimited retries.
+   */
+  maxRetries?: number;
+}
+
+/**
+ * Resolved reconnect policy with all defaults applied.
+ *
+ * @internal
+ */
+interface ReconnectPolicy {
+  delayMs: number;
+  maxDelayMs: number;
+  maxRetries: number;
+}
+
+/**
+ * Normalize the user-facing reconnect option into a concrete policy.
+ *
+ * @param option - The raw `reconnect` option value
+ *
+ * @returns The resolved policy, or `undefined` when reconnecting is disabled
+ *
+ * @internal
+ */
+function resolveReconnect(option: boolean | AvReconnectOptions | undefined): ReconnectPolicy | undefined {
+  if (!option) return undefined;
+  const opts = option === true ? {} : option;
+  return {
+    delayMs: opts.delayMs ?? 1000,
+    maxDelayMs: opts.maxDelayMs ?? 30_000,
+    maxRetries: opts.maxRetries ?? Number.POSITIVE_INFINITY,
+  };
+}
+
+/**
+ * Compute the exponential backoff delay for the given attempt number.
+ *
+ * @param policy - The resolved reconnect policy
+ *
+ * @param attempt - 1-based count of consecutive failed attempts
+ *
+ * @returns The delay in milliseconds, capped at the policy's maximum
+ *
+ * @internal
+ */
+function backoffDelay(policy: ReconnectPolicy, attempt: number): number {
+  return Math.min(policy.delayMs * 2 ** (attempt - 1), policy.maxDelayMs);
 }
 
 /**
@@ -279,14 +372,17 @@ export class AvSource implements Source, BackchannelSource {
    *
    * Drives one read pass over the input; when {@link AvSourceOptions.loop} is
    * enabled, the input is reopened on completion and streaming continues on the
-   * same wall clock until aborted. {@link AvSource.open} must have been called
-   * first.
+   * same wall clock until aborted. With {@link AvSourceOptions.reconnect}, read
+   * failures (and unexpected end-of-stream) reopen the input under an
+   * exponential backoff instead of ending iteration. {@link AvSource.open} must
+   * have been called first.
    *
    * @param signal - Abort signal that stops iteration and aborts any in-flight pacing delay
    *
    * @yields {MediaPacket} Demuxed media packets (each must be freed by the caller)
    *
-   * @throws {Error} If called before {@link AvSource.open}
+   * @throws {Error} If called before {@link AvSource.open}, or when a read fails
+   * and reconnecting is disabled or its retries are exhausted
    *
    * @example
    * ```typescript
@@ -307,19 +403,51 @@ export class AvSource implements Source, BackchannelSource {
     if (signal.aborted) onAbort();
     else signal.addEventListener('abort', onAbort, { once: true });
 
+    const reconnect = resolveReconnect(this.opts.reconnect);
+    // Consecutive failed attempts; reset once a reopened input delivers packets.
+    const retry = { attempts: 0 };
+
     // Expose the read loop's lifetime so close() can wait for it to unwind before
     // freeing the demuxer — closing a demuxer mid-read is a process-killing UAF.
     let done!: () => void;
     this.reading = new Promise<void>((resolve) => (done = resolve));
     try {
-      do {
-        yield* this.readOnce(signal);
-        if (signal.aborted || !this.opts.loop) break;
-        // Loop: reopen the input and keep streaming on the same wall clock.
-        await this.closeDemuxer();
+      while (!signal.aborted) {
+        let readError: Error | undefined;
+        let produced = false;
+        try {
+          produced = yield* this.readOnce(signal);
+        } catch (error) {
+          if (signal.aborted || this.abort?.signal.aborted) break;
+          readError = error instanceof Error ? error : new Error(String(error));
+        }
         if (signal.aborted) break;
-        this.demuxer = await this.openDemuxer();
-      } while (!signal.aborted);
+        if (produced) retry.attempts = 0;
+
+        if (readError === undefined && !this.opts.loop && !reconnect) break;
+
+        if (readError !== undefined || !this.opts.loop) {
+          // A read failure — or, with reconnect but no loop, an unexpected
+          // end-of-stream (a live input that "ends" has disconnected) — gates
+          // the reopen behind the backoff.
+          retry.attempts++;
+          if (!reconnect || retry.attempts > reconnect.maxRetries) {
+            if (readError !== undefined) throw readError;
+            break;
+          }
+          if (readError !== undefined) this.opts.logger?.warn?.('[rtsp] AvSource read failed — reconnecting:', readError);
+          else this.opts.logger?.warn?.('[rtsp] AvSource input ended — reconnecting');
+          // Wait on the internal abort: it fires for both a consumer abort (via
+          // the onAbort bridge) and a direct close(), so teardown never has to
+          // sit out a long backoff.
+          await delay(backoffDelay(reconnect, retry.attempts), this.abort!.signal);
+          if (signal.aborted || this.abort?.signal.aborted) break;
+        }
+
+        // Reopen the input (loop restart or reconnect attempt) and keep
+        // streaming on the same wall clock.
+        if (!(await this.reopen(signal, reconnect, retry))) break;
+      }
     } finally {
       done();
       this.reading = undefined;
@@ -378,6 +506,47 @@ export class AvSource implements Source, BackchannelSource {
   }
 
   /**
+   * Close the current input and reopen it, retrying under the reconnect policy.
+   *
+   * Backs both the plain `loop` restart (a failed reopen throws immediately when
+   * reconnecting is disabled, as before) and the reconnect path, where reopen
+   * failures are retried with exponential backoff until the policy's retry
+   * budget is exhausted.
+   *
+   * @param signal - Abort signal that cancels retries and in-flight delays
+   *
+   * @param reconnect - Resolved reconnect policy, or `undefined` when disabled
+   *
+   * @param retry - Shared retry state across read and reopen failures
+   *
+   * @param retry.attempts - Count of consecutive failed attempts, reset by the caller once packets flow
+   *
+   * @returns `true` once the input is open again, `false` when aborted
+   *
+   * @throws {Error} If a reopen fails and reconnecting is disabled or its
+   * retries are exhausted
+   *
+   * @internal
+   */
+  private async reopen(signal: AbortSignal, reconnect: ReconnectPolicy | undefined, retry: { attempts: number }): Promise<boolean> {
+    await this.closeDemuxer();
+    for (;;) {
+      if (signal.aborted || this.abort?.signal.aborted) return false;
+      try {
+        this.demuxer = await this.openDemuxer();
+        return true;
+      } catch (error) {
+        if (signal.aborted || this.abort?.signal.aborted) return false;
+        retry.attempts++;
+        if (!reconnect || retry.attempts > reconnect.maxRetries) throw error;
+        this.opts.logger?.warn?.('[rtsp] AvSource reopen failed — retrying:', error);
+        // Internal abort covers both consumer aborts and direct close().
+        await delay(backoffDelay(reconnect, retry.attempts), this.abort!.signal);
+      }
+    }
+  }
+
+  /**
    * Read the camera's backchannel descriptor from the open demuxer.
    *
    * Looks for a send-only RTSP stream and maps its codec, payload type and clock
@@ -417,14 +586,18 @@ export class AvSource implements Source, BackchannelSource {
    *
    * @yields {MediaPacket} Media packets for one pass over the input (each must be freed by the caller)
    *
+   * @returns `true` if the pass yielded at least one packet, letting the caller
+   * reset its reconnect backoff only once media actually flowed again
+   *
    * @internal
    */
-  private async *readOnce(signal: AbortSignal): AsyncIterable<MediaPacket> {
+  private async *readOnce(signal: AbortSignal): AsyncGenerator<MediaPacket, boolean, void> {
     const demuxer = this.demuxer!;
     const readrate = this.opts.readrate;
     let wallStart = 0;
     let baseSeconds = 0;
     let paced = false;
+    let produced = false;
 
     try {
       for await (const packet of demuxer.packets()) {
@@ -432,7 +605,7 @@ export class AvSource implements Source, BackchannelSource {
         if (!packet) continue;
         if (signal.aborted) {
           packet.free();
-          return;
+          return produced;
         }
 
         if (readrate && readrate > 0) {
@@ -447,16 +620,19 @@ export class AvSource implements Source, BackchannelSource {
               paced = true;
             }
             const waitMs = (seconds - baseSeconds) * 1000 - (Date.now() - wallStart);
-            if (waitMs > 1) await delay(waitMs, signal);
+            // Internal abort covers both consumer aborts and direct close().
+            if (waitMs > 1) await delay(waitMs, this.abort?.signal ?? signal);
           }
         }
 
+        produced = true;
         yield wrapAvPacket(packet);
       }
     } catch (error) {
       // A read aborted by teardown (close()/abort) is expected; only surface real errors.
       if (!signal.aborted && !this.abort?.signal.aborted) throw error;
     }
+    return produced;
   }
 
   /**

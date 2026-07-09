@@ -97,14 +97,26 @@ function parseParams(input: string): Record<string, string> {
   return params;
 }
 
+// How long an issued Digest nonce stays acceptable. Long enough for a client
+// to complete its challenge/response handshake and keep re-using the nonce for
+// follow-up requests in the same session, short enough that a captured
+// Authorization header cannot be replayed indefinitely.
+const NONCE_TTL_MS = 5 * 60 * 1000;
+
+// Upper bound on concurrently valid nonces, so a client hammering DESCRIBE
+// cannot grow the nonce table unbounded. Oldest entries are evicted first.
+const MAX_NONCES = 64;
+
 /**
  * Server-side RTSP authenticator for a single set of credentials.
  *
  * Validates incoming client requests against one configured account using
  * either Basic or Digest authentication. It produces the challenge string the
  * server returns when credentials are missing or invalid, and verifies the
- * Authorization header that clients send in response. For Digest, a fresh nonce
- * is generated per instance and all comparisons run in constant time.
+ * Authorization header that clients send in response. For Digest, every
+ * challenge issues a fresh nonce with a limited lifetime, so a captured
+ * Authorization header cannot be replayed after the window closes; all
+ * credential comparisons run in constant time.
  *
  * @example
  * ```typescript
@@ -123,7 +135,9 @@ function parseParams(input: string): Record<string, string> {
  */
 export class RtspAuth {
   private readonly realm: string;
-  private readonly nonce = randomBytes(16).toString('hex');
+
+  /** Issued Digest nonces mapped to their expiry timestamp (insertion-ordered). */
+  private readonly nonces = new Map<string, number>();
 
   /**
    * Create an authenticator for a single account.
@@ -171,8 +185,9 @@ export class RtspAuth {
    * Build the value for the `WWW-Authenticate` response header.
    *
    * Returns the challenge appropriate to the configured scheme: a realm-only
-   * challenge for Basic, or a realm plus the per-instance nonce for Digest.
-   * Send this when a request arrives without credentials or fails verification.
+   * challenge for Basic, or a realm plus a freshly issued, time-limited nonce
+   * for Digest. Send this when a request arrives without credentials or fails
+   * verification.
    *
    * @returns The header value to return to the client
    *
@@ -185,7 +200,7 @@ export class RtspAuth {
     if (this.method === 'Basic') {
       return `Basic realm="${this.realm}"`;
     }
-    return `Digest realm="${this.realm}", nonce="${this.nonce}"`;
+    return `Digest realm="${this.realm}", nonce="${this.issueNonce()}"`;
   }
 
   /**
@@ -225,11 +240,58 @@ export class RtspAuth {
 
     if (scheme.toLowerCase() !== 'digest') return false;
     const p = parseParams(value);
-    if (p.username !== this.config.username || p.nonce !== this.nonce) return false;
+    if (p.username !== this.config.username || !p.nonce || !this.isNonceValid(p.nonce)) return false;
 
     const ha1 = md5(`${this.config.username}:${this.realm}:${this.config.password}`);
     const ha2 = md5(`${rtspMethod}:${p.uri || uri}`);
-    const expected = md5(`${ha1}:${this.nonce}:${ha2}`);
+    const expected = md5(`${ha1}:${p.nonce}:${ha2}`);
     return safeEqual(p.response ?? '', expected);
+  }
+
+  /**
+   * Generate, register, and return a fresh Digest nonce.
+   *
+   * The nonce is stored with its expiry; the oldest entries are evicted once
+   * the table exceeds its bound so hostile clients cannot grow it unbounded.
+   *
+   * @returns The newly issued nonce value
+   *
+   * @internal
+   */
+  private issueNonce(): string {
+    this.pruneNonces();
+    const nonce = randomBytes(16).toString('hex');
+    this.nonces.set(nonce, Date.now() + NONCE_TTL_MS);
+    while (this.nonces.size > MAX_NONCES) {
+      const oldest = this.nonces.keys().next().value!;
+      this.nonces.delete(oldest);
+    }
+    return nonce;
+  }
+
+  /**
+   * Check whether a client-presented nonce was issued here and is still fresh.
+   *
+   * @param nonce - The nonce from the Authorization header
+   *
+   * @returns `true` if the nonce is known and unexpired
+   *
+   * @internal
+   */
+  private isNonceValid(nonce: string): boolean {
+    this.pruneNonces();
+    return this.nonces.has(nonce);
+  }
+
+  /**
+   * Drop expired nonces from the table.
+   *
+   * @internal
+   */
+  private pruneNonces(): void {
+    const now = Date.now();
+    for (const [nonce, expires] of this.nonces) {
+      if (expires <= now) this.nonces.delete(nonce);
+    }
   }
 }

@@ -217,4 +217,156 @@ describe('Relay error handling', () => {
     expect(relay.status).toBe('idle');
     expect(errors).toHaveLength(1);
   });
+
+  it('does not crash the process when the source fails and no error listener exists', async () => {
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on('unhandledRejection', onRejection);
+    try {
+      const source = new FakeSource(AV_INFO, { failOpen: new Error('boom') });
+      // No 'error' listener on purpose — must neither throw nor reject unhandled.
+      const relay = new Relay({ source });
+      const c = collector();
+      relay.pipe(c.sink);
+      await flush(20);
+
+      expect(relay.status).toBe('idle');
+      expect(c.closed).toBe(true);
+      expect(rejections).toHaveLength(0);
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
+  });
+
+  it('does not leave an unhandled rejection behind on autoStart failure', async () => {
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on('unhandledRejection', onRejection);
+    try {
+      const source = new FakeSource(AV_INFO, { failOpen: new Error('boom') });
+      const relay = new Relay({ source, autoStart: true });
+      await flush(20);
+
+      expect(relay.status).toBe('idle');
+      expect(rejections).toHaveLength(0);
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
+  });
+
+  it('emits sink:error and isolates the sink when a write fails', async () => {
+    const source = new FakeSource(AV_INFO);
+    const tracker = new PacketTracker();
+    const relay = new Relay({ source });
+    const sinkErrors: { sink: unknown; error: unknown }[] = [];
+    relay.on('sink:error', (sink, error) => sinkErrors.push({ sink, error }));
+
+    const healthy = collector();
+    const broken = new CallbackSink({
+      onPacket: () => {
+        throw new Error('write blew up');
+      },
+    });
+    relay.pipe(healthy.sink);
+    relay.pipe(broken);
+    await flush();
+
+    source.push(tracker.make({ streamIndex: 0, isKeyframe: true }));
+    source.push(tracker.make({ streamIndex: 0, isKeyframe: false }));
+    await flush();
+
+    expect(sinkErrors).toHaveLength(1);
+    expect(sinkErrors[0].sink).toBe(broken);
+    expect(relay.sinkCount).toBe(1);
+    // The healthy sink keeps receiving despite its broken sibling.
+    expect(healthy.packets.length).toBe(2);
+    expect(relay.status).toBe('running');
+  });
+
+  it('emits sink:error when a late-piped sink fails to init', async () => {
+    const source = new FakeSource(AV_INFO);
+    const relay = new Relay({ source });
+    const sinkErrors: unknown[] = [];
+    relay.on('sink:error', (_sink, error) => sinkErrors.push(error));
+
+    const healthy = collector();
+    relay.pipe(healthy.sink);
+    await flush();
+    expect(relay.status).toBe('running');
+
+    const removed: unknown[] = [];
+    relay.on('sink:removed', (sink) => removed.push(sink));
+    const broken = new CallbackSink({
+      onInit: () => {
+        throw new Error('init blew up');
+      },
+    });
+    relay.pipe(broken);
+    await flush();
+
+    expect(sinkErrors).toHaveLength(1);
+    expect(removed).toContain(broken);
+    expect(relay.status).toBe('running');
+  });
+
+  it('returns to idle when the only sink dies during startup init', async () => {
+    const source = new FakeSource(AV_INFO);
+    const relay = new Relay({ source });
+
+    const broken = new CallbackSink({
+      onInit: () => {
+        throw new Error('init blew up');
+      },
+    });
+    relay.pipe(broken);
+    await flush(20);
+
+    // The relay must not keep pumping a source nobody consumes.
+    expect(relay.sinkCount).toBe(0);
+    expect(relay.status).toBe('idle');
+    expect(source.closeCount).toBe(1);
+  });
+});
+
+describe('Relay stop/start races', () => {
+  it('stop() during a pending start never lets the relay go running', async () => {
+    const source = new FakeSource(AV_INFO, { openDelay: 20 });
+    const relay = new Relay({ source });
+    const errors: unknown[] = [];
+    relay.on('error', (e) => errors.push(e));
+
+    const started = relay.start();
+    expect(relay.status).toBe('starting');
+    await relay.stop();
+
+    expect(relay.status).toBe('idle');
+    // Let the delayed open() resolve — the relay must stay idle regardless.
+    await flush(50);
+    expect(relay.status).toBe('idle');
+
+    // A deliberate stop is not an error, and the start promise must settle.
+    await started.catch(() => undefined);
+    expect(errors).toHaveLength(0);
+  });
+
+  it('can start again after a stop that interrupted a pending start', async () => {
+    const source = new FakeSource(AV_INFO, { openDelay: 10 });
+    const relay = new Relay({ source });
+
+    void relay.start().catch(() => undefined);
+    await relay.stop();
+    await flush(30);
+
+    const c = collector();
+    relay.pipe(c.sink);
+    await flush(30);
+
+    expect(relay.status).toBe('running');
+    expect(c.inited).toEqual(AV_INFO);
+    await relay.stop();
+  });
 });
