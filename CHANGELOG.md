@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-09
+
 ### Breaking Changes
 
 - `MultiSource` now fails fast: when one input dies mid-stream, the remaining inputs are aborted and the error surfaces immediately (previously the source kept running without the failed input and only reported the error once every input had ended).
