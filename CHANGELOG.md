@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-07-10
+
 ### Fixed
 
 - Audio transcoding (`audioTranscode`) died silently at the first `loop`/`reconnect` reopen on Linux: node-av's `Decoder` compared each packet against the *live* stream index of the demuxer it was created from — freed memory once that demuxer was closed — and dropped every subsequent packet without an error. Fixed upstream in node-av 6.2.0-beta.5 (stream index snapshotted at decoder creation); the dependency is bumped accordingly. macOS was unaffected only by allocator luck.
