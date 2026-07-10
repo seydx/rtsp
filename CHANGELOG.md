@@ -4,16 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [1.0.2] - 2026-07-10
-
 ### Fixed
 
+- Audio transcoding (`audioTranscode`) died silently at the first `loop`/`reconnect` reopen on Linux: node-av's `Decoder` compared each packet against the *live* stream index of the demuxer it was created from — freed memory once that demuxer was closed — and dropped every subsequent packet without an error. Fixed upstream in node-av 6.2.0-beta.5 (stream index snapshotted at decoder creation); the dependency is bumped accordingly. macOS was unaffected only by allocator luck.
 - Test suite: run vitest with the `forks` pool instead of `threads`. node-av's async completions can be lost inside `worker_threads`, stalling the worker's event loop mid-test, and a test-timeout `worker.terminate()` during an in-flight native call aborted the whole process (`SIGABRT` / exit 134 on CI). Process isolation removes both failure modes; library code is unaffected.
-
-## [1.0.2] - 2026-07-10
-
-### Fixed
-
 - `AvSource` now keeps packet timestamps continuous across `loop` and `reconnect` reopens: each pass is shifted to continue exactly where the previous one ended, instead of restarting at the input's own clock (zero for looped files). Previously, any consumer spanning a loop boundary — an RTSP viewer, a recording muxer, the audio transcoder — received a non-monotonic stream (cycling DTS, stalled players, `Non-monotonic DTS` floods in pulling ffmpeg clients).
 
 ## [1.0.1] - 2026-07-10
