@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +13,36 @@ import { RtspServerSink } from '../rtsp-server-sink.js';
 
 const execFileAsync = promisify(execFile);
 const suite = isFfmpegAvailable() ? describe : describe.skip;
+
+/**
+ * Run ffmpeg with a hard deadline, always settling with its stderr tail.
+ *
+ * `execFile`'s timeout sends SIGTERM, which ffmpeg ignores while parked in a
+ * blocking socket read on a stalled stream — leaving the promise pending until
+ * the test times out with zero diagnostics. This kills with SIGKILL instead
+ * and rejects with the captured stderr, so a CI failure shows exactly where
+ * ffmpeg's progress stopped.
+ */
+function runFfmpeg(args: string[], timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ffmpegPath(), args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
+      if (stderr.length > 64 * 1024) stderr = stderr.slice(-32 * 1024);
+    });
+    const deadline = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
+    child.on('error', (error) => {
+      clearTimeout(deadline);
+      reject(error);
+    });
+    child.on('close', (code, signal) => {
+      clearTimeout(deadline);
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg exited with ${signal ?? code}; stderr tail:\n${stderr.slice(-4000)}`));
+    });
+  });
+}
 
 suite('RtspServerSink (integration)', () => {
   let dir: string;
@@ -111,20 +141,22 @@ suite('RtspServerSink (integration)', () => {
     // test is the first to surface timing bugs, and without the sink/session
     // logs a failure here is undiagnosable.
     const logger = {
-      warn: (...args: unknown[]) => console.warn('[server]', ...args),
-      error: (...args: unknown[]) => console.error('[server]', ...args),
+      debug: (...args: unknown[]) => console.log('[server:debug]', ...args),
+      warn: (...args: unknown[]) => console.warn('[server:warn]', ...args),
+      error: (...args: unknown[]) => console.error('[server:error]', ...args),
     };
     const relay = new Relay({ source: new AvSource(sample, { readrate: 1, loop: true, logger }), logger });
+    relay.on('error', (error) => console.error('[relay:error]', error));
+    relay.on('sink:error', (_sink, error) => console.error('[relay:sink-error]', error));
+    relay.on('end', () => console.log('[relay:end]'));
     const server = await relay.serveRtsp({ path: 'live', audioTranscode: { codec: 'aac', bitRate: 32_000 } });
 
     const out = join(dir, 'transcoded.mp4');
     try {
-      // The exec timeout must stay well below the test timeout: when vitest
-      // hard-kills the worker mid-teardown, in-flight native calls abort the
-      // whole process (SIGABRT) and swallow the diagnostics of the actual
-      // failure. This way ffmpeg is reaped first and teardown runs inside the
-      // test's lifetime.
-      await execFileAsync(ffmpegPath(), ['-y', '-rtsp_transport', 'tcp', '-i', server.url, '-t', '3', '-c', 'copy', out], { timeout: 20_000 });
+      // Hard-killed deadline well below the test timeout: teardown must run
+      // inside the test's lifetime, and the rejection carries ffmpeg's stderr
+      // tail so a stall is diagnosable from the CI log alone.
+      await runFfmpeg(['-y', '-rtsp_transport', 'tcp', '-i', server.url, '-t', '3', '-c', 'copy', out], 25_000);
 
       const demuxer = await Demuxer.open(out);
       const kinds = demuxer.streams.map((s) => s.codecpar.codecType);

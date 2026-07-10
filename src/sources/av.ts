@@ -553,6 +553,7 @@ export class AvSource implements Source, BackchannelSource {
    * @internal
    */
   private async reopen(signal: AbortSignal, reconnect: ReconnectPolicy | undefined, retry: { attempts: number }): Promise<boolean> {
+    this.opts.logger?.debug?.('[rtsp] AvSource reopening input (loop/reconnect)');
     await this.closeDemuxer();
     for (;;) {
       if (signal.aborted || this.abort?.signal.aborted) return false;
