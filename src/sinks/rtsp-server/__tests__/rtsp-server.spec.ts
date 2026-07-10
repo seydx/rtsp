@@ -9,6 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { Relay } from '../../../relay.js';
 import { AvSource } from '../../../sources/av.js';
+import { RtspServerSink } from '../rtsp-server-sink.js';
 
 const execFileAsync = promisify(execFile);
 const suite = isFfmpegAvailable() ? describe : describe.skip;
@@ -98,4 +99,80 @@ suite('RtspServerSink (integration)', () => {
       await relay.stop();
     }
   }, 40_000);
+
+  it('serves transcoded audio: the SDP waits for the re-encoded track header', async () => {
+    // Regression: the transcode path buffers before it muxes its first packet.
+    // The SDP must not be generated until that header exists, or the audio
+    // media section carries unresolved codec parameters and clients fail SETUP.
+    const relay = new Relay({ source: new AvSource(sample, { readrate: 1, loop: true }) });
+    const server = await relay.serveRtsp({ path: 'live', audioTranscode: { codec: 'aac', bitRate: 32_000 } });
+
+    const out = join(dir, 'transcoded.mp4');
+    try {
+      await execFileAsync(ffmpegPath(), ['-y', '-rtsp_transport', 'tcp', '-i', server.url, '-t', '1', '-c', 'copy', out], { timeout: 25_000 });
+
+      const demuxer = await Demuxer.open(out);
+      const kinds = demuxer.streams.map((s) => s.codecpar.codecType);
+      await demuxer.close();
+      // Both the passthrough video and the re-encoded audio arrived intact.
+      expect(kinds.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      await server.shutdown();
+      await relay.stop();
+    }
+  }, 30_000);
+
+  it('excludes a track that produces no RTP header within sdpTimeout', async () => {
+    const source = new AvSource(sample);
+    const info = await source.open();
+    // Drive the sink directly (no relay pump, no TCP) so we control exactly
+    // which tracks receive packets.
+    const fakeRelay = { pipe: () => undefined } as unknown as Relay;
+    const sink = new RtspServerSink(fakeRelay, { sdpTimeout: 300 });
+
+    try {
+      await sink.init(info);
+      const sdpPromise = sink.activate();
+
+      // Feed only video — the audio track never muxes and must be excluded.
+      const videoIndex = info.tracks.find((t) => t.kind === 'video')!.index;
+      const controller = new AbortController();
+      const feeding = (async () => {
+        for await (const packet of source.packets(controller.signal)) {
+          if (packet.streamIndex === videoIndex) await sink.write(packet);
+          packet.free();
+        }
+      })();
+
+      const sdp = await sdpPromise;
+      controller.abort();
+      await feeding;
+
+      expect(sdp).toContain('m=video');
+      expect(sdp).not.toContain('m=audio');
+      // The surviving track keeps its original streamid (its position in the
+      // servable track list), even though the audio section was removed.
+      const expectedId = info.tracks.findIndex((t) => t.kind === 'video');
+      expect(sdp).toContain(`a=control:streamid=${expectedId}`);
+    } finally {
+      await sink.close();
+      await source.close();
+    }
+  }, 15_000);
+
+  it('rejects pending DESCRIBEs when no track produces a header within sdpTimeout', async () => {
+    const source = new AvSource(sample);
+    const info = await source.open();
+    const fakeRelay = { pipe: () => undefined } as unknown as Relay;
+    const sink = new RtspServerSink(fakeRelay, { sdpTimeout: 200 });
+
+    try {
+      await sink.init(info);
+      // No packets are ever written — the SDP must fail instead of hanging.
+      await expect(sink.activate()).rejects.toThrow(/no track produced an rtp header/i);
+    } finally {
+      await sink.close();
+      await source.close();
+    }
+  }, 15_000);
 });

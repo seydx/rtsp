@@ -102,6 +102,24 @@ export interface RtspServerSinkOptions {
   audioTranscode?: AudioTranscodeTarget;
 
   /**
+   * How long, in milliseconds, to wait for every track to produce its RTP
+   * header before generating the DESCRIBE SDP without the stalled tracks.
+   *
+   * The SDP can only describe tracks whose muxer has emitted a header, which
+   * happens on a track's first successfully muxed packet. A track that never
+   * produces one (for example a permanently undecodable audio stream routed
+   * through {@link RtspServerSinkOptions.audioTranscode}) would otherwise stall
+   * SDP generation and hang every DESCRIBE. When the deadline — measured from
+   * sink initialization — passes, stalled tracks are excluded from the SDP and
+   * the remaining tracks are served; if no track produced a header at all,
+   * pending DESCRIBEs fail with `503 Service Unavailable` instead of hanging.
+   * Set to `0` to disable and wait indefinitely.
+   *
+   * @default 10000
+   */
+  sdpTimeout?: number;
+
+  /**
    * Logger used to emit diagnostics about the server lifecycle and per-request
    * activity.
    *
@@ -309,11 +327,14 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
   private pendingHeaders = new Set<number>();
   private sdp = deferred<string>();
   private sdpResolved = false;
+  private sdpTimer?: ReturnType<typeof setTimeout>;
   private currentKeyframe = false;
   private piped = false;
+  private dropped: TrackMuxer[] = [];
 
   private readonly backchannelOption?: boolean | BackchannelAdvertise;
   private readonly audioTranscode?: AudioTranscodeTarget;
+  private readonly sdpTimeout: number;
   private backchannelAdvertise?: BackchannelAdvertise;
   backchannelStreamId?: number;
 
@@ -342,6 +363,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     this.logger = options.logger;
     this.backchannelOption = options.backchannel;
     this.audioTranscode = options.audioTranscode;
+    this.sdpTimeout = options.sdpTimeout ?? 10_000;
   }
 
   /**
@@ -619,6 +641,9 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     if (this.muxers.length === 0) {
       throw new Error('RtspServerSink: upstream carries no RTP-servable (video/audio) track');
     }
+    // Arm the SDP deadline: a track that never muxes a packet must not hang
+    // DESCRIBE forever (see onSdpTimeout).
+    this.armSdpTimer();
 
     // Talkback media is advertised after the regular tracks so its streamid follows them.
     if (this.backchannelOption) {
@@ -654,16 +679,22 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     // Remember the current packet's keyframe flag so onRtp can gate viewers on an IDR.
     this.currentKeyframe = packet.isKeyframe;
 
+    let muxed: number;
     if (entry.transcode) {
-      await entry.transcode.write(packet.av, entry.muxer);
+      muxed = await entry.transcode.write(packet.av, entry.muxer);
     } else if (entry.bsf) {
-      await this.writeFiltered(entry, packet);
+      muxed = await this.writeFiltered(entry, packet);
     } else {
       await entry.muxer.writePacket(packet.av, entry.muxIndex);
+      muxed = 1;
     }
 
-    // The SDP can only be built once every track's muxer has emitted its header.
-    if (!this.sdpResolved && this.pendingHeaders.delete(entry.sdpStreamId) && this.pendingHeaders.size === 0) {
+    // The SDP can only be built once every track's muxer has emitted its header,
+    // which happens on the first muxed packet. Encoding/filtering paths buffer, so
+    // an early call can produce zero packets — clearing the pending header before
+    // the header exists would serialise the track with unresolved codecpar
+    // (e.g. `m=application RTP/AVP 3`). Only clear it once a packet was muxed.
+    if (!this.sdpResolved && muxed > 0 && this.pendingHeaders.delete(entry.sdpStreamId) && this.pendingHeaders.size === 0) {
       this.resolveSdp();
     }
   }
@@ -681,12 +712,16 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    *
    * @param packet - The raw upstream packet to filter and write.
    *
+   * @returns The number of packets written to the muxer this call (zero while the
+   * filter is still buffering, before its header is emitted).
+   *
    * @internal
    */
-  private async writeFiltered(entry: TrackMuxer, packet: MediaPacket): Promise<void> {
+  private async writeFiltered(entry: TrackMuxer, packet: MediaPacket): Promise<number> {
     const filtered = await entry.bsf!.filterAll(packet.av!);
-    if (filtered.length === 0) return; // filter needs more data before it emits anything
+    if (filtered.length === 0) return 0; // filter needs more data before it emits anything
 
+    let written = 0;
     for (const out of filtered) {
       try {
         // The filter signals fresh global headers via NEW_EXTRADATA side data;
@@ -700,10 +735,12 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
           }
         }
         await entry.muxer.writePacket(out, entry.muxIndex);
+        written++;
       } finally {
         out.free();
       }
     }
+    return written;
   }
 
   /**
@@ -721,9 +758,14 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    * ```
    */
   async close(): Promise<void> {
-    for (const m of this.muxers) m.bsf?.close();
-    await Promise.all(this.muxers.flatMap((m) => (m.transcode ? [m.transcode.close()] : [])));
-    await Promise.all(this.muxers.map((m) => m.muxer.close().catch(() => undefined)));
+    this.cancelSdpTimer();
+    // Include deadline-excluded tracks: they were only unrouted, their native
+    // resources are still alive and owned here.
+    const all = [...this.muxers, ...this.dropped];
+    this.dropped = [];
+    for (const m of all) m.bsf?.close();
+    await Promise.all(all.flatMap((m) => (m.transcode ? [m.transcode.close()] : [])));
+    await Promise.all(all.map((m) => m.muxer.close().catch(() => undefined)));
     this.muxers.length = 0;
     this.muxerBySource.clear();
     this.pendingHeaders = new Set();
@@ -769,13 +811,86 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    * @internal
    */
   private resolveSdp(): void {
+    this.cancelSdpTimer();
     const sdp = StreamingUtils.createSdp(this.muxers.map((m) => m.muxer.getFormatContext()));
     if (!sdp) {
       this.logger?.warn?.('[rtsp] SDP generation returned null');
       return;
     }
     this.sdpResolved = true;
-    this.sdp.resolve(this.appendBackchannel(this.rewriteControl(sdp)));
+    this.sdp.resolve(
+      this.appendBackchannel(
+        this.rewriteControl(
+          sdp,
+          this.muxers.map((m) => m.sdpStreamId),
+        ),
+      ),
+    );
+  }
+
+  /**
+   * Arm the SDP deadline timer, if enabled and not already resolved or armed.
+   *
+   * @internal
+   */
+  private armSdpTimer(): void {
+    if (this.sdpTimeout <= 0 || this.sdpResolved || this.sdpTimer) return;
+    this.sdpTimer = setTimeout(() => {
+      this.sdpTimer = undefined;
+      this.onSdpTimeout();
+    }, this.sdpTimeout);
+    this.sdpTimer.unref?.();
+  }
+
+  /**
+   * Cancel a pending SDP deadline timer.
+   *
+   * @internal
+   */
+  private cancelSdpTimer(): void {
+    if (this.sdpTimer) {
+      clearTimeout(this.sdpTimer);
+      this.sdpTimer = undefined;
+    }
+  }
+
+  /**
+   * Handle the SDP deadline: serve what is ready, drop what is not.
+   *
+   * Tracks that still have no muxer header (nothing was ever muxed for them —
+   * e.g. permanently undecodable audio) are excluded from the SDP so waiting
+   * DESCRIBEs can be answered with the tracks that do work. Exclusion is pure
+   * bookkeeping — the track is removed from packet routing and SDP generation,
+   * but its native resources stay alive until {@link close} because a write may
+   * be in flight on it. The remaining tracks keep their original SDP streamids,
+   * so already-cached client state stays valid. When no track produced a header
+   * at all, the SDP promise is rejected instead and pending DESCRIBEs fail with
+   * 503 rather than hanging.
+   *
+   * @internal
+   */
+  private onSdpTimeout(): void {
+    if (this.sdpResolved || this.pendingHeaders.size === 0) return;
+
+    const stalled = this.muxers.filter((m) => this.pendingHeaders.has(m.sdpStreamId));
+    if (stalled.length === this.muxers.length) {
+      this.logger?.warn?.(`[rtsp] no track produced an RTP header within ${this.sdpTimeout}ms — DESCRIBE unavailable`);
+      // Clear the pending set so a late packet cannot re-trigger resolveSdp
+      // against the now-rejected deferred; the endpoint stays unavailable until
+      // close() re-arms it.
+      this.pendingHeaders.clear();
+      this.sdp.reject(new Error(`No track produced an RTP header within ${this.sdpTimeout}ms`));
+      return;
+    }
+
+    for (const entry of stalled) {
+      this.logger?.warn?.(`[rtsp] excluding ${entry.kind} track #${entry.sourceIndex} from the SDP — no RTP header within ${this.sdpTimeout}ms`);
+      this.dropped.push(entry);
+      this.muxers.splice(this.muxers.indexOf(entry), 1);
+      this.muxerBySource.delete(entry.sourceIndex);
+      this.pendingHeaders.delete(entry.sdpStreamId);
+    }
+    this.resolveSdp();
   }
 
   /**
@@ -807,21 +922,25 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    * Rewrite each media's control attribute to a relative `a=control:streamid=N`.
    *
    * Normalizes whatever control URL the muxer emitted into the relative form
-   * clients use during SETUP, numbering media sections in order.
+   * clients use during SETUP. Media sections carry the streamids assigned at
+   * init rather than their position, so tracks excluded by the SDP deadline do
+   * not shift the ids of the remaining tracks.
    *
    * @param sdp - The SDP whose control attributes are rewritten.
+   *
+   * @param streamIds - The original streamid for each media section, in order.
    *
    * @returns The SDP with relative per-media control attributes.
    *
    * @internal
    */
-  private rewriteControl(sdp: string): string {
+  private rewriteControl(sdp: string, streamIds: number[]): string {
     let media = -1;
     return sdp
       .split('\n')
       .map((line) => {
         if (line.startsWith('m=')) media++;
-        if (line.startsWith('a=control:')) return `a=control:streamid=${media}`;
+        if (line.startsWith('a=control:')) return `a=control:streamid=${streamIds[media] ?? media}`;
         return line;
       })
       .join('\n');

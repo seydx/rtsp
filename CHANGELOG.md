@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `RtspServerSink` `sdpTimeout` option (default 10s): tracks that produce no RTP header within the deadline are excluded from the DESCRIBE SDP so the remaining tracks can be served; if no track produces a header at all, pending DESCRIBEs fail with `503 Service Unavailable` instead of hanging. Surviving tracks keep their original SDP streamids. Set `0` to disable.
+
+### Changed
+
+- `ForwardAudioTranscoder.write()` now returns the number of packets actually muxed (previously `void`). Existing callers that ignore the result are unaffected.
+
+### Fixed
+
+- SDP generation no longer completes while a transcoded or bitstream-filtered track is still buffering: the track's pending header is only cleared once a packet was actually muxed, so the DESCRIBE SDP can no longer carry unresolved codec parameters (e.g. an `m=application RTP/AVP 3` line) that made clients fail SETUP.
+
 ## [1.0.0] - 2026-07-09
 
 ### Breaking Changes

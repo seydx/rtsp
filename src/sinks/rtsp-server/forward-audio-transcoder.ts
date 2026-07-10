@@ -151,24 +151,29 @@ export class ForwardAudioTranscoder {
    *
    * @param muxer - The muxer whose stream the encoded packets are written to.
    *
+   * @returns The number of encoded packets written to the muxer this call. Zero
+   * while the encoder is still buffering (no muxer header emitted yet), which the
+   * caller uses to defer SDP generation until the stream's parameters are known.
+   *
    * @throws {Error} If writing an encoded packet to the muxer fails.
    *
    * @example
    * ```typescript
-   * await transcoder.write(packet.av, muxer);
+   * const written = await transcoder.write(packet.av, muxer);
    * ```
    */
-  async write(packet: Packet, muxer: Muxer): Promise<void> {
-    if (!this.decoder || !this.filter || !this.encoder) return;
+  async write(packet: Packet, muxer: Muxer): Promise<number> {
+    if (!this.decoder || !this.filter || !this.encoder) return 0;
 
     let frames;
     try {
       frames = await this.decoder.decodeAll(packet);
     } catch (error) {
       this.logger?.warn?.('[rtsp] audio transcode: dropping undecodable packet:', error);
-      return;
+      return 0;
     }
 
+    let written = 0;
     for (const frame of frames) {
       // Collected encoded packets are owned here until written; anything left
       // over after a failure is freed below so nothing native leaks.
@@ -189,12 +194,14 @@ export class ForwardAudioTranscoder {
         while (encodedPackets.length > 0) {
           await muxer.writePacket(encodedPackets[0], this.streamIndex);
           encodedPackets.shift()!.free();
+          written++;
         }
       } finally {
         frame.free();
         for (const encoded of encodedPackets) encoded.free();
       }
     }
+    return written;
   }
 
   /**
