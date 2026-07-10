@@ -107,12 +107,24 @@ suite('RtspServerSink (integration)', () => {
     // Regression 2: pulling for longer than the 2s sample forces the client
     // across a loop boundary — without timestamp rebasing the stream turns
     // non-monotonic there and the pull never completes.
-    const relay = new Relay({ source: new AvSource(sample, { readrate: 1, loop: true }) });
+    // Server-side diagnostics go to the test output: on slow CI runners this
+    // test is the first to surface timing bugs, and without the sink/session
+    // logs a failure here is undiagnosable.
+    const logger = {
+      warn: (...args: unknown[]) => console.warn('[server]', ...args),
+      error: (...args: unknown[]) => console.error('[server]', ...args),
+    };
+    const relay = new Relay({ source: new AvSource(sample, { readrate: 1, loop: true, logger }), logger });
     const server = await relay.serveRtsp({ path: 'live', audioTranscode: { codec: 'aac', bitRate: 32_000 } });
 
     const out = join(dir, 'transcoded.mp4');
     try {
-      await execFileAsync(ffmpegPath(), ['-y', '-rtsp_transport', 'tcp', '-i', server.url, '-t', '3', '-c', 'copy', out], { timeout: 25_000 });
+      // The exec timeout must stay well below the test timeout: when vitest
+      // hard-kills the worker mid-teardown, in-flight native calls abort the
+      // whole process (SIGABRT) and swallow the diagnostics of the actual
+      // failure. This way ffmpeg is reaped first and teardown runs inside the
+      // test's lifetime.
+      await execFileAsync(ffmpegPath(), ['-y', '-rtsp_transport', 'tcp', '-i', server.url, '-t', '3', '-c', 'copy', out], { timeout: 20_000 });
 
       const demuxer = await Demuxer.open(out);
       const kinds = demuxer.streams.map((s) => s.codecpar.codecType);
@@ -123,7 +135,7 @@ suite('RtspServerSink (integration)', () => {
       await server.shutdown();
       await relay.stop();
     }
-  }, 30_000);
+  }, 45_000);
 
   it('excludes a track that produces no RTP header within sdpTimeout', async () => {
     const source = new AvSource(sample);
