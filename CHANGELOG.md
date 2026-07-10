@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-07-10
+
 ### Fixed
 
 - `AvSource` now keeps packet timestamps continuous across `loop` and `reconnect` reopens: each pass is shifted to continue exactly where the previous one ended, instead of restarting at the input's own clock (zero for looped files). Previously, any consumer spanning a loop boundary — an RTSP viewer, a recording muxer, the audio transcoder — received a non-monotonic stream (cycling DTS, stalled players, `Non-monotonic DTS` floods in pulling ffmpeg clients).
