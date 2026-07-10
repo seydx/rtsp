@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-07-10
+
 ### Changed
 
 - `RtspServerSink` no longer detaches from the relay the instant the last client disconnects: it now lingers for a grace period (new `detachDelay` option, default 5s) so a quickly retrying client — the normal pattern of pullers like go2rtc or ffmpeg after a timeout — finds the muxers and SDP still warm and gets its DESCRIBE answered immediately instead of restarting the whole upstream warm-up from zero. The relay's `idleTimeout` starts counting only once the sink actually detaches. Set `detachDelay: 0` for the previous immediate-detach behavior.
