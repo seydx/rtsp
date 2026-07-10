@@ -2,14 +2,17 @@ import { execFile, spawn } from 'node:child_process';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { Demuxer } from 'node-av';
 import { ffmpegPath, isFfmpegAvailable } from 'node-av';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { Relay } from '../../../relay.js';
 import { AvSource } from '../../../sources/av.js';
 import { RtspServerSink } from '../rtsp-server-sink.js';
+
+import type { MediaPacket } from '../../../types.js';
 
 const execFileAsync = promisify(execFile);
 const suite = isFfmpegAvailable() ? describe : describe.skip;
@@ -202,6 +205,95 @@ suite('RtspServerSink (integration)', () => {
       const expectedId = info.tracks.findIndex((t) => t.kind === 'video');
       expect(sdp).toContain(`a=control:streamid=${expectedId}`);
     } finally {
+      await sink.close();
+      await source.close();
+    }
+  }, 15_000);
+
+  it('detaches from the relay only after the grace period, and not at all when a client returns', async () => {
+    const source = new AvSource(sample);
+    const info = await source.open();
+    const calls = { pipe: 0, unpipe: 0 };
+    let sink: RtspServerSink = undefined!;
+    const fakeRelay = {
+      pipe: () => calls.pipe++,
+      unpipe: async () => {
+        calls.unpipe++;
+        await sink.close();
+      },
+    } as unknown as Relay;
+    sink = new RtspServerSink(fakeRelay, { detachDelay: 150, sdpTimeout: 0 });
+
+    try {
+      await sink.init(info);
+      void sink.activate().catch(() => undefined);
+      const gone = {} as never;
+
+      // Last session leaves — the detach is scheduled, not immediate.
+      sink.sessionClosed(gone);
+      expect(calls.unpipe).toBe(0);
+
+      // A DESCRIBE inside the window cancels it: the sink stays attached and
+      // its warm muxer/SDP state survives the client's reconnect gap.
+      await delay(50);
+      void sink.activate().catch(() => undefined);
+      await delay(250);
+      expect(calls.unpipe).toBe(0);
+
+      // Nobody returns this time — detached exactly once after the delay.
+      sink.sessionClosed(gone);
+      await delay(250);
+      expect(calls.unpipe).toBe(1);
+    } finally {
+      await sink.close();
+      await source.close();
+    }
+  }, 15_000);
+
+  it('re-attaches a DESCRIBE that races the detach begun by the last client leaving', async () => {
+    const source = new AvSource(sample);
+    const info = await source.open();
+    const packets: MediaPacket[] = [];
+    for await (const packet of source.packets(new AbortController().signal)) packets.push(packet);
+
+    let sink: RtspServerSink = undefined!;
+    let pipes = 0;
+    let initDone = Promise.resolve();
+    const fakeRelay = {
+      // Mirror the real relay: piping (re-)initializes the sink for the upstream.
+      pipe: () => {
+        pipes++;
+        initDone = sink.init(info);
+      },
+      unpipe: async () => sink.close(),
+    } as unknown as Relay;
+    sink = new RtspServerSink(fakeRelay, { detachDelay: 0, sdpTimeout: 0 });
+
+    const feedAll = async (): Promise<void> => {
+      for (const packet of packets) {
+        const copy = packet.clone();
+        await sink.write(copy);
+        copy.free();
+      }
+    };
+
+    try {
+      const first = sink.activate();
+      await initDone;
+      await feedAll();
+      expect(await first).toContain('m=video');
+
+      // Last client leaves — with detachDelay 0 the teardown starts right
+      // away. The next DESCRIBE races it and must wait it out and re-attach,
+      // not be handed the stale SDP of a sink that is closing under it.
+      sink.sessionClosed({} as never);
+      const second = sink.activate();
+      await vi.waitFor(() => expect(pipes).toBe(2));
+      await initDone;
+      await feedAll();
+      expect(await second).toContain('m=video');
+    } finally {
+      for (const packet of packets) packet.free();
       await sink.close();
       await source.close();
     }

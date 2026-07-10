@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `RtspServerSink` no longer detaches from the relay the instant the last client disconnects: it now lingers for a grace period (new `detachDelay` option, default 5s) so a quickly retrying client — the normal pattern of pullers like go2rtc or ffmpeg after a timeout — finds the muxers and SDP still warm and gets its DESCRIBE answered immediately instead of restarting the whole upstream warm-up from zero. The relay's `idleTimeout` starts counting only once the sink actually detaches. Set `detachDelay: 0` for the previous immediate-detach behavior.
+
+### Fixed
+
+- A DESCRIBE racing the detach triggered by the last client leaving could be handed the SDP promise the in-flight teardown was about to reject (or a stale pre-teardown SDP of a sink closing under it). `activate()` now waits out an in-flight detach and re-attaches with fresh state.
+- Sessions whose socket already died no longer log a `DESCRIBE failed — upstream unavailable` warning when a later teardown rejects the SDP they were waiting on; one real failure no longer produces a warn burst per zombie DESCRIBE.
+
 ## [1.0.2] - 2026-07-10
 
 ### Fixed

@@ -81,6 +81,28 @@ describe('RtspSession request handling', () => {
     expect(socket.text).toContain('CSeq: 1');
   });
 
+  it('stays silent when a DESCRIBE fails after the session already closed', async () => {
+    // A viewer that gave up (socket died) leaves its DESCRIBE handler awaiting
+    // the shared SDP promise; when a teardown later rejects it, that zombie
+    // handler must neither warn nor try to answer.
+    const warnings: string[] = [];
+    let rejectSdp!: (error: Error) => void;
+    const host = makeHost({
+      logger: { warn: (...args: unknown[]) => warnings.push(String(args[0])) },
+      activate: () => new Promise<string>((_resolve, reject) => (rejectSdp = reject)),
+    });
+    const { socket, session } = connect(host);
+
+    socket.emit('data', Buffer.from('DESCRIBE rtsp://h/live RTSP/1.0\r\nCSeq: 1\r\n\r\n'));
+    await flush();
+    session.close();
+    rejectSdp(new Error('RTSP server sink closed before the SDP became available'));
+    await flush();
+
+    expect(socket.written).toHaveLength(0);
+    expect(warnings).toHaveLength(0);
+  });
+
   it('closes the session on a parser violation', async () => {
     const host = makeHost();
     const { socket, session } = connect(host);

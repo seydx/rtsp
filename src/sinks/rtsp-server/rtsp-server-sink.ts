@@ -120,6 +120,24 @@ export interface RtspServerSinkOptions {
   sdpTimeout?: number;
 
   /**
+   * How long, in milliseconds, to stay attached to the relay after the last
+   * client disconnects.
+   *
+   * Detaching tears down the per-track muxers and the resolved SDP, so an
+   * immediate detach forces the next viewer through a full warm-up (muxer
+   * headers, keyframe sync, SDP generation) even when it reconnects right
+   * away — the typical pattern of pulling clients that retry on a timeout
+   * (go2rtc, ffmpeg with `-timeout`). The grace period keeps that state warm
+   * across the gap: a viewer arriving within the window is answered from the
+   * existing SDP immediately, and the upstream never observes the detach. The
+   * relay's own `idleTimeout` only starts counting once the sink actually
+   * detaches. Set to `0` to detach as soon as the last client leaves.
+   *
+   * @default 5000
+   */
+  detachDelay?: number;
+
+  /**
    * Logger used to emit diagnostics about the server lifecycle and per-request
    * activity.
    *
@@ -278,9 +296,10 @@ function bsfForTrack(track: TrackInfo): string | null {
  * Each track is packetized exactly once and the resulting RTP is fanned out to
  * every playing viewer over interleaved TCP, so the upstream is pulled a single
  * time regardless of how many clients are connected. The server is created lazily
- * via the relay, attaching to it on the first client and detaching once the last
- * viewer leaves, and can optionally advertise an ONVIF talkback channel and
- * require authentication.
+ * via the relay, attaching to it on the first client and detaching a grace period
+ * after the last viewer leaves (so a quickly retrying client finds the stream
+ * still warm), and can optionally advertise an ONVIF talkback channel and require
+ * authentication.
  *
  * @example
  * ```typescript
@@ -331,10 +350,13 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
   private currentKeyframe = false;
   private piped = false;
   private dropped: TrackMuxer[] = [];
+  private detachTimer?: ReturnType<typeof setTimeout>;
+  private detaching?: Promise<void>;
 
   private readonly backchannelOption?: boolean | BackchannelAdvertise;
   private readonly audioTranscode?: AudioTranscodeTarget;
   private readonly sdpTimeout: number;
+  private readonly detachDelay: number;
   private backchannelAdvertise?: BackchannelAdvertise;
   backchannelStreamId?: number;
 
@@ -364,6 +386,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     this.backchannelOption = options.backchannel;
     this.audioTranscode = options.audioTranscode;
     this.sdpTimeout = options.sdpTimeout ?? 10_000;
+    this.detachDelay = options.detachDelay ?? 5000;
   }
 
   /**
@@ -436,6 +459,9 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     if (this.server) return this;
     const server = createServer((socket) => {
       socket.setNoDelay(true);
+      // A returning client cancels a pending detach so the warm muxer/SDP
+      // state survives the gap between its attempts.
+      this.cancelDetach();
       const session = new RtspSession(socket, this);
       this.sessions.add(session);
     });
@@ -474,6 +500,10 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    */
   async shutdown(): Promise<void> {
     for (const session of [...this.sessions]) session.close();
+    // Closing the last session may have scheduled (or begun) a lazy detach;
+    // supersede it with this deliberate teardown.
+    this.cancelDetach();
+    if (this.detaching) await this.detaching;
     if (this.server) {
       await new Promise<void>((resolve) => this.server!.close(() => resolve()));
       this.server = undefined;
@@ -516,6 +546,12 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    * ```
    */
   async activate(): Promise<string> {
+    this.cancelDetach();
+    // A detach may already be tearing the sink down (close() rejects and
+    // re-arms the SDP deferred). Wait it out and re-attach with fresh state —
+    // otherwise this DESCRIBE would be handed the very promise the teardown
+    // is about to reject.
+    if (this.detaching) await this.detaching;
     if (!this.piped) {
       this.piped = true;
       this.relay.pipe(this);
@@ -545,8 +581,10 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    * Deregister a session that has disconnected.
    *
    * Removes the session from the connected and playing sets, emitting
-   * `viewer:removed` if it was playing. When no sessions remain, the sink detaches
-   * from the relay so the upstream can go idle.
+   * `viewer:removed` if it was playing. When no sessions remain, a detach from
+   * the relay is scheduled after the configured grace period (so a quickly
+   * retrying client finds the sink still warm); once it fires, the relay — and
+   * thus the upstream — can go idle.
    *
    * @param session - The session that closed.
    *
@@ -561,9 +599,59 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
       this.emit('viewer:removed', this.playing.size);
     }
     if (this.sessions.size === 0 && this.piped) {
-      // No clients left — let the relay (and thus the upstream) go idle.
-      // Fire-and-forget: unpipe never rejects (channel close isolates errors).
-      void this.relay.unpipe(this);
+      this.scheduleDetach();
+    }
+  }
+
+  /**
+   * Schedule the detach from the relay after the last client left.
+   *
+   * With a zero grace period the detach begins immediately; otherwise a timer
+   * is armed and cancelled again if a client connects (or a DESCRIBE activates
+   * the sink) before it fires.
+   *
+   * @internal
+   */
+  private scheduleDetach(): void {
+    if (this.detachTimer || this.detaching) return;
+    if (this.detachDelay <= 0) {
+      this.detachNow();
+      return;
+    }
+    this.detachTimer = setTimeout(() => {
+      this.detachTimer = undefined;
+      this.detachNow();
+    }, this.detachDelay);
+    this.detachTimer.unref?.();
+  }
+
+  /**
+   * Begin the actual detach, re-checking that no client returned in the
+   * meantime.
+   *
+   * The unpipe (which closes this sink and resets it for reuse) is tracked in
+   * `detaching` so a DESCRIBE racing the teardown can await it instead of
+   * being handed the SDP promise the teardown is about to reject. Unpipe never
+   * rejects — channel close isolates sink errors.
+   *
+   * @internal
+   */
+  private detachNow(): void {
+    if (this.sessions.size > 0 || !this.piped) return;
+    this.detaching = this.relay.unpipe(this).finally(() => {
+      this.detaching = undefined;
+    });
+  }
+
+  /**
+   * Cancel a scheduled (but not yet started) detach.
+   *
+   * @internal
+   */
+  private cancelDetach(): void {
+    if (this.detachTimer) {
+      clearTimeout(this.detachTimer);
+      this.detachTimer = undefined;
     }
   }
 
@@ -759,6 +847,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    */
   async close(): Promise<void> {
     this.cancelSdpTimer();
+    this.cancelDetach();
     // Include deadline-excluded tracks: they were only unrouted, their native
     // resources are still alive and owned here.
     const all = [...this.muxers, ...this.dropped];

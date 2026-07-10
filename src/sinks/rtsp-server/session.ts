@@ -396,6 +396,10 @@ export class RtspSession {
     try {
       sdp = await this.host.activate();
     } catch (error) {
+      // A session whose socket already died has nobody to answer — and a
+      // teardown rejecting the SDP its dead viewers were waiting on is
+      // expected, not worth a warning per zombie DESCRIBE.
+      if (this.closed) return;
       this.host.logger?.warn?.('[rtsp] DESCRIBE failed — upstream unavailable:', error);
       this.send(buildResponse({ status: 503, cseq }));
       return;
