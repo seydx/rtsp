@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-07-10
+
 ### Fixed
 
 - Test suite: run vitest with the `forks` pool instead of `threads`. node-av's async completions can be lost inside `worker_threads`, stalling the worker's event loop mid-test, and a test-timeout `worker.terminate()` during an in-flight native call aborted the whole process (`SIGABRT` / exit 134 on CI). Process isolation removes both failure modes; library code is unaffected.
