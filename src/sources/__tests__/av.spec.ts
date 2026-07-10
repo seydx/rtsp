@@ -92,4 +92,37 @@ suite('AvSource (integration)', () => {
     const firstVideo = seen.find((p) => p.index === relay.info?.tracks.find((t) => t.kind === 'video')?.index);
     expect(firstVideo?.keyframe).toBe(true);
   });
+
+  it('keeps timestamps continuous across loop boundaries', async () => {
+    // Regression: each loop pass reopens the file, whose own clock restarts at
+    // zero. Without rebasing, every viewer spanning a boundary receives a
+    // non-monotonic stream (cycling DTS, stuck players).
+    const source = new AvSource(file, { loop: true });
+    const info = await source.open();
+    const videoIndex = info.tracks.find((t) => t.kind === 'video')!.index;
+
+    const controller = new AbortController();
+    const lastDts = new Map<number, number>();
+    let videoPackets = 0;
+    try {
+      for await (const packet of source.packets(controller.signal)) {
+        const ts = packet.dts ?? packet.pts;
+        if (ts !== undefined) {
+          const previous = lastDts.get(packet.streamIndex);
+          if (previous !== undefined) expect(ts).toBeGreaterThanOrEqual(previous);
+          lastDts.set(packet.streamIndex, ts);
+        }
+        if (packet.streamIndex === videoIndex) videoPackets++;
+        packet.free();
+        // The 1s clip holds 15 video frames; 40 packets span at least two
+        // loop boundaries.
+        if (videoPackets >= 40) break;
+      }
+    } finally {
+      controller.abort();
+      await source.close();
+    }
+
+    expect(videoPackets).toBeGreaterThanOrEqual(40);
+  }, 15_000);
 });

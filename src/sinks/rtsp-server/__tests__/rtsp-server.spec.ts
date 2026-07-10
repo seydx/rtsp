@@ -100,16 +100,19 @@ suite('RtspServerSink (integration)', () => {
     }
   }, 40_000);
 
-  it('serves transcoded audio: the SDP waits for the re-encoded track header', async () => {
-    // Regression: the transcode path buffers before it muxes its first packet.
+  it('serves transcoded audio across a loop boundary: the SDP waits for the re-encoded track header', async () => {
+    // Regression 1: the transcode path buffers before it muxes its first packet.
     // The SDP must not be generated until that header exists, or the audio
     // media section carries unresolved codec parameters and clients fail SETUP.
+    // Regression 2: pulling for longer than the 2s sample forces the client
+    // across a loop boundary — without timestamp rebasing the stream turns
+    // non-monotonic there and the pull never completes.
     const relay = new Relay({ source: new AvSource(sample, { readrate: 1, loop: true }) });
     const server = await relay.serveRtsp({ path: 'live', audioTranscode: { codec: 'aac', bitRate: 32_000 } });
 
     const out = join(dir, 'transcoded.mp4');
     try {
-      await execFileAsync(ffmpegPath(), ['-y', '-rtsp_transport', 'tcp', '-i', server.url, '-t', '1', '-c', 'copy', out], { timeout: 25_000 });
+      await execFileAsync(ffmpegPath(), ['-y', '-rtsp_transport', 'tcp', '-i', server.url, '-t', '3', '-c', 'copy', out], { timeout: 25_000 });
 
       const demuxer = await Demuxer.open(out);
       const kinds = demuxer.streams.map((s) => s.codecpar.codecType);

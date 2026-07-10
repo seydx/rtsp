@@ -1,8 +1,9 @@
-import { avGetCodecName, Demuxer } from 'node-av';
+import { AV_NOPTS_VALUE, avGetCodecName, Demuxer } from 'node-av';
 
 import { wrapAvPacket } from '../av-packet.js';
 import { toTrackInfo } from './stream-info.js';
 
+import type { Packet } from 'node-av';
 import type { BackchannelInfo, BackchannelSource, Logger, MediaPacket, Source, StreamInfo } from '../types.js';
 
 /**
@@ -67,7 +68,9 @@ export interface AvSourceOptions {
    *
    * Enables looping a finite file or reconnecting a stream that terminates:
    * after the input drains, the source closes and reopens it, continuing to
-   * yield packets on the same wall clock. When `false` (the default), the
+   * yield packets on the same wall clock. Packet timestamps are shifted so the
+   * outgoing timeline stays continuous across passes — consumers never see
+   * time jump back to zero at a loop boundary. When `false` (the default), the
    * packet iterator completes once the input ends.
    */
   loop?: boolean;
@@ -81,9 +84,10 @@ export interface AvSourceOptions {
    * exponential backoff, resuming packet delivery once the upstream answers
    * again. An unexpected end-of-stream is also treated as a disconnect when
    * {@link AvSourceOptions.loop} is not set. Pass `true` for the defaults or an
-   * {@link AvReconnectOptions} to tune the backoff. The reconnected input is
-   * assumed to expose the same stream layout as the original; downstream sinks
-   * are not re-initialized.
+   * {@link AvReconnectOptions} to tune the backoff. Packet timestamps are
+   * shifted so the outgoing timeline stays continuous across the reconnect.
+   * The reconnected input is assumed to expose the same stream layout as the
+   * original; downstream sinks are not re-initialized.
    */
   reconnect?: boolean | AvReconnectOptions;
 
@@ -158,6 +162,22 @@ interface ReconnectPolicy {
   delayMs: number;
   maxDelayMs: number;
   maxRetries: number;
+}
+
+/**
+ * Per-stream timestamp continuity state across input reopens.
+ *
+ * @internal
+ */
+interface TimelineState {
+  /** Offset (in the stream's time base) added to every packet timestamp. */
+  offset: bigint;
+
+  /** End of the timeline seen so far: last adjusted timestamp plus duration. */
+  end: bigint;
+
+  /** Set after a reopen; the next packet of this stream re-anchors the offset. */
+  rebase: boolean;
 }
 
 /**
@@ -284,6 +304,9 @@ export class AvSource implements Source, BackchannelSource {
   /** Resolves when the active packets() read loop has fully unwound; awaited by close(). */
   private reading?: Promise<void>;
 
+  /** Per-stream timestamp continuity across loop/reconnect reopens, keyed by stream index. */
+  private readonly timeline = new Map<number, TimelineState>();
+
   /**
    * Create a source for the given input.
    *
@@ -337,6 +360,7 @@ export class AvSource implements Source, BackchannelSource {
    */
   async open(): Promise<StreamInfo> {
     this.abort = new AbortController();
+    this.timeline.clear();
     this.demuxer = await this.openDemuxer();
     if (this.opts.backchannel) this._backchannel = this.readBackchannel();
     return { tracks: this.demuxer.streams.map(toTrackInfo), backchannel: this._backchannel };
@@ -534,6 +558,11 @@ export class AvSource implements Source, BackchannelSource {
       if (signal.aborted || this.abort?.signal.aborted) return false;
       try {
         this.demuxer = await this.openDemuxer();
+        // The reopened input restarts its own clock (a looped file begins at
+        // zero again); re-anchor every stream so the outgoing timeline stays
+        // continuous — downstream muxers and viewers must never see time
+        // jump backwards.
+        for (const state of this.timeline.values()) state.rebase = true;
         return true;
       } catch (error) {
         if (signal.aborted || this.abort?.signal.aborted) return false;
@@ -608,6 +637,9 @@ export class AvSource implements Source, BackchannelSource {
           return produced;
         }
 
+        // Keep the outgoing timeline continuous across loop/reconnect reopens.
+        this.makeContinuous(packet);
+
         if (readrate && readrate > 0) {
           const tb = packet.timeBase;
           const dts = packet.dts;
@@ -633,6 +665,47 @@ export class AvSource implements Source, BackchannelSource {
       if (!signal.aborted && !this.abort?.signal.aborted) throw error;
     }
     return produced;
+  }
+
+  /**
+   * Shift a packet's timestamps so the outgoing timeline never jumps backwards.
+   *
+   * Each reopened input restarts its own clock (a looped file begins at zero;
+   * a reconnected camera may reset its RTP mapping), which would hand every
+   * downstream muxer and viewer a non-monotonic stream. On the first packet of
+   * each stream after a reopen, the offset is re-anchored so that packet lands
+   * exactly where the previous pass ended — for an input that reset to zero the
+   * shift equals the accumulated duration, for an upstream that kept counting
+   * it is roughly zero. The first pass is never modified.
+   *
+   * @param packet - The native packet to adjust in place
+   *
+   * @internal
+   */
+  private makeContinuous(packet: Packet): void {
+    const raw = packet.dts !== AV_NOPTS_VALUE ? packet.dts : packet.pts;
+    if (raw === AV_NOPTS_VALUE) return; // untimed packet — nothing to anchor on
+
+    let state = this.timeline.get(packet.streamIndex);
+    if (!state) {
+      state = { offset: 0n, end: 0n, rebase: false };
+      this.timeline.set(packet.streamIndex, state);
+    }
+    if (state.rebase) {
+      state.rebase = false;
+      state.offset = state.end - raw;
+    }
+    if (state.offset !== 0n) {
+      if (packet.pts !== AV_NOPTS_VALUE) packet.pts = packet.pts + state.offset;
+      if (packet.dts !== AV_NOPTS_VALUE) packet.dts = packet.dts + state.offset;
+    }
+
+    // Track the end of the timeline (last timestamp plus duration); a packet
+    // with unknown duration still advances by one tick so the next pass can
+    // never collide with it.
+    const adjusted = raw + state.offset;
+    const advance = packet.duration > 0n ? packet.duration : 1n;
+    if (adjusted + advance > state.end) state.end = adjusted + advance;
   }
 
   /**
