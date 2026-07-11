@@ -269,7 +269,9 @@ export class BackchannelTranscoder {
       const audio = this.rtpInput.input.audio();
       if (!audio) throw new Error('No audio stream in talkback SDP');
 
-      this.decoder = await Decoder.create(audio, { exitOnError: false });
+      // Pass the resolved codec explicitly so `from.codec` really selects the
+      // decoder implementation (e.g. `libfdk_aac`), not just the SDP mapping.
+      this.decoder = await Decoder.create(audio, decoderCodec, { exitOnError: false });
 
       const layout = to.channels === 1 ? 'mono' : 'stereo';
       const sampleFormat = this.options.sampleFormat ? avGetSampleFmtFromName(this.options.sampleFormat) : AV_SAMPLE_FMT_S16;

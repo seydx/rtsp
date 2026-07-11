@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `RawAudioTranscoder`: normalizes raw framed elementary audio — bare coded frames with no container, one buffer per frame — into a demuxable stream (AAC-LC/ADTS by default) that plugs straight into an `AvSource`/`MultiSource` input. Supports an explicit decoder implementation (`from.decoder`) and an out-of-band codec config announced via a synthetic SDP. The motivating case is Eufy's P2P livestream audio: some cameras (e.g. T8400) deliver raw AAC-ELD, which cannot be expressed in ADTS at all (audio object type 39 does not fit the 2-bit ADTS profile field), so feeding it to the plain `aac` demuxer produced only decoder garbage; ELD additionally decodes only via `libfdk_aac`.
+- `buildAacEldConfig(sampleRate, channels, frameLength)`: builds the hex AudioSpecificConfig for raw AAC-ELD (e.g. `f8f03000` for 16 kHz mono, 480-sample frames) for use as `RawAudioTranscoder`'s codec config.
+
+### Fixed
+
+- `BackchannelTranscoder` now passes the resolved `from.codec` to the decoder it creates, so the option really selects the decoder *implementation* (e.g. `libfdk_aac`) instead of only influencing the generated SDP.
+
 ## [1.0.3] - 2026-07-10
 
 ### Changed

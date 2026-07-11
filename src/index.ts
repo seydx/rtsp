@@ -17,6 +17,9 @@ export type { AvInput, AvReconnectOptions, AvSourceOptions } from './sources/av.
 export { MultiSource } from './sources/multi.js';
 export type { MultiSourceInput } from './sources/multi.js';
 
+export { buildAacEldConfig, RawAudioTranscoder } from './sources/raw-audio-transcoder.js';
+export type { RawAudioInput, RawAudioTarget, RawAudioTranscoderOptions } from './sources/raw-audio-transcoder.js';
+
 // Sinks
 export { CallbackSink } from './sinks/callback.js';
 export type { CallbackSinkHandlers } from './sinks/callback.js';
