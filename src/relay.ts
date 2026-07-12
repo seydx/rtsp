@@ -55,6 +55,25 @@ export interface RelayOptions {
   autoStart?: boolean;
 
   /**
+   * How long, in milliseconds, the running upstream may deliver no packet at all
+   * before it is treated as a silent stall and torn down.
+   *
+   * A live source can wedge without ever ending: it delivers neither packets nor
+   * an end-of-stream nor an error — the classic symptom is a camera whose
+   * session "starts" but never sends a frame, or a network link that freezes
+   * mid-stream. The pump loop would otherwise wait on the next packet forever,
+   * leaving every consumer staring at a dead stream. With a positive value the
+   * relay watches the gap since the last dispatched packet; if it exceeds the
+   * timeout the pump is aborted, `error` is emitted, and the relay stops — so a
+   * consumer (or a reconnecting client) can restart it and force a fresh upstream
+   * session. Measured only while `running`, and reset by every packet, so a
+   * healthy stream never trips it. A value of `0` (the default) disables the
+   * watchdog and waits indefinitely. Set it above the largest legitimate gap the
+   * source can produce (several seconds for a low-frame-rate camera).
+   */
+  stallTimeout?: number;
+
+  /**
    * Optional logger for diagnostic and error output.
    *
    * Receives non-fatal warnings and errors raised while pumping the upstream,
@@ -187,6 +206,7 @@ export class Relay extends TypedEmitter<RelayEvents> {
   private readonly logger?: Logger;
   private readonly idleTimeout: number;
   private readonly maxQueue: number;
+  private readonly stallTimeout: number;
 
   private readonly channels = new Set<SinkChannel>();
   private readonly videoIndexes = new Set<number>();
@@ -219,6 +239,7 @@ export class Relay extends TypedEmitter<RelayEvents> {
     this.logger = options.logger;
     this.idleTimeout = options.idleTimeout ?? 0;
     this.maxQueue = options.maxQueue ?? DEFAULT_MAX_QUEUE;
+    this.stallTimeout = options.stallTimeout ?? 0;
 
     // Fire-and-forget: runStart() already logs and emits 'error' on failure, so
     // an eager start must not surface as an unhandled rejection.
@@ -612,26 +633,60 @@ export class Relay extends TypedEmitter<RelayEvents> {
   private async pumpLoop(): Promise<void> {
     const abort = new AbortController();
     this.pullAbort = abort;
+
+    // Silent-stall watchdog: a wedged live source delivers no packet, no EOF and
+    // no error, so the for-await below would suspend forever. A periodic check on
+    // the gap since the last packet aborts the pull when it exceeds stallTimeout;
+    // `stalled` distinguishes that from a deliberate stop() abort so it surfaces
+    // as an error rather than a clean end.
+    let stalled = false;
+    let lastPacketAt = Date.now();
+    let watchdog: ReturnType<typeof setInterval> | undefined;
+    if (this.stallTimeout > 0) {
+      // Poll at a fraction of the timeout so detection latency stays well under it.
+      const interval = Math.max(250, Math.floor(this.stallTimeout / 4));
+      watchdog = setInterval(() => {
+        if (Date.now() - lastPacketAt >= this.stallTimeout) {
+          stalled = true;
+          abort.abort();
+        }
+      }, interval);
+      watchdog.unref?.();
+    }
+
     try {
       for await (const packet of this.source.packets(abort.signal)) {
+        lastPacketAt = Date.now();
         if (abort.signal.aborted) {
           packet.free();
           break;
         }
         this.dispatch(packet);
       }
-      if (!abort.signal.aborted) {
+      if (stalled) {
+        const error = new Error(`upstream stalled: no packet within ${this.stallTimeout}ms`);
+        this.logger?.error?.('[rtsp] upstream stalled — tearing down:', error);
+        this.emit('error', error);
+        void this.stop();
+      } else if (!abort.signal.aborted) {
         this.emit('end');
         // Fire-and-forget: gracefulStop() handles its own failures internally.
         void this.gracefulStop();
       }
     } catch (error) {
-      if (!abort.signal.aborted) {
+      if (stalled) {
+        const stallError = new Error(`upstream stalled: no packet within ${this.stallTimeout}ms`);
+        this.logger?.error?.('[rtsp] upstream stalled — tearing down:', stallError);
+        this.emit('error', stallError);
+        void this.stop();
+      } else if (!abort.signal.aborted) {
         this.logger?.error?.('[rtsp] upstream pump failed:', error);
         this.emit('error', error);
         // Fire-and-forget: stop() handles its own failures internally.
         void this.stop();
       }
+    } finally {
+      if (watchdog) clearInterval(watchdog);
     }
   }
 
