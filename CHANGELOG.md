@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-07-12
+
 ### Added
 
 - `Relay` `stallTimeout` option: a silent-stall watchdog for wedged live sources. A camera whose session "starts" but never sends a frame — or a network link that freezes mid-stream — delivers no packet, no end-of-stream, and no error, so the pump loop would wait forever and every consumer sees a dead stream. With a positive `stallTimeout` the relay watches the gap since the last packet; if it exceeds the timeout it aborts the pull, emits `error`, and stops, so a consumer (or reconnecting client) can restart it and force a fresh upstream session. Reset by every packet, so a healthy stream never trips it; measured only while running. Defaults to `0` (disabled).
