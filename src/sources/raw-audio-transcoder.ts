@@ -153,10 +153,10 @@ export interface RawAudioTranscoderOptions {
  * Build the AudioSpecificConfig for raw AAC-ELD, hex-encoded.
  *
  * AAC-ELD (Enhanced Low Delay, audio object type 39) cannot be carried in ADTS
- * — the ADTS header has only a 2-bit profile field — so cameras that speak it
- * (for example Eufy's P2P livestream audio) deliver bare frames that are
- * undecodable without this out-of-band configuration. The returned hex string
- * plugs directly into {@link RawAudioInput.config}.
+ * — the ADTS header has only a 2-bit profile field — so devices that speak it
+ * tend to deliver bare frames that are undecodable without this out-of-band
+ * configuration. The returned hex string plugs directly into
+ * {@link RawAudioInput.config}.
  *
  * @param sampleRate - Sample rate in hertz; must be a standard MPEG-4 rate (e.g. 16000).
  *
@@ -231,28 +231,28 @@ function rtpmapName(codec: string): string {
 /**
  * Normalizes raw framed elementary audio into a demuxable stream.
  *
- * Some devices deliver audio as bare coded frames with no container at all —
- * the canonical case is Eufy's P2P livestream, whose AAC-ELD frames cannot be
- * expressed in ADTS and therefore break every ADTS-based consumer. This class
- * accepts those frames one `push()` at a time, decodes them (optionally with an
- * explicit decoder such as `libfdk_aac`), re-encodes to a standards-compliant
- * target (AAC-LC in ADTS by default), and exposes the result as a Readable that
- * plugs directly into an `AvSource` or `MultiSource` input.
+ * Some devices deliver audio as bare coded frames with no container at all — the
+ * canonical case is raw AAC-ELD, whose frames cannot be expressed in ADTS and
+ * therefore break every ADTS-based consumer. This class accepts those frames one
+ * `push()` at a time, decodes them (optionally with an explicit decoder such as
+ * `libfdk_aac`), re-encodes to a standards-compliant target (AAC-LC in ADTS by
+ * default), and exposes the result as a Readable that plugs directly into an
+ * `AvSource` or `MultiSource` input.
  *
  * @example
  * ```typescript
  * import { buildAacEldConfig, MultiSource, RawAudioTranscoder } from '@seydx/rtsp';
  *
- * // Eufy AAC-ELD: 16 kHz mono, 480-sample frames, decodable only via libfdk.
+ * // Raw AAC-ELD: 16 kHz mono, 480-sample frames, decodable only via libfdk.
  * const audio = new RawAudioTranscoder({
  *   from: { codec: 'aac', decoder: 'libfdk_aac', sampleRate: 16000, channels: 1, samplesPerFrame: 480, config: buildAacEldConfig(16000, 1, 480) },
  *   to: { bitRate: 32000 },
  * });
  * await audio.start();
- * eufyAudioStream.on('data', (frame) => audio.push(frame));
+ * audioFrameStream.on('data', (frame) => audio.push(frame));
  *
  * const source = new MultiSource([
- *   { input: eufyVideoStream, format: 'h264' },
+ *   { input: videoStream, format: 'h264' },
  *   { input: audio.stream, format: 'aac' },
  * ]);
  * ```
@@ -333,20 +333,20 @@ export class RawAudioTranscoder {
     const encoderCodec = Codec.findEncoderByName((to.codec ?? 'aac') as FFEncoderCodec);
     if (!encoderCodec) throw new Error(`Unsupported raw audio target codec: ${to.codec ?? 'aac'}`);
 
-    try {
-      // A free local port makes the SDP well-formed, though no socket is ever
-      // bound — frames are fed in directly via push(). The SDP is hand-rolled
-      // because libav's own SDP writer refuses AAC without global headers,
-      // while the whole point here is carrying that config in the fmtp line.
-      const port = await getPort({ host: '127.0.0.1' });
-      const payloadType = 96;
-      const fmtpParams =
-        from.codec === 'aac'
-          ? `profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3${from.config ? `;config=${from.config}` : ''}`
-          : from.config
-            ? `config=${from.config}`
-            : undefined;
-      const sdp = [
+    const payloadType = 96;
+    const fmtpParams =
+      from.codec === 'aac'
+        ? `profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3${from.config ? `;config=${from.config}` : ''}`
+        : from.config
+          ? `config=${from.config}`
+          : undefined;
+    // The SDP is hand-rolled because libav's own SDP writer refuses AAC without
+    // global headers, while the whole point here is carrying that config in the
+    // fmtp line. openSDP binds the announced UDP port even though frames are fed
+    // in via push() rather than the socket, so two transcoders starting at once
+    // can race for the same "free" port — retry with a fresh one on collision.
+    const buildSdp = (port: number): string =>
+      [
         'v=0',
         'o=- 0 0 IN IP4 127.0.0.1',
         's=RawAudio',
@@ -358,7 +358,8 @@ export class RawAudioTranscoder {
         '',
       ].join('\n');
 
-      this.input = await Demuxer.openSDP(sdp);
+    try {
+      this.input = await this.openInputWithRetry(buildSdp);
       const audio = this.input.input.audio();
       if (!audio) throw new Error('No audio stream in raw audio SDP');
 
@@ -400,6 +401,45 @@ export class RawAudioTranscoder {
 
     // Drive the pipeline in the background; it runs until close() tears it down.
     this.processing = this.process();
+  }
+
+  /**
+   * Open the synthetic RTP input, retrying with a fresh port on a bind clash.
+   *
+   * `getPort` only guarantees a free port within its own process, and `openSDP`
+   * actually binds the announced UDP port, so two transcoders (or two processes)
+   * starting simultaneously can pick the same port and one bind fails. A handful
+   * of retries with freshly allocated ports makes startup robust.
+   *
+   * @param buildSdp - Builds the input SDP for a given UDP port.
+   *
+   * @returns The opened RTP demuxer.
+   *
+   * @throws {Error} If every attempt fails; the last error is re-thrown.
+   *
+   * @internal
+   */
+  private async openInputWithRetry(buildSdp: (port: number) => string): Promise<RTPDemuxer> {
+    const attempts = 8;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        // Random preferred port so concurrent openers (get-port's default scan
+        // starts at the same low port in every process) do not correlate;
+        // get-port still falls back to any free port if it is taken.
+        const preferred = 20000 + Math.floor(Math.random() * 40000);
+        const port = await getPort({ host: '127.0.0.1', port: preferred });
+        return await Demuxer.openSDP(buildSdp(port));
+      } catch (error) {
+        lastError = error;
+        // The SDP is statically valid (built from validated config), so a
+        // failure here is environmental — practically always a UDP bind clash on
+        // the picked port, which a fresh port clears. Log so a genuinely
+        // persistent failure is diagnosable rather than silently retried away.
+        this.options.logger?.debug?.(`[rtsp] raw audio input open attempt ${attempt}/${attempts} failed, retrying on a fresh port:`, error);
+      }
+    }
+    throw lastError;
   }
 
   /**

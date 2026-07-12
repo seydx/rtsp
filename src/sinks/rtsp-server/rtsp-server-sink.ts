@@ -126,8 +126,9 @@ export interface RtspServerSinkOptions {
    * Detaching tears down the per-track muxers and the resolved SDP, so an
    * immediate detach forces the next viewer through a full warm-up (muxer
    * headers, keyframe sync, SDP generation) even when it reconnects right
-   * away — the typical pattern of pulling clients that retry on a timeout
-   * (go2rtc, ffmpeg with `-timeout`). The grace period keeps that state warm
+   * away — the typical pattern of pulling clients that retry on a read timeout
+   * (for example ffmpeg with `-timeout`, or a restreamer that reconnects). The
+   * grace period keeps that state warm
    * across the gap: a viewer arriving within the window is answered from the
    * existing SDP immediately, and the upstream never observes the detach. The
    * relay's own `idleTimeout` only starts counting once the sink actually
