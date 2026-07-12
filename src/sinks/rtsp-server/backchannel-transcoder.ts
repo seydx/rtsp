@@ -258,9 +258,13 @@ export class BackchannelTranscoder {
     if (!encoderCodec) throw new Error(`Unsupported talkback target codec: ${to.codec ?? to.codecId}`);
 
     try {
-      // A free local port is required to form a valid input SDP, even though no
-      // socket is actually bound — packets are fed in directly via push().
-      const port = await getPort({ host: '127.0.0.1' });
+      // A free local port is required to form a valid input SDP; openSDP binds
+      // it even though packets are fed in directly via push(). get-port's default
+      // scan starts at the same low port in every process, so concurrent
+      // processes correlate and pick the same port — seed a random preferred one
+      // to decorrelate them (get-port falls back to any free port if it is taken).
+      const preferred = 20000 + Math.floor(Math.random() * 40000);
+      const port = await getPort({ host: '127.0.0.1', port: preferred });
       const sdp = StreamingUtils.createInputSDP([
         { port, codecId: decoderCodec.id, payloadType: from.payloadType, clockRate: from.clockRate, channels: from.channels, fmtp: from.fmtp },
       ]);
