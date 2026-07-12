@@ -81,6 +81,7 @@ export class SinkChannel {
   private inited = false;
   private initPromise?: Promise<void>;
   private idleWaiters: (() => void)[] = [];
+  private lastWriteAt = 0;
 
   /**
    * Create a fan-out channel for one sink.
@@ -146,7 +147,24 @@ export class SinkChannel {
     }
 
     if (this.queue.length >= this.options.maxQueue) {
-      this.options.logger?.warn?.('[rtsp] sink queue overflow — dropping backlog and resyncing');
+      const age = this.lastWriteAt === 0 ? 'never wrote' : `last write ${((Date.now() - this.lastWriteAt) / 1000).toFixed(1)}s ago`;
+      // Prefer skipping forward to the newest keyframe already buffered: the
+      // consumer resumes seamlessly at a clean GOP with no output gap. This is
+      // the common shape after an upstream burst (a stalled camera flushing
+      // several seconds at once) — the burst itself usually contains the
+      // keyframe needed to continue. Only when the kept tail would not relieve
+      // the pressure does the channel fall back to dropping everything and
+      // re-gating on the next arriving keyframe.
+      const cut = this.newestKeyframeIndex();
+      if (cut > 0 && this.queue.length - cut <= this.options.maxQueue / 2) {
+        this.options.logger?.warn?.(`[rtsp] sink queue overflow (${this.queue.length} packets, ${age}) — skipping forward to the newest buffered keyframe`);
+        for (let i = 0; i < cut; i++) this.queue[i].free();
+        this.queue.splice(0, cut);
+        this.queue.push(packet);
+        this.drain();
+        return;
+      }
+      this.options.logger?.warn?.(`[rtsp] sink queue overflow (${this.queue.length} packets, ${age}) — dropping backlog and resyncing`);
       this.flushQueue();
       // Re-gate so we restart cleanly at the next keyframe instead of mid-GOP.
       this.active = false;
@@ -292,6 +310,7 @@ export class SinkChannel {
         const packet = this.queue.shift()!;
         try {
           await this.sink.write(packet);
+          this.lastWriteAt = Date.now();
         } catch (error) {
           this.options.logger?.error?.('[rtsp] sink write failed — closing channel:', error);
           packet.free();
@@ -331,6 +350,22 @@ export class SinkChannel {
     const waiters = this.idleWaiters;
     this.idleWaiters = [];
     for (const resolve of waiters) resolve();
+  }
+
+  /**
+   * Index of the newest video keyframe in the queue, or `-1` when none is
+   * buffered.
+   *
+   * @returns The queue index of the last buffered keyframe.
+   *
+   * @internal
+   */
+  private newestKeyframeIndex(): number {
+    for (let i = this.queue.length - 1; i >= 0; i--) {
+      const packet = this.queue[i];
+      if (packet.isKeyframe && this.isVideo(packet)) return i;
+    }
+    return -1;
   }
 
   /**
