@@ -218,6 +218,62 @@ describe('Relay error handling', () => {
     expect(errors).toHaveLength(1);
   });
 
+  it('tears down with an error when the running upstream goes silent past stallTimeout', async () => {
+    const source = new FakeSource(AUDIO_ONLY);
+    const tracker = new PacketTracker();
+    const relay = new Relay({ source, stallTimeout: 120 });
+    const errors: unknown[] = [];
+    let stopped = false;
+    relay.on('error', (e) => errors.push(e));
+    relay.on('stop', () => (stopped = true));
+
+    const c = collector();
+    relay.pipe(c.sink);
+    await flush();
+
+    // A couple of packets flow, then the source wedges: no more packets, no end,
+    // no error — the exact "session started but frames stopped" failure.
+    source.push(tracker.make({ streamIndex: 0, isKeyframe: true }));
+    source.push(tracker.make({ streamIndex: 0, isKeyframe: false }));
+    await flush(30);
+    expect(relay.status).toBe('running');
+    expect(errors).toHaveLength(0);
+
+    // Within the stall window the watchdog aborts the pump, surfaces an error and stops.
+    await flush(250);
+    expect(errors).toHaveLength(1);
+    expect(String((errors[0] as Error).message)).toMatch(/stalled/i);
+    expect(stopped).toBe(true);
+    expect(relay.status).toBe('idle');
+    expect(source.closed).toBe(true);
+    expect(tracker.live).toBe(0);
+  });
+
+  it('does not trip the stall watchdog while packets keep flowing', async () => {
+    const source = new FakeSource(AUDIO_ONLY);
+    const tracker = new PacketTracker();
+    const relay = new Relay({ source, stallTimeout: 120 });
+    const errors: unknown[] = [];
+    relay.on('error', (e) => errors.push(e));
+
+    const c = collector();
+    relay.pipe(c.sink);
+    await flush();
+
+    // Deliver a packet every 40ms for ~300ms — comfortably under the 120ms
+    // timeout each time, so the watchdog must never fire.
+    for (let i = 0; i < 8; i++) {
+      source.push(tracker.make({ streamIndex: 0, isKeyframe: i === 0 }));
+      await flush(40);
+    }
+
+    expect(errors).toHaveLength(0);
+    expect(relay.status).toBe('running');
+
+    await relay.stop();
+    expect(tracker.live).toBe(0);
+  });
+
   it('does not crash the process when the source fails and no error listener exists', async () => {
     const rejections: unknown[] = [];
     const onRejection = (reason: unknown): void => {

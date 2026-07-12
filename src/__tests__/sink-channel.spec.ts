@@ -103,6 +103,42 @@ describe('SinkChannel', () => {
     expect(tracker.live).toBe(0);
   });
 
+  it('skips forward to the newest buffered keyframe on overflow instead of flushing', async () => {
+    const tracker = new PacketTracker();
+    const gated = gatedSink();
+    const videoIndexes = new Set([0]);
+    const channel = new SinkChannel(gated.sink, { videoIndexes, maxQueue: 4 });
+    await channel.init({ tracks: [] });
+
+    // First keyframe goes straight into an in-flight (gated) write.
+    channel.offer(tracker.make({ streamIndex: 0, isKeyframe: true }));
+    await flush();
+    expect(gated.written.length).toBe(1);
+
+    // Fill the queue behind the stalled write: two deltas, a fresh keyframe, one more delta.
+    channel.offer(tracker.make({ streamIndex: 0, isKeyframe: false })); // d1
+    channel.offer(tracker.make({ streamIndex: 0, isKeyframe: false })); // d2
+    channel.offer(tracker.make({ streamIndex: 0, isKeyframe: true })); // KF1
+    channel.offer(tracker.make({ streamIndex: 0, isKeyframe: false })); // d3 — queue now at maxQueue
+
+    // This overflows: rather than dropping everything and re-gating, the channel
+    // skips forward to KF1 (freeing d1/d2) and keeps delivering — the gate stays open.
+    channel.offer(tracker.make({ streamIndex: 0, isKeyframe: false })); // d4
+    expect(channel.active).toBe(true);
+
+    // Release the in-flight write and the kept tail (KF1, d3, d4).
+    for (let i = 0; i < 5; i++) {
+      gated.release();
+      await flush();
+    }
+
+    // The original keyframe plus the kept tail were written; the two stale
+    // deltas ahead of KF1 were dropped, not the whole backlog.
+    expect(gated.written.length).toBe(4);
+    await channel.close();
+    expect(tracker.live).toBe(0);
+  });
+
   it('drops the backlog and re-gates on overflow', async () => {
     const tracker = new PacketTracker();
     const gated = gatedSink();

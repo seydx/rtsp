@@ -30,7 +30,7 @@ async function *sineFrames(count: number, samplesPerFrame: number, sampleRate: n
   yield null;
 }
 
-/** Encode sine PCM to raw AAC-ELD frames via libfdk — the shape a Eufy camera delivers. */
+/** Encode sine PCM to raw AAC-ELD frames via libfdk — the shape a device emitting raw ELD delivers. */
 async function makeEldFrames(count: number): Promise<Buffer[]> {
   const encoder = await Encoder.create('libfdk_aac' as FFEncoderCodec, {
     context: { timeBase: new Rational(1, SAMPLE_RATE) },
@@ -73,8 +73,8 @@ describe('buildAacEldConfig', () => {
 
 describe('RawAudioTranscoder', () => {
   it.skipIf(!hasFdk)('normalizes raw AAC-ELD frames to demuxable ADTS AAC-LC', async () => {
-    // 100 frames × 480 samples @16kHz = 3s of real ELD, exactly what a Eufy
-    // T8400 pushes over P2P (bare frames, undecodable as ADTS).
+    // 100 frames × 480 samples @16kHz = 3s of real ELD — bare frames with no
+    // container, exactly the shape a raw-ELD source delivers (undecodable as ADTS).
     const eldFrames = await makeEldFrames(100);
     expect(eldFrames.length).toBeGreaterThan(90);
 
