@@ -4,11 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `Relay` `stallTimeout` option: a silent-stall watchdog for wedged live sources. A camera whose session "starts" but never sends a frame — or a network link that freezes mid-stream — delivers no packet, no end-of-stream, and no error, so the pump loop would wait forever and every consumer sees a dead stream. With a positive `stallTimeout` the relay watches the gap since the last packet; if it exceeds the timeout it aborts the pull, emits `error`, and stops, so a consumer (or reconnecting client) can restart it and force a fresh upstream session. Reset by every packet, so a healthy stream never trips it; measured only while running. Defaults to `0` (disabled).
+
+### Changed
+
+- On a per-sink queue overflow, `SinkChannel` now skips forward to the newest keyframe already buffered instead of always dropping the whole backlog and re-gating on the next arriving keyframe. When an upstream burst (e.g. a stalled camera flushing several seconds of frames at once) fills the queue, the consumer resumes at a clean GOP with no output gap rather than stalling until the next IDR arrives. Only when the kept tail would not relieve the pressure does it fall back to the full flush. The overflow warning now also reports the queue depth and the time since the last successful write, to distinguish a genuine slow consumer from a source-side burst.
+
+### Fixed
+
+- `RawAudioTranscoder` and `BackchannelTranscoder` could fail to start when two of them (or two processes) opened their synthetic RTP input at the same time: `get-port`'s default scan starts at the same low port in every process, so the picked "free" UDP port correlated and `openSDP`'s bind clashed. They now seed `get-port` with a random preferred port to decorrelate concurrent openers, and `RawAudioTranscoder` retries on a fresh port if the bind still clashes.
+
 ## [1.0.4] - 2026-07-11
 
 ### Added
 
-- `RawAudioTranscoder`: normalizes raw framed elementary audio — bare coded frames with no container, one buffer per frame — into a demuxable stream (AAC-LC/ADTS by default) that plugs straight into an `AvSource`/`MultiSource` input. Supports an explicit decoder implementation (`from.decoder`) and an out-of-band codec config announced via a synthetic SDP. The motivating case is Eufy's P2P livestream audio: some cameras (e.g. T8400) deliver raw AAC-ELD, which cannot be expressed in ADTS at all (audio object type 39 does not fit the 2-bit ADTS profile field), so feeding it to the plain `aac` demuxer produced only decoder garbage; ELD additionally decodes only via `libfdk_aac`.
+- `RawAudioTranscoder`: normalizes raw framed elementary audio — bare coded frames with no container, one buffer per frame — into a demuxable stream (AAC-LC/ADTS by default) that plugs straight into an `AvSource`/`MultiSource` input. Supports an explicit decoder implementation (`from.decoder`) and an out-of-band codec config announced via a synthetic SDP. The motivating case is a device that delivers raw AAC-ELD, which cannot be expressed in ADTS at all (audio object type 39 does not fit the 2-bit ADTS profile field), so feeding it to the plain `aac` demuxer produced only decoder garbage; ELD additionally decodes only via `libfdk_aac`.
 - `buildAacEldConfig(sampleRate, channels, frameLength)`: builds the hex AudioSpecificConfig for raw AAC-ELD (e.g. `f8f03000` for 16 kHz mono, 480-sample frames) for use as `RawAudioTranscoder`'s codec config.
 
 ### Fixed
@@ -19,7 +31,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- `RtspServerSink` no longer detaches from the relay the instant the last client disconnects: it now lingers for a grace period (new `detachDelay` option, default 5s) so a quickly retrying client — the normal pattern of pullers like go2rtc or ffmpeg after a timeout — finds the muxers and SDP still warm and gets its DESCRIBE answered immediately instead of restarting the whole upstream warm-up from zero. The relay's `idleTimeout` starts counting only once the sink actually detaches. Set `detachDelay: 0` for the previous immediate-detach behavior.
+- `RtspServerSink` no longer detaches from the relay the instant the last client disconnects: it now lingers for a grace period (new `detachDelay` option, default 5s) so a quickly retrying client — the normal pattern of pulling clients that reconnect after a read timeout — finds the muxers and SDP still warm and gets its DESCRIBE answered immediately instead of restarting the whole upstream warm-up from zero. The relay's `idleTimeout` starts counting only once the sink actually detaches. Set `detachDelay: 0` for the previous immediate-detach behavior.
 
 ### Fixed
 
