@@ -142,7 +142,18 @@ suite('MultiSource', () => {
   }
 
   it('merges separate raw inputs into one source that feeds a relay', async () => {
-    const relay = new Relay({ source: rawPair() });
+    // the sink starts at the first video keyframe; read at full speed, the whole audio clip can pass before it and be dropped,
+    // so the rest follows the first video packet
+    const data = await readFile(aac);
+    const split = Math.floor(data.length * 0.7);
+    const audio = new PassThrough();
+    audio.write(data.subarray(0, split));
+    const relay = new Relay({
+      source: new MultiSource([
+        { input: createReadStream(h264), format: 'h264' },
+        { input: audio, format: 'aac' },
+      ]),
+    });
     const indexes = new Set<number>();
     let info: StreamInfo | undefined;
     let firstVideo: boolean | undefined;
@@ -155,7 +166,9 @@ suite('MultiSource', () => {
         new CallbackSink({
           onPacket: (packet) => {
             indexes.add(packet.streamIndex);
-            if (packet.streamIndex === 0) firstVideo ??= packet.isKeyframe;
+            if (packet.streamIndex !== 0) return;
+            firstVideo ??= packet.isKeyframe;
+            if (!audio.writableEnded) audio.end(data.subarray(split));
           },
         }),
       );
