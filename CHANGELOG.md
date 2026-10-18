@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-18
+
 Version 2 is a rework of the whole library: one shared demux and audio pipeline instead of several near-duplicates, a synchronous in-process transcoding path, video re-encoding (MJPEG to H.264 with hardware acceleration), a stricter RTSP server and a test suite that covers every module. The public surface is smaller and more consistent, which breaks some imports and option names; the migration section lists every change.
 
 ### Migration from 1.x
