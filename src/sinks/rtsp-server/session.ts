@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 
-import { buildResponse, RtspParser } from './protocol.js';
+import { buildResponse, RtspParser, uriPath } from './protocol.js';
 
 import type { Socket } from 'node:net';
 import type { Logger, TrackKind } from '../../types.js';
@@ -8,177 +8,112 @@ import type { RtspAuth } from './auth.js';
 import type { RtspRequest } from './protocol.js';
 
 /**
- * Server-side hooks a session relies on from its owning server.
- *
- * Decouples an individual viewer session from the server that created it,
- * exposing only the shared configuration and callbacks the session needs to
- * answer the RTSP handshake and forward media. The server implements this
- * interface and passes itself to each {@link RtspSession} it accepts.
+ * What a session needs from the server that owns it.
  *
  * @internal
  */
 export interface RtspSessionHost {
-  /**
-   * Optional authenticator for incoming requests.
-   *
-   * When present, every request is checked against this authenticator before it
-   * is dispatched; unauthenticated requests receive a 401 challenge. When
-   * absent, all requests are served without authentication.
-   */
   readonly auth?: RtspAuth;
-
-  /**
-   * Optional logger for diagnostics.
-   *
-   * Used to surface parse failures and request-handling errors. All logging is
-   * best-effort and guarded, so a missing logger silently disables it.
-   */
   readonly logger?: Logger;
-
-  /**
-   * Track kinds indexed by SDP `streamid`.
-   *
-   * The element at index `n` describes the media kind (for example `video` or
-   * `audio`) of the track advertised with `streamid=n` in the SDP. Used to
-   * decide whether a viewer's subscription must be keyframe-gated.
-   */
-  readonly trackKinds: readonly TrackKind[];
-
-  /**
-   * SDP `streamid` of the talkback (backchannel) media, if advertised.
-   *
-   * When set, a viewer that sets up this stream may push audio back to the
-   * source over its interleaved RTP channel. Undefined when the source exposes
-   * no backchannel.
-   */
-  readonly backchannelStreamId?: number;
-
-  /**
-   * Ensure the upstream source is live and resolve its DESCRIBE SDP.
-   *
-   * Called the first time a viewer issues DESCRIBE; the server starts (or
-   * reuses) the upstream and returns the SDP describing the available tracks.
-   *
-   * @returns The SDP body to return for DESCRIBE
-   */
-  activate(): Promise<string>;
-
-  /**
-   * Notify the server that a session has entered the playing state.
-   *
-   * Invoked after a successful PLAY so the server can begin feeding media to
-   * this session.
-   *
-   * @param session - The session that started playing
-   */
+  /** Stream path without slashes, for example `live`. */
+  readonly path: string;
+  /** Resolve the SDP, attaching the server to the relay if needed. */
+  describe(session: RtspSession): Promise<string>;
+  /** Kind of a served track or the talkback track, `undefined` for unknown ids. */
+  trackKind(trackId: number): TrackKind | undefined;
+  /** Track id of the talkback media, if advertised. */
+  readonly backchannelTrack?: number;
+  /** `RTP-Info` header value for the given tracks, if any has sent data. */
+  rtpInfo(base: string, trackIds: readonly number[]): string | undefined;
   sessionPlaying(session: RtspSession): void;
-
-  /**
-   * Notify the server that a session has closed.
-   *
-   * Invoked once when the session tears down or its socket fails, allowing the
-   * server to drop it from its active set and release resources.
-   *
-   * @param session - The session that closed
-   */
+  sessionPaused(session: RtspSession): void;
   sessionClosed(session: RtspSession): void;
-
-  /**
-   * Forward inbound talkback RTP from a viewer to the upstream source.
-   *
-   * The payload has already been de-framed from the interleaved TCP envelope,
-   * so it is a bare RTP packet ready to be sent back to the source.
-   *
-   * @param rtp - The de-framed RTP packet received from the viewer
-   */
-  onBackchannelRtp(rtp: Buffer): void;
+  backchannelRtp(rtp: Buffer): void;
 }
 
 /**
- * Interleaved channel pair negotiated for a single track.
+ * Interleaved channels of one set-up track.
  *
  * @internal
  */
 interface Transport {
-  /** Interleaved TCP channel number carrying RTP for the track. */
   rtp: number;
-
-  /** Interleaved TCP channel number carrying RTCP for the track. */
   rtcp: number;
 }
 
-const SUPPORTED_METHODS = 'OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER';
+/**
+ * One RTP or RTCP packet, framed for interleaved delivery once per channel.
+ *
+ * Viewers usually pick the same channel numbers, so most packets are framed
+ * once no matter how many sessions receive them.
+ *
+ * @internal
+ */
+export class InterleavedFrame {
+  private channel = -1;
+  private framed?: Buffer;
 
-// Session timeout advertised to clients in the SETUP response, in seconds.
-const ADVERTISED_TIMEOUT_S = 60;
+  constructor(readonly payload: Buffer) {}
 
-// Idle window after which a non-playing session is reaped. Playing sessions are
-// exempt: interleaved clients typically stop sending keep-alives once RTP flows,
-// and their liveness is enforced by the write backpressure limit instead.
-const IDLE_TIMEOUT_MS = 2 * ADVERTISED_TIMEOUT_S * 1000;
+  /**
+   * The packet with the `$`, channel and length prefix.
+   *
+   * @param channel - Interleaved channel number
+   *
+   * @returns The framed packet
+   *
+   * @internal
+   */
+  on(channel: number): Buffer {
+    if (channel === this.channel && this.framed) return this.framed;
+    const framed = Buffer.allocUnsafe(4 + this.payload.length);
+    framed[0] = 0x24;
+    framed[1] = channel;
+    framed.writeUInt16BE(this.payload.length, 2);
+    this.payload.copy(framed, 4);
+    this.channel = channel;
+    this.framed = framed;
+    return framed;
+  }
+}
 
-// How often each session checks itself for idleness.
-const IDLE_CHECK_INTERVAL_MS = 30_000;
-
-// Upper bound on bytes queued in a viewer's socket before the session is
-// dropped. The per-sink relay queue only protects the relay→sink path; a slow
-// or half-dead client would otherwise grow the kernel-side socket buffer plus
-// Node's writable queue without limit. 8 MiB is several seconds of a typical
-// HD stream — a client that far behind cannot catch up on live media anyway.
-const MAX_SOCKET_BUFFER_BYTES = 8 * 1024 * 1024;
+const SUPPORTED_METHODS = 'OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER, SET_PARAMETER';
+const SESSION_TIMEOUT_S = 60;
+// playing sessions are exempt, interleaved clients often stop sending keep-alives once media flows
+const IDLE_TIMEOUT_MS = 2 * SESSION_TIMEOUT_S * 1000;
+const IDLE_CHECK_MS = 30_000;
+const KEEPALIVE_MS = 15_000;
+// several seconds of HD video; a viewer this far behind cannot catch up on live media
+const MAX_SOCKET_BUFFER = 8 * 1024 * 1024;
 
 /**
- * A single connected RTSP viewer.
+ * One RTSP client connection.
  *
- * Represents one client connection to the RTSP server and drives the full
- * control handshake from OPTIONS through DESCRIBE, SETUP and PLAY. Once playing,
- * the server feeds it packetized media, which the session frames and writes back
- * to the client over the same TCP connection. The session is internal to the
- * server and not part of the public API.
+ * Handles the request flow from OPTIONS to TEARDOWN over TCP-interleaved
+ * transport, writes the media of the tracks the client set up and forwards
+ * talkback RTP to the host. A playing session starts at a video keyframe and
+ * is dropped when the client stops reading.
  *
  * @internal
  */
 export class RtspSession {
-  /** Unique random identifier for this session, used as the RTSP `Session` value. */
   readonly id = randomBytes(8).toString('hex');
 
-  /** Incremental parser for control requests and interleaved frames from the socket. */
   private readonly parser = new RtspParser();
-
-  /** Map of SDP `streamid` to the interleaved channel pair negotiated for that track. */
   private readonly transports = new Map<number, Transport>();
-
-  /** Interleaved RTP channel the client uses to send talkback, set during SETUP of the backchannel track. */
+  private readonly idleTimer: NodeJS.Timeout;
   private backchannelChannel?: number;
-
-  /** Whether the session has issued PLAY and is currently receiving media. */
   private playing = false;
-
-  /** Whether media delivery has actually begun (cleared on each PLAY for keyframe gating). */
   private started = false;
-
-  /** Whether the session has been torn down; guards against double-close and post-close writes. */
   private closed = false;
-
-  /** Serializes request handling so pipelined requests are answered strictly in order. */
+  private sdp?: string;
   private pending: Promise<void> = Promise.resolve();
-
-  /** Wall-clock time of the last inbound bytes, used to reap idle non-playing sessions. */
-  private lastActivity = Date.now();
-
-  /** Periodic idle check; unref'd so it never keeps the process alive. */
-  private readonly idleTimer: ReturnType<typeof setInterval>;
+  private lastActivity = performance.now();
 
   /**
-   * Create a session bound to an accepted client socket.
+   * @param socket - The accepted client connection
    *
-   * Wires up the socket's `data`, `error` and `close` events so the session can
-   * parse incoming control messages and tear itself down on disconnect, and arms
-   * the periodic idle check that reaps abandoned non-playing sessions.
-   *
-   * @param socket - The accepted TCP socket for this client
-   *
-   * @param host - The owning server's hooks and shared configuration
+   * @param host - The owning server
    *
    * @internal
    */
@@ -186,61 +121,48 @@ export class RtspSession {
     private readonly socket: Socket,
     private readonly host: RtspSessionHost,
   ) {
+    socket.setNoDelay(true);
+    // detects viewers that vanished without closing, for example after a network change
+    socket.setKeepAlive(true, KEEPALIVE_MS);
     socket.on('data', (chunk: Buffer) => this.onData(chunk));
     socket.on('error', () => this.close());
     socket.on('close', () => this.close());
-    this.idleTimer = setInterval(() => this.checkIdle(), IDLE_CHECK_INTERVAL_MS);
-    this.idleTimer.unref?.();
+    this.idleTimer = setInterval(() => this.checkIdle(), IDLE_CHECK_MS);
+    this.idleTimer.unref();
   }
 
   /**
-   * Deliver one packetized RTP/RTCP buffer to this client.
+   * Deliver one RTP or RTCP packet of a track to the client.
    *
-   * Drops the packet unless the session is playing and open. The first time
-   * media is delivered after PLAY, delivery waits for a video keyframe (when the
-   * client subscribed to video) so the viewer starts at an IDR; once started,
-   * every packet for a set-up track is framed and written. Packets for tracks
-   * the client did not set up are ignored.
+   * @param trackId - Track the packet belongs to
    *
-   * @param streamId - SDP `streamid` the packet belongs to
+   * @param rtcp - Whether the packet is RTCP
    *
-   * @param isRtcp - Whether the buffer is RTCP rather than RTP
+   * @param keyframe - Whether it belongs to a video keyframe
    *
-   * @param isVideoKeyframe - Whether this RTP packet begins a video keyframe
-   *
-   * @param data - The packetized RTP/RTCP bytes to deliver
+   * @param frame - The packet, framed per channel on demand
    *
    * @internal
    */
-  feed(streamId: number, isRtcp: boolean, isVideoKeyframe: boolean, data: Buffer): void {
-    if (!this.playing || this.closed) return;
+  deliver(trackId: number, rtcp: boolean, keyframe: boolean, frame: InterleavedFrame): void {
+    if (!this.playing) return;
+    const transport = this.transports.get(trackId);
+    if (!transport) return;
 
-    // Backpressure: a viewer that stops reading (or reads too slowly) would
-    // otherwise buffer unbounded media in this socket's write queue. Live media
-    // that far behind is unrecoverable — drop the session instead.
-    if (this.socket.writableLength > MAX_SOCKET_BUFFER_BYTES) {
-      this.host.logger?.warn?.(`[rtsp] viewer ${this.id} is too slow (${this.socket.writableLength} bytes queued) — closing session`);
+    if (this.socket.writableLength > MAX_SOCKET_BUFFER) {
+      this.host.logger?.warn?.(`[rtsp] viewer ${this.id} is too slow (${this.socket.writableLength} bytes queued), closing session`);
       this.close();
       return;
     }
-
     if (!this.started) {
-      if (this.requiresKeyframe) {
-        if (!isVideoKeyframe) return;
-      }
+      if (!keyframe && this.needsKeyframe()) return;
       this.started = true;
     }
-
-    const transport = this.transports.get(streamId);
-    if (!transport) return;
-    this.sendInterleaved(isRtcp ? transport.rtcp : transport.rtp, data);
+    this.socket.write(frame.on(rtcp ? transport.rtcp : transport.rtp));
   }
 
   /**
-   * Tear down the session and release its socket.
-   *
-   * Idempotent: the first call stops playback, notifies the server, and destroys
-   * the socket; subsequent calls do nothing.
+   * Close the connection. Idempotent.
    *
    * @internal
    */
@@ -254,112 +176,86 @@ export class RtspSession {
   }
 
   /**
-   * Whether media delivery to this client must wait for a video keyframe.
+   * Parse incoming bytes and dispatch requests and talkback frames.
    *
-   * @returns `true` if the client set up at least one video track
-   *
-   * @internal
-   */
-  private get requiresKeyframe(): boolean {
-    // Only gate on a keyframe if this client actually set up a video track;
-    // audio-only subscriptions can start mid-stream without artifacts.
-    for (const [streamId] of this.transports) {
-      if (this.host.trackKinds[streamId] === 'video') return true;
-    }
-    return false;
-  }
-
-  /**
-   * Handle a chunk of raw bytes from the socket.
-   *
-   * Feeds the chunk through the parser and dispatches each complete message:
-   * control requests are routed to the handler, and interleaved frames on the
-   * backchannel channel are forwarded upstream. A parse failure closes the
-   * session.
-   *
-   * @param chunk - Raw bytes received from the client socket
+   * @param chunk - Bytes read from the socket
    *
    * @internal
    */
   private onData(chunk: Buffer): void {
-    this.lastActivity = Date.now();
+    this.lastActivity = performance.now();
     let messages;
     try {
       messages = this.parser.push(chunk);
     } catch (error) {
-      this.host.logger?.warn?.('[rtsp] parse error:', error);
+      this.host.logger?.warn?.('[rtsp] invalid request, closing session:', error);
       this.close();
       return;
     }
     for (const message of messages) {
-      if (message.type === 'request') {
-        // Chain requests so a slow handler (e.g. DESCRIBE waiting on the
-        // upstream) cannot be overtaken by a later pipelined request — RTSP
-        // clients expect responses in request order.
-        const { request } = message;
-        this.pending = this.pending.then(() => this.handle(request));
-      } else if (message.frame.channel === this.backchannelChannel) {
-        // Talkback RTP from the client → forward upstream.
-        this.host.onBackchannelRtp(message.frame.data);
+      if (message.type === 'interleaved') {
+        if (message.channel === this.backchannelChannel) this.host.backchannelRtp(message.data);
+        continue;
       }
+      const { request } = message;
+      // clients expect responses in request order, a slow DESCRIBE must not be overtaken
+      this.pending = this.pending.then(() => this.handle(request));
     }
   }
 
   /**
-   * Reap the session when a non-playing client has gone quiet.
-   *
-   * Playing sessions are exempt: once RTP flows over the interleaved
-   * connection, many clients stop sending keep-alive requests entirely, and
-   * their liveness is covered by the socket backpressure limit in `feed`.
+   * Close a session that has been idle too long without playing.
    *
    * @internal
    */
   private checkIdle(): void {
-    if (this.playing) return;
-    if (Date.now() - this.lastActivity > IDLE_TIMEOUT_MS) {
-      this.host.logger?.warn?.(`[rtsp] session ${this.id} idle for ${IDLE_TIMEOUT_MS}ms without playing — closing`);
-      this.close();
-    }
+    if (this.playing || performance.now() - this.lastActivity < IDLE_TIMEOUT_MS) return;
+    this.host.logger?.debug?.(`[rtsp] session ${this.id} idle for ${IDLE_TIMEOUT_MS / 1000}s without playing, closing`);
+    this.close();
   }
 
   /**
-   * Dispatch a parsed RTSP request to its method handler.
+   * Authenticate and answer one request.
    *
-   * Enforces authentication first (replying 401 with a challenge when it fails),
-   * then routes by method. Unknown methods return 501 and any handler error
-   * returns 500, so the connection stays usable.
+   * @param request - The request
    *
-   * @param req - The parsed RTSP request to handle
+   * @returns A promise that resolves once the response is written
    *
    * @internal
    */
-  private async handle(req: RtspRequest): Promise<void> {
-    const cseq = req.headers.cseq;
+  private async handle(request: RtspRequest): Promise<void> {
+    if (this.closed) return;
+    const cseq = request.headers.cseq;
 
-    if (this.host.auth && !this.host.auth.verify(req.method, req.uri, req.headers.authorization)) {
-      this.send(buildResponse({ status: 401, cseq, headers: { 'WWW-Authenticate': this.host.auth.challenge() } }));
+    const auth = this.host.auth?.verify(request.method, request.uri, request.headers.authorization) ?? 'ok';
+    if (auth !== 'ok') {
+      this.send(buildResponse({ status: 401, cseq, headers: { 'WWW-Authenticate': this.host.auth!.challenge(auth === 'stale') } }));
       return;
     }
 
     try {
-      switch (req.method) {
+      switch (request.method) {
         case 'OPTIONS':
           this.send(buildResponse({ status: 200, cseq, headers: { Public: SUPPORTED_METHODS } }));
           break;
         case 'DESCRIBE':
-          await this.onDescribe(req, cseq);
+          await this.onDescribe(request, cseq);
           break;
         case 'SETUP':
-          this.onSetup(req, cseq);
+          await this.onSetup(request, cseq);
           break;
         case 'PLAY':
-          this.onPlay(cseq);
+          this.onPlay(request, cseq);
           break;
         case 'PAUSE':
-          this.playing = false;
+          if (this.playing) {
+            this.playing = false;
+            this.host.sessionPaused(this);
+          }
           this.send(buildResponse({ status: 200, cseq, headers: { Session: this.id } }));
           break;
         case 'GET_PARAMETER':
+        case 'SET_PARAMETER':
           this.send(buildResponse({ status: 200, cseq, headers: { Session: this.id } }));
           break;
         case 'TEARDOWN':
@@ -376,167 +272,167 @@ export class RtspSession {
   }
 
   /**
-   * Handle a DESCRIBE request by returning the upstream SDP.
+   * Answer DESCRIBE with the SDP of the stream.
    *
-   * Activates the upstream source to obtain the SDP, then replies with it and a
-   * `Content-Base` so the client resolves relative track URIs correctly. When
-   * activation fails (the upstream cannot be opened or is torn down before its
-   * SDP resolves), the client receives 503 Service Unavailable so it can retry
-   * instead of hanging. Activation is asynchronous, so the session may have
-   * closed in the meantime; if so, nothing is sent.
+   * @param request - The request
    *
-   * @param req - The DESCRIBE request, used for its target URI
+   * @param cseq - Its CSeq
    *
-   * @param cseq - The request's CSeq to echo back, if present
+   * @returns A promise that resolves once the response is written
    *
    * @internal
    */
-  private async onDescribe(req: RtspRequest, cseq: string | undefined): Promise<void> {
-    let sdp: string;
-    try {
-      sdp = await this.host.activate();
-    } catch (error) {
-      // A session whose socket already died has nobody to answer — and a
-      // teardown rejecting the SDP its dead viewers were waiting on is
-      // expected, not worth a warning per zombie DESCRIBE.
-      if (this.closed) return;
-      this.host.logger?.warn?.('[rtsp] DESCRIBE failed — upstream unavailable:', error);
+  private async onDescribe(request: RtspRequest, cseq: string | undefined): Promise<void> {
+    if (uriPath(request.uri) !== this.host.path) {
+      this.send(buildResponse({ status: 404, cseq }));
+      return;
+    }
+    const sdp = await this.ensureDescribed();
+    if (sdp === undefined) {
       this.send(buildResponse({ status: 503, cseq }));
       return;
     }
-    if (this.closed) return;
     this.send(
       buildResponse({
         status: 200,
         cseq,
-        headers: { 'Content-Type': 'application/sdp', 'Content-Base': `${stripQuery(req.uri)}/` },
+        headers: { 'Content-Type': 'application/sdp', 'Content-Base': `${stripQuery(request.uri).replace(/\/+$/, '')}/` },
         body: sdp,
       }),
     );
   }
 
   /**
-   * Handle a SETUP request by negotiating an interleaved transport.
+   * Bind a track to interleaved channels.
    *
-   * Accepts only TCP-interleaved transport; any other transport is rejected with
-   * 461 Unsupported Transport. On success it records the RTP/RTCP channel pair
-   * for the requested track and, if that track is the backchannel, remembers its
-   * RTP channel so inbound talkback can be recognized.
+   * @param request - The request
    *
-   * @param req - The SETUP request carrying the Transport header and track URI
+   * @param cseq - Its CSeq
    *
-   * @param cseq - The request's CSeq to echo back, if present
+   * @returns A promise that resolves once the response is written
    *
    * @internal
    */
-  private onSetup(req: RtspRequest, cseq: string | undefined): void {
-    const transport = req.headers.transport ?? '';
+  private async onSetup(request: RtspRequest, cseq: string | undefined): Promise<void> {
+    const transport = request.headers.transport ?? '';
     const interleaved = /interleaved=(\d+)-(\d+)/.exec(transport);
     if (!transport.includes('TCP') || !interleaved) {
-      // Only TCP-interleaved transport is supported; reject UDP and others.
       this.send(buildResponse({ status: 461, cseq }));
       return;
     }
+    const path = uriPath(request.uri);
+    if (this.host.path !== '' && path !== this.host.path && !path.startsWith(`${this.host.path}/`)) {
+      this.send(buildResponse({ status: 404, cseq }));
+      return;
+    }
+    // a client may skip DESCRIBE when it cached the SDP, the stream still has to run
+    if ((await this.ensureDescribed()) === undefined) {
+      this.send(buildResponse({ status: 503, cseq }));
+      return;
+    }
 
-    // Fall back to insertion order when the URI omits an explicit streamid.
-    const streamId = Number(/streamid=(\d+)/.exec(req.uri)?.[1] ?? this.transports.size);
+    const trackId = Number(/streamid=(\d+)/.exec(path)?.[1] ?? this.transports.size);
+    if (this.host.trackKind(trackId) === undefined) {
+      this.send(buildResponse({ status: 404, cseq }));
+      return;
+    }
     const rtp = Number(interleaved[1]);
     const rtcp = Number(interleaved[2]);
-    this.transports.set(streamId, { rtp, rtcp });
-    if (streamId === this.host.backchannelStreamId) this.backchannelChannel = rtp;
+    this.transports.set(trackId, { rtp, rtcp });
+    if (trackId === this.host.backchannelTrack) this.backchannelChannel = rtp;
 
     this.send(
       buildResponse({
         status: 200,
         cseq,
-        headers: {
-          Transport: `RTP/AVP/TCP;unicast;interleaved=${rtp}-${rtcp}`,
-          Session: `${this.id};timeout=${ADVERTISED_TIMEOUT_S}`,
-        },
+        headers: { Transport: `RTP/AVP/TCP;unicast;interleaved=${rtp}-${rtcp}`, Session: `${this.id};timeout=${SESSION_TIMEOUT_S}` },
       }),
     );
   }
 
   /**
-   * Handle a PLAY request and start media delivery.
+   * Start delivering media.
    *
-   * Marks the session as playing, resets the keyframe gate so delivery resumes
-   * cleanly, and notifies the server to begin feeding media. The response
-   * includes an `RTP-Info` header listing each set-up track's initial sequence
-   * and timestamp.
+   * @param request - The request
    *
-   * @param cseq - The request's CSeq to echo back, if present
+   * @param cseq - Its CSeq
    *
    * @internal
    */
-  private onPlay(cseq: string | undefined): void {
-    const rtpInfo = [...this.transports.keys()]
-      .sort((a, b) => a - b)
-      .map((id) => `url=streamid=${id};seq=0;rtptime=0`)
-      .join(',');
+  private onPlay(request: RtspRequest, cseq: string | undefined): void {
+    if (this.transports.size === 0) {
+      this.send(buildResponse({ status: 455, cseq }));
+      return;
+    }
+    const base = stripQuery(request.uri).replace(/\/+$/, '');
+    const media = [...this.transports.keys()].filter((id) => id !== this.host.backchannelTrack).sort((a, b) => a - b);
+    const rtpInfo = this.host.rtpInfo(base, media);
 
-    this.playing = true;
-    this.started = false;
-    this.host.sessionPlaying(this);
-
-    this.send(
-      buildResponse({
-        status: 200,
-        cseq,
-        headers: { Session: this.id, Range: 'npt=0.000-', ...(rtpInfo ? { 'RTP-Info': rtpInfo } : {}) },
-      }),
-    );
+    this.send(buildResponse({ status: 200, cseq, headers: { Session: this.id, Range: 'npt=0.000-', ...(rtpInfo ? { 'RTP-Info': rtpInfo } : {}) } }));
+    if (!this.playing) {
+      this.playing = true;
+      this.started = false;
+      this.host.sessionPlaying(this);
+    }
   }
 
   /**
-   * Wrap a payload in an interleaved binary frame and send it.
+   * Fetch the SDP once per session, attaching the server to the relay.
    *
-   * Prepends the 4-byte `$`-channel-length header RTSP uses to multiplex binary
-   * media over the control connection, then writes the framed bytes.
-   *
-   * @param channel - Interleaved channel number to tag the frame with
-   *
-   * @param data - The RTP/RTCP payload to frame
+   * @returns The SDP, or `undefined` when the upstream is unavailable or the session closed
    *
    * @internal
    */
-  private sendInterleaved(channel: number, data: Buffer): void {
-    const frame = Buffer.allocUnsafe(4 + data.length);
-    frame[0] = 0x24; // '$' magic byte marking an interleaved binary frame
-    frame[1] = channel;
-    frame.writeUInt16BE(data.length, 2);
-    data.copy(frame, 4);
-    this.send(frame);
+  private async ensureDescribed(): Promise<string | undefined> {
+    if (this.sdp !== undefined) return this.sdp;
+    try {
+      const sdp = await this.host.describe(this);
+      if (this.closed) return undefined;
+      this.sdp = sdp;
+      return sdp;
+    } catch (error) {
+      // a viewer that already left needs no answer, and its failed describe is expected
+      if (!this.closed) this.host.logger?.warn?.('[rtsp] DESCRIBE failed, upstream unavailable:', error);
+      return undefined;
+    }
   }
 
   /**
-   * Write raw bytes to the client socket.
+   * Whether the client set up a video track and must start at a keyframe.
    *
-   * No-ops once the session is closed, and closes the session if the write
-   * fails, so a broken connection is cleaned up promptly.
-   *
-   * @param buffer - The bytes to write
+   * @returns `true` with a video track
    *
    * @internal
    */
-  private send(buffer: Buffer): void {
-    if (this.closed) return;
-    this.socket.write(buffer, (error) => {
-      if (error) this.close();
-    });
+  private needsKeyframe(): boolean {
+    for (const trackId of this.transports.keys()) {
+      if (this.host.trackKind(trackId) === 'video') return true;
+    }
+    return false;
+  }
+
+  /**
+   * Write to the socket unless the session is closed.
+   *
+   * @param data - Bytes to write
+   *
+   * @internal
+   */
+  private send(data: Buffer): void {
+    if (!this.closed) this.socket.write(data);
   }
 }
 
 /**
- * Strip the query string from a URI.
+ * Remove the query string from a URI.
  *
- * @param uri - The URI to trim
+ * @param uri - The URI
  *
- * @returns The URI up to but not including the first `?`, or the original URI when none is present
+ * @returns The URI without query
  *
  * @internal
  */
 function stripQuery(uri: string): string {
-  const q = uri.indexOf('?');
-  return q === -1 ? uri : uri.slice(0, q);
+  const query = uri.indexOf('?');
+  return query === -1 ? uri : uri.slice(0, query);
 }

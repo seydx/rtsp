@@ -1,87 +1,199 @@
-import { execFile } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { promisify } from 'node:util';
-import { ffmpegPath, isFfmpegAvailable } from 'node-av';
+import { setTimeout as delay } from 'node:timers/promises';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { buildRtp, Fixtures, hasFfmpeg, until } from '../../../__tests__/helpers/media.js';
 import { Relay } from '../../../relay.js';
 import { AvSource } from '../../../sources/av.js';
+import { isRtcp } from '../../../util/rtp.js';
+import { RtspServerSink } from '../rtsp-server-sink.js';
 
-const execFileAsync = promisify(execFile);
-const suite = isFfmpegAvailable() ? describe : describe.skip;
+import type { BackchannelInfo, MediaPacket, StreamInfo } from '../../../types.js';
+import type { RtspServerSinkOptions } from '../rtsp-server-sink.js';
 
-function buildRtp(pt: number, seq: number, ts: number, ssrc: number, payload: Buffer): Buffer {
-  const header = Buffer.alloc(12);
-  header[0] = 0x80;
-  header[1] = pt & 0x7f;
-  header.writeUInt16BE(seq, 2);
-  header.writeUInt32BE(ts >>> 0, 4);
-  header.writeUInt32BE(ssrc >>> 0, 8);
-  return Buffer.concat([header, payload]);
-}
+const suite = hasFfmpeg ? describe : describe.skip;
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const MULAW_SILENCE = Buffer.alloc(160, 0xff);
+const ALAW_SILENCE = Buffer.alloc(160, 0xd5);
 
-suite('RtspServerSink backchannel (loopback)', () => {
-  let dir: string;
-  let sample: string;
+suite('RtspServerSink talkback over RTSP', () => {
+  let fixtures: Fixtures;
+  let video: string;
 
   beforeAll(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'rtsp-bc-'));
-    sample = join(dir, 'sample.mp4');
-    await execFileAsync(ffmpegPath(), [
-      '-y',
-      '-f',
-      'lavfi',
-      '-i',
-      'testsrc=size=320x240:rate=15',
-      '-t',
-      '2',
-      '-c:v',
-      'libx264',
-      '-g',
-      '15',
-      '-pix_fmt',
-      'yuv420p',
-      sample,
-    ]);
+    fixtures = await Fixtures.create();
+    video = await fixtures.clip('video');
   }, 30_000);
 
   afterAll(async () => {
-    if (dir) await rm(dir, { recursive: true, force: true });
+    await fixtures?.dispose();
   });
 
-  it('advertises talkback, and a node-av client can read + send it', async () => {
-    const serverRelay = new Relay({ source: new AvSource(sample, { readrate: 1, loop: true }) });
-    const server = await serverRelay.serveRtsp({
-      backchannel: { codec: 'pcm_mulaw', payloadType: 0, clockRate: 8000, channels: 1 },
-    });
+  it('advertises talkback that a node-av client can send', async () => {
+    const relay = new Relay({ source: new AvSource(video, { readrate: 1, loop: true }) });
+    const server = await new RtspServerSink(relay, {
+      backchannel: { advertise: { codec: 'pcm_mulaw', payloadType: 0, clockRate: 8000, channels: 1 }, idleTimeout: 300 },
+    }).listen();
 
     const received: Buffer[] = [];
+    const events: string[] = [];
     server.on('backchannel', (rtp) => received.push(rtp));
+    server.on('backchannel:start', () => events.push('start'));
+    server.on('backchannel:stop', () => events.push('stop'));
 
     const client = new AvSource(server.url, { transport: 'tcp', backchannel: true });
     try {
       const info = await client.open();
-      // The client sees our advertised sendonly talkback stream.
-      expect(info.backchannel).toBeDefined();
-      expect(info.backchannel?.codec).toBe('pcm_mulaw');
+      expect(info.backchannel).toMatchObject({ codec: 'pcm_mulaw', payloadType: 0, clockRate: 8000, channels: 1 });
 
-      // Send a few talkback RTP packets upstream.
-      const silence = Buffer.alloc(160, 0xff);
       for (let i = 0; i < 5; i++) {
-        client.sendBackchannel(buildRtp(0, 1000 + i, 8000 * i, 0x1234abcd, silence));
-        await sleep(20);
+        client.sendBackchannel(buildRtp(0, 1000 + i, 160 * i, MULAW_SILENCE));
+        await delay(20);
       }
-      await sleep(200);
-
-      expect(received.length).toBeGreaterThan(0);
+      await until(() => received.length === 5, 3000, 'talkback packets');
+      expect(received[0].subarray(12)).toEqual(MULAW_SILENCE);
+      expect(events).toEqual(['start']);
+      await until(() => events.length === 2, 3000, 'talkback idle stop');
+      expect(events).toEqual(['start', 'stop']);
     } finally {
       await client.close();
       await server.shutdown();
-      await serverRelay.stop();
+      await relay.stop();
     }
   }, 30_000);
+});
+
+suite('RtspServerSink talkback forwarding', () => {
+  let fixtures: Fixtures;
+  let info: StreamInfo;
+  let source: AvSource;
+  let packets: MediaPacket[];
+
+  beforeAll(async () => {
+    fixtures = await Fixtures.create();
+    source = new AvSource(await fixtures.clip('video', 1));
+    info = await source.open();
+    packets = [];
+    for await (const packet of source.packets(new AbortController().signal)) packets.push(packet);
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const packet of packets ?? []) packet.free();
+    await source?.close();
+    await fixtures?.dispose();
+  });
+
+  // a camera source that records what reaches it
+  function camera(backchannel: BackchannelInfo | undefined): { sent: Buffer[]; relay: Relay } {
+    const sent: Buffer[] = [];
+    const fake = {
+      backchannel,
+      sendBackchannel: (rtp: Buffer) => sent.push(rtp),
+      open: () => Promise.resolve(info),
+      packets: source.packets.bind(source),
+      close: () => Promise.resolve(),
+    };
+    return { sent, relay: { source: fake, pipe: () => undefined, unpipe: () => Promise.resolve() } as unknown as Relay };
+  }
+
+  function sink(relay: Relay, backchannel: RtspServerSinkOptions['backchannel']): RtspServerSink {
+    const server = new RtspServerSink(relay, { sdpTimeout: 0, backchannel });
+    server.init(info);
+    return server;
+  }
+
+  const MULAW_CAMERA: BackchannelInfo = { streamIndex: 2, codec: 'pcm_mulaw', payloadType: 0, clockRate: 8000, channels: 1 };
+
+  it('passes matching talkback through unchanged', () => {
+    const { sent, relay } = camera(MULAW_CAMERA);
+    const server = sink(relay, { advertise: { codec: 'pcm_mulaw', payloadType: 0, clockRate: 8000, channels: 1 } });
+    try {
+      const rtp = buildRtp(0, 1, 0, MULAW_SILENCE);
+      server.backchannelRtp(rtp);
+      expect(sent).toEqual([rtp]);
+      expect(sent[0]).toBe(rtp);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('rewrites the payload type when only that differs', () => {
+    const { sent, relay } = camera({ ...MULAW_CAMERA, payloadType: 110 });
+    const server = sink(relay, { advertise: { codec: 'pcm_mulaw', payloadType: 0, clockRate: 8000, channels: 1 } });
+    try {
+      const rtp = buildRtp(0, 1, 0, MULAW_SILENCE);
+      rtp[1] |= 0x80;
+      server.backchannelRtp(rtp);
+      // marker bit kept, payload untouched, original left alone
+      expect(sent[0][1]).toBe(0x80 | 110);
+      expect(sent[0].subarray(2)).toEqual(rtp.subarray(2));
+      expect(rtp[1]).toBe(0x80);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('advertises the camera format by default', () => {
+    const { relay } = camera(MULAW_CAMERA);
+    const server = new RtspServerSink(relay, { sdpTimeout: 0, backchannel: true });
+    try {
+      server.init({ ...info, backchannel: MULAW_CAMERA });
+      expect(server.backchannelFormat).toEqual({ codec: 'pcm_mulaw', payloadType: 0, clockRate: 8000, channels: 1, fmtp: undefined });
+    } finally {
+      server.close();
+    }
+  });
+
+  it('advertises nothing without a format to offer', () => {
+    const warnings: unknown[] = [];
+    const { relay } = camera(undefined);
+    const server = new RtspServerSink(relay, { sdpTimeout: 0, backchannel: true, logger: { warn: (...args: unknown[]) => warnings.push(args) } });
+    try {
+      server.init(info);
+      expect(server.backchannelFormat).toBeUndefined();
+      expect(server.backchannelTrack).toBeUndefined();
+      expect(warnings).toHaveLength(1);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('transcodes talkback to the camera codec and closes the transcoder when idle', async () => {
+    const { sent, relay } = camera(MULAW_CAMERA);
+    const server = sink(relay, { advertise: { codec: 'pcm_alaw', payloadType: 8, clockRate: 8000, channels: 1 }, idleTimeout: 200 });
+    const events: string[] = [];
+    server.on('backchannel:start', () => events.push('start'));
+    server.on('backchannel:stop', () => events.push('stop'));
+    try {
+      for (let i = 0; i < 10; i++) server.backchannelRtp(buildRtp(8, i, i * 160, ALAW_SILENCE));
+      expect(sent.length).toBeGreaterThan(0);
+      expect(sent.every((rtp) => !isRtcp(rtp) && (rtp[1] & 0x7f) === 0)).toBe(true);
+      // alaw silence is the smallest positive step, mu-law codes it at the top of its range
+      expect(sent[0].subarray(12).every((byte) => byte >= 0xfe)).toBe(true);
+
+      await until(() => events.length === 2, 2000, 'talkback idle stop');
+      expect(events).toEqual(['start', 'stop']);
+
+      // a new burst starts a fresh transcoder
+      const before = sent.length;
+      server.backchannelRtp(buildRtp(8, 100, 16000, ALAW_SILENCE));
+      expect(sent.length).toBeGreaterThan(before);
+    } finally {
+      server.close();
+    }
+    expect(events).toEqual(['start', 'stop', 'start', 'stop']);
+  });
+
+  it('ignores talkback when none is advertised', () => {
+    const { sent, relay } = camera(MULAW_CAMERA);
+    const server = sink(relay, false);
+    const received: Buffer[] = [];
+    server.on('backchannel', (rtp) => received.push(rtp));
+    try {
+      server.backchannelRtp(buildRtp(0, 1, 0, MULAW_SILENCE));
+      expect(received).toHaveLength(0);
+      expect(sent).toHaveLength(0);
+    } finally {
+      server.close();
+    }
+  });
 });

@@ -1,241 +1,196 @@
-import type { AVCodecID, IRational, Packet, Stream } from 'node-av';
+import type { AVCodecID } from 'node-av/constants';
+import type { IRational, Packet, Stream } from 'node-av/lib';
 
 /**
- * Minimal logger shape used throughout the relay.
+ * Console-like logger accepted throughout the library.
  *
- * Every method is optional, so callers can pass a partial console-like object
- * (or omit it entirely) and the relay will only invoke the methods that are
- * present. This keeps integration with existing logging frameworks trivial:
- * pass `console` for everything, a subset for selective output, or nothing to
- * stay silent.
+ * Every method is optional, so `console`, a subset of it or an adapter for an
+ * existing logging framework all work. Omit it to stay silent.
  *
  * @example
  * ```typescript
  * import { Relay } from '@seydx/rtsp';
  *
- * const logger = { warn: console.warn, error: console.error };
- * const relay = new Relay({ source, logger });
+ * const relay = new Relay({ source, logger: { warn: console.warn, error: console.error } });
  * ```
  */
 export interface Logger {
   /**
-   * General-purpose informational logging.
-   *
-   * Receives an arbitrary list of arguments, mirroring `console.log`. Invoked
-   * for routine, non-error events the relay wants to surface.
+   * Informational messages, such as the URL a server listens on.
    */
   log?: (...args: unknown[]) => void;
 
   /**
-   * Warning-level logging.
-   *
-   * Receives an arbitrary list of arguments, mirroring `console.warn`. Used for
-   * recoverable conditions that may indicate a problem (e.g. a sink falling
-   * behind or a retried connection).
+   * Recoverable problems, such as a sink falling behind or a reconnect.
    */
   warn?: (...args: unknown[]) => void;
 
   /**
-   * Error-level logging.
-   *
-   * Receives an arbitrary list of arguments, mirroring `console.error`. Used for
-   * failures the relay could not recover from on its own.
+   * Failures the library could not recover from on its own.
    */
   error?: (...args: unknown[]) => void;
 
   /**
-   * Verbose diagnostic logging.
-   *
-   * Receives an arbitrary list of arguments, mirroring `console.debug`. Emits
-   * fine-grained detail intended for troubleshooting; safe to leave unset in
-   * production.
+   * Detailed diagnostics for troubleshooting.
    */
   debug?: (...args: unknown[]) => void;
 }
 
 /**
- * The high-level category of an elementary stream.
- *
- * Distinguishes video, audio, and non-media data tracks so the relay and its
- * sinks can route or filter packets without inspecting codec specifics.
+ * Category of a track.
  */
 export type TrackKind = 'video' | 'audio' | 'data';
 
 /**
- * Metadata describing a single elementary stream of the upstream source.
+ * One elementary stream of a source.
  *
- * Each track corresponds to one demuxed stream (a video, audio, or data
- * channel) and carries just enough information for the relay to route packets
- * and for sinks to reproduce the stream. Codec specifics are kept opaque so the
- * relay core stays format-agnostic; AV-backed sinks read the native handle when
- * they need to attach the stream to a muxer.
+ * Carries what the relay needs to route packets and what sinks need to
+ * reproduce the stream. AV-backed sinks attach the native stream handle to
+ * their muxers.
  *
  * @example
  * ```typescript
- * import { Source, StreamInfo } from '@seydx/rtsp';
- *
- * const info: StreamInfo = await source.open();
- * for (const track of info.tracks) {
- *   console.log(track.index, track.kind, track.codec);
- * }
+ * const info = await source.open();
+ * for (const track of info.tracks) console.log(track.index, track.kind, track.codec);
  * ```
  *
- * @see {@link StreamInfo} For the full set of tracks a source carries
- *
- * @see {@link MediaPacket} For the units of media that flow per track
+ * @see {@link StreamInfo} For all tracks of a source
  */
 export interface TrackInfo {
   /**
-   * Stream index as reported by the source.
-   *
-   * Matches {@link MediaPacket.streamIndex} for every packet belonging to this
-   * track, allowing sinks to correlate packets with their describing track.
+   * Track index, equal to {@link MediaPacket.streamIndex} of its packets.
    */
   index: number;
 
   /**
-   * High-level category of this track.
-   *
-   * One of `video`, `audio`, or `data`, letting consumers branch on stream type
-   * without parsing the codec name.
+   * Whether the track carries video, audio or other data.
    */
   kind: TrackKind;
 
   /**
-   * Lower-case codec name of the track.
-   *
-   * Examples include `h264`, `hevc`, `aac`, `opus`, and `pcm_alaw`. Reported in
-   * the canonical FFmpeg short-name form.
+   * Lower-case FFmpeg codec name, for example `h264`, `hevc`, `aac` or `pcm_alaw`.
    */
   codec: string;
 
   /**
-   * Source-native stream handle.
+   * The node-av stream behind the track.
    *
-   * For AV-backed sources this is the underlying node-av `Stream`, which
-   * AV-backed sinks pass to `addStream()` when configuring a muxer. The relay
-   * core never inspects it; it is absent for sources that are not AV-backed.
+   * Present for AV-backed sources. Sinks pass it to node-av muxers, decoders
+   * and bitstream filters. It stays valid until the source closes, also across
+   * reconnects and loops. The relay itself never touches it.
    */
   native?: Stream;
 
   /**
-   * Stream time base as a node-av `IRational` (`{ num, den }`).
+   * Unit of the packet timestamps in seconds (`num / den`).
    *
-   * Present for AV-backed sources and describes the unit of the packet
-   * timestamps in seconds (`num / den`). Used by sinks that need to rescale or
-   * interpret PTS/DTS values.
+   * Present for AV-backed sources.
    */
   timeBase?: IRational;
 }
 
 /**
- * Describes the upstream's talkback (ONVIF backchannel) audio format.
+ * Codec and RTP parameters of a talkback audio stream.
  *
- * Present only when the upstream accepts audio sent back to it (for example an
- * RTSP camera that exposes an ONVIF backchannel). The codec and clock fields
- * describe exactly what the upstream expects to receive, so a sink can encode or
- * repackage viewer audio into a compatible stream before forwarding it.
+ * Describes what one end of a backchannel sends or expects, for example the
+ * format an RTSP server advertises to its viewers.
  *
  * @example
  * ```typescript
- * import { Source, supportsBackchannel } from '@seydx/rtsp';
+ * import type { BackchannelFormat } from '@seydx/rtsp';
  *
- * if (supportsBackchannel(source) && source.backchannel) {
- *   const { codec, clockRate, channels } = source.backchannel;
- *   console.log(`talkback expects ${codec} @ ${clockRate}Hz x${channels}`);
- * }
+ * const pcma: BackchannelFormat = { codec: 'pcm_alaw', payloadType: 8, clockRate: 8000, channels: 1 };
  * ```
- *
- * @see {@link BackchannelSource} For the source capability that exposes this
  */
-export interface BackchannelInfo {
+export interface BackchannelFormat {
   /**
-   * Upstream stream index used to send packets back.
-   *
-   * Identifies the backchannel stream on the upstream connection (e.g. the RTSP
-   * track to which outbound RTP packets are written).
-   */
-  streamIndex: number;
-
-  /**
-   * Lower-case codec name expected by the upstream.
-   *
-   * Examples include `pcm_mulaw`, `pcm_alaw`, and `aac`. Reported in the
-   * canonical FFmpeg short-name form.
+   * Lower-case FFmpeg codec name, for example `pcm_mulaw`, `pcm_alaw`, `opus` or `aac`.
    */
   codec: string;
 
   /**
-   * node-av `AVCodecID` for the backchannel codec.
-   *
-   * Provided so a transcoder can construct a matching encoder when the viewer
-   * audio must be converted into the upstream's expected format. Absent when the
-   * id is not available.
-   */
-  codecId?: AVCodecID;
-
-  /**
-   * RTP payload type advertised for the backchannel.
-   *
-   * The dynamic or static payload type number that must be stamped on outbound
-   * RTP packets so the upstream associates them with the backchannel stream.
+   * RTP payload type carried by the packets.
    */
   payloadType: number;
 
   /**
-   * RTP clock rate of the backchannel, in Hz.
-   *
-   * Used to compute RTP timestamps for outbound packets at the rate the upstream
-   * expects (e.g. `8000` for G.711, `48000` for Opus).
+   * RTP clock rate in Hz, for example `8000` for G.711 or `48000` for Opus.
    */
   clockRate: number;
 
   /**
-   * Number of audio channels in the backchannel.
-   *
-   * Typically `1` for the mono talkback streams cameras expect.
+   * Channel count, usually `1` for talkback.
    */
   channels: number;
+
+  /**
+   * SDP `a=fmtp` parameters without the payload type.
+   *
+   * Required for AAC (`mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=...`),
+   * whose `config` carries the decoder configuration.
+   */
+  fmtp?: string;
 }
 
 /**
- * A source that can accept talkback audio back upstream.
+ * Talkback format of an upstream camera (ONVIF backchannel).
  *
- * Implemented by sources whose upstream supports a backchannel, such as an RTSP
- * camera with an ONVIF backchannel. When a viewer sends audio, the relay
- * forwards it through this capability so it reaches the upstream device. Use
- * {@link supportsBackchannel} to detect whether a given source implements it.
+ * Present when the upstream accepts audio, for example an RTSP camera with a
+ * send-only stream. Audio sent upstream must match this format.
+ *
+ * @example
+ * ```typescript
+ * if (supportsBackchannel(source) && source.backchannel) {
+ *   const { codec, clockRate } = source.backchannel;
+ *   console.log(`camera expects ${codec} at ${clockRate} Hz`);
+ * }
+ * ```
+ *
+ * @see {@link BackchannelSource} For the source capability
+ */
+export interface BackchannelInfo extends BackchannelFormat {
+  /**
+   * Upstream stream index the talkback packets are sent on.
+   */
+  streamIndex: number;
+
+  /**
+   * node-av codec id of the talkback codec, if known.
+   */
+  codecId?: AVCodecID;
+}
+
+/**
+ * A source that can send talkback audio upstream.
+ *
+ * Implemented by sources whose upstream has a backchannel, such as an RTSP
+ * camera with an ONVIF backchannel. {@link RtspServerSink} forwards viewer
+ * audio through it. Use {@link supportsBackchannel} to detect it.
  *
  * @example
  * ```typescript
  * import { supportsBackchannel } from '@seydx/rtsp';
  *
- * if (supportsBackchannel(source)) {
- *   source.sendBackchannel(rtpPacket);
- * }
+ * if (supportsBackchannel(source)) source.sendBackchannel(rtpPacket);
  * ```
  *
- * @see {@link supportsBackchannel} For the runtime type guard
+ * @see {@link supportsBackchannel} For the type guard
  *
- * @see {@link BackchannelInfo} For the talkback format description
+ * @see {@link BackchannelInfo} For the talkback format
  */
 export interface BackchannelSource {
   /**
-   * The negotiated backchannel format, once known.
-   *
-   * Present only after the upstream is open and has advertised a backchannel;
-   * remains `undefined` while closed or when the upstream offers no talkback.
+   * Talkback format of the upstream, once it is open and advertises one.
    */
   readonly backchannel?: BackchannelInfo;
 
   /**
-   * Send one RTP packet upstream over the backchannel.
+   * Send one RTP packet upstream.
    *
-   * The packet must already be encoded in the backchannel codec and packetized
-   * as RTP matching {@link BackchannelInfo}; the source forwards it verbatim to
-   * the upstream.
+   * The packet must already match {@link BackchannelSource.backchannel}; it is
+   * forwarded unchanged.
    *
-   * @param rtp - A single RTP packet, already in the backchannel codec
+   * @param rtp - One RTP packet in the talkback codec
    *
    * @example
    * ```typescript
@@ -246,161 +201,113 @@ export interface BackchannelSource {
 }
 
 /**
- * Determine whether a source accepts talkback audio.
- *
- * Narrows a {@link Source} to also be a {@link BackchannelSource} when it
- * implements `sendBackchannel`, enabling type-safe access to the backchannel
- * API without an unchecked cast.
+ * Whether a source can send talkback audio upstream.
  *
  * @param source - The source to test
  *
- * @returns `true` if the source implements the backchannel capability, narrowing
- * its type accordingly
+ * @returns `true` if the source implements {@link BackchannelSource}
  *
  * @example
  * ```typescript
  * import { supportsBackchannel } from '@seydx/rtsp';
  *
- * if (supportsBackchannel(source)) {
- *   // source is now typed as Source & BackchannelSource
- *   source.sendBackchannel(rtpPacket);
- * }
+ * if (supportsBackchannel(source)) source.sendBackchannel(rtpPacket);
  * ```
  *
- * @see {@link BackchannelSource} For the capability being detected
+ * @see {@link BackchannelSource} For the capability
  */
 export function supportsBackchannel(source: Source): source is Source & BackchannelSource {
   return typeof (source as Partial<BackchannelSource>).sendBackchannel === 'function';
 }
 
 /**
- * A resolved description of everything a source carries.
+ * Everything a source carries, resolved by {@link Source.open}.
  *
- * Returned by {@link Source.open} and handed to each sink's `init`, it
- * enumerates the source's tracks and, when available, the upstream's talkback
- * format. Sinks use this to configure themselves before any packet is written.
+ * Every sink receives it in `init()` before its first packet.
  *
  * @example
  * ```typescript
- * import { Source } from '@seydx/rtsp';
- *
  * const info = await source.open();
- * console.log(`${info.tracks.length} tracks, backchannel: ${!!info.backchannel}`);
+ * console.log(`${info.tracks.length} tracks, talkback: ${info.backchannel !== undefined}`);
  * ```
  *
- * @see {@link TrackInfo} For per-track metadata
- *
- * @see {@link BackchannelInfo} For the talkback format
+ * @see {@link TrackInfo} For one track
  */
 export interface StreamInfo {
   /**
-   * The elementary streams carried by the source.
-   *
-   * One {@link TrackInfo} per demuxed stream, in source order. Sinks iterate
-   * this list to set up muxers, encoders, or output channels.
+   * The tracks of the source in index order.
    */
   tracks: TrackInfo[];
 
   /**
-   * The upstream's talkback format, when supported.
-   *
-   * Present only if the source exposes a backchannel; describes the audio format
-   * the upstream expects to receive. Absent for one-way sources.
+   * Talkback format of the upstream, if it accepts audio.
    */
   backchannel?: BackchannelInfo;
 }
 
 /**
- * One unit of media flowing through the relay.
+ * One packet flowing through the relay.
  *
- * Represents a single demuxed packet for one track. The relay core only ever
- * reads {@link MediaPacket.streamIndex} and {@link MediaPacket.isKeyframe} to
- * route and gate packets; sinks that need the encoded payload reach for the
- * underlying AV packet. Each packet is owned by exactly one holder: `clone`
- * produces an independently-owned copy so a single demuxed packet can be fanned
- * out to many sinks, and `free` releases any native resources it holds.
+ * The relay reads {@link MediaPacket.streamIndex} and
+ * {@link MediaPacket.isKeyframe} to route and gate packets; sinks that need
+ * the payload use the node-av packet in {@link MediaPacket.av}. A packet has
+ * exactly one owner. `clone()` creates another owned reference to the same
+ * payload, `free()` releases the owner's reference.
  *
  * @example
  * ```typescript
- * import { MediaPacket } from '@seydx/rtsp';
- *
- * function fanOut(packet: MediaPacket, sinks: { write(p: MediaPacket): void }[]) {
- *   for (const sink of sinks) {
- *     sink.write(packet.clone());
- *   }
- *   packet.free();
- * }
+ * const copy = packet.clone();
+ * consume(copy);
+ * copy.free();
  * ```
  *
- * @see {@link TrackInfo} For the track a packet belongs to
- *
- * @see {@link Sink} For the consumer that receives packets
+ * @see {@link Sink} For the consumer contract
  */
 export interface MediaPacket {
   /**
-   * Index of the track this packet belongs to.
-   *
-   * Matches the {@link TrackInfo.index} of the describing track, letting the
-   * relay and sinks route the packet to the correct stream.
+   * Index of the track the packet belongs to.
    */
   readonly streamIndex: number;
 
   /**
-   * Whether this packet is a keyframe.
+   * Whether the packet starts a decodable picture.
    *
-   * Used by the relay to gate sinks until a decodable starting point arrives, so
-   * downstream consumers begin on a clean frame rather than mid-GOP.
+   * New sinks start at a video keyframe, so they never begin mid-GOP.
    */
   readonly isKeyframe: boolean;
 
   /**
-   * Presentation timestamp, in the track's time base.
-   *
-   * The time at which the decoded frame should be presented. May be absent when
-   * the source does not provide it.
+   * Presentation timestamp in the track time base, if known.
    */
   readonly pts?: number;
 
   /**
-   * Decode timestamp, in the track's time base.
-   *
-   * The time at which the packet should be decoded, which can differ from
-   * {@link MediaPacket.pts} for streams with B-frames. May be absent when the
-   * source does not provide it.
+   * Decode timestamp in the track time base, if known.
    */
   readonly dts?: number;
 
   /**
-   * Underlying node-av `Packet`.
-   *
-   * Present for AV-backed sources and carries the encoded payload AV-backed
-   * sinks need to write to a muxer. Never inspected by the relay core; absent
-   * for plain (non-AV) packets.
+   * The node-av packet with the payload, present for AV-backed sources.
    */
   readonly av?: Packet;
 
   /**
-   * Return an independently-owned copy of this packet for fan-out.
+   * Create another owned reference to this packet.
    *
-   * The copy can be handed to another holder without affecting this one; for
-   * native packets the copy is cheap and reference-counted. Each clone must be
-   * freed independently.
+   * Native payloads are shared by reference count, so a clone is cheap. Every
+   * clone must be freed on its own.
    *
-   * @returns A new, independently-owned packet referring to the same media
+   * @returns The new packet
    *
    * @example
    * ```typescript
    * const copy = packet.clone();
-   * sink.write(copy);
    * ```
    */
   clone(): MediaPacket;
 
   /**
-   * Release the packet's underlying native resources.
-   *
-   * Must be called once the holder is done with the packet. A no-op for plain
-   * packets that hold no native resources.
+   * Release this reference.
    *
    * @example
    * ```typescript
@@ -411,40 +318,33 @@ export interface MediaPacket {
 }
 
 /**
- * A single-connection upstream that produces media.
+ * An upstream that produces media over one connection.
  *
- * Models the lifecycle of one upstream connection: `open` establishes it and
- * resolves the stream layout, `packets` yields demuxed packets until the caller
- * aborts or the stream ends, and `close` tears the connection down. The relay
- * drives exactly one source at a time and fans its packets out to the
- * configured sinks.
+ * `open()` connects and resolves the stream layout, `packets()` yields packets
+ * until the signal aborts or the stream ends, and `close()` disconnects. A
+ * {@link Relay} drives exactly one source and calls `close()` after every
+ * running cycle, including after an aborted or failed `open()`.
  *
  * @example
  * ```typescript
- * import { Source } from '@seydx/rtsp';
- *
  * const info = await source.open();
  * const controller = new AbortController();
  * for await (const packet of source.packets(controller.signal)) {
- *   // route packet.streamIndex to the matching sink
+ *   handle(packet);
+ *   packet.free();
  * }
  * await source.close();
  * ```
  *
- * @see {@link Sink} For the consuming side of the relay
+ * @see {@link Sink} For the consuming side
  *
- * @see {@link StreamInfo} For what `open` resolves
+ * @see {@link Relay} For fanning a source out
  */
 export interface Source {
   /**
-   * Establish the connection and resolve the stream layout.
+   * Connect and resolve the stream layout.
    *
-   * Connects to the upstream and probes its tracks, returning the resolved
-   * description once the layout is known. Must complete before `packets` is
-   * consumed.
-   *
-   * @returns The resolved stream information describing the source's tracks and
-   * optional backchannel
+   * @returns The tracks and the optional talkback format
    *
    * @example
    * ```typescript
@@ -454,31 +354,28 @@ export interface Source {
   open(): Promise<StreamInfo>;
 
   /**
-   * Yield demuxed packets until aborted or the stream ends.
+   * Yield packets until the signal aborts or the stream ends.
    *
-   * Produces an async iterable of {@link MediaPacket} values. Iteration stops
-   * when the provided signal aborts or the upstream stream ends.
+   * The caller owns every yielded packet. Throwing ends the stream with an
+   * error.
    *
-   * @param signal - Abort signal that stops iteration when triggered
+   * @param signal - Stops the iteration when it aborts
    *
-   * @returns An async iterable of demuxed media packets
+   * @returns The packets of the open connection
    *
    * @example
    * ```typescript
-   * for await (const packet of source.packets(controller.signal)) {
-   *   handle(packet);
-   * }
+   * for await (const packet of source.packets(controller.signal)) handle(packet);
    * ```
    */
   packets(signal: AbortSignal): AsyncIterable<MediaPacket>;
 
   /**
-   * Release the upstream connection and associated resources.
+   * Disconnect and release all resources.
    *
-   * Closes the connection opened by `open`. Safe to call after iteration has
-   * finished or been aborted.
+   * Must also abort a pending `open()` and be safe to call more than once.
    *
-   * @returns A promise that resolves once the connection is fully closed
+   * @returns A promise that resolves once the connection is closed
    *
    * @example
    * ```typescript
@@ -491,15 +388,14 @@ export interface Source {
 /**
  * A consumer of the relayed stream.
  *
- * The relay calls `init` once with the resolved stream info, then `write` for
- * each packet destined for this sink (already keyframe-gated), and finally
- * `close` on teardown. The relay frees each packet after the `write` promise
- * resolves, so a sink must not retain a packet beyond that point; if it needs to
- * hold one, it must clone it first.
+ * The relay calls `init()` once with the stream layout, then `write()` for
+ * every packet from the first video keyframe on, one at a time, and finally
+ * `close()`. The relay frees each packet once `write()` resolved, so a sink
+ * that keeps a packet longer must clone it.
  *
  * @example
  * ```typescript
- * import { Sink, StreamInfo, MediaPacket } from '@seydx/rtsp';
+ * import type { MediaPacket, Sink, StreamInfo } from '@seydx/rtsp';
  *
  * const sink: Sink = {
  *   init(info: StreamInfo) { setup(info); },
@@ -508,20 +404,19 @@ export interface Source {
  * };
  * ```
  *
- * @see {@link Source} For the producing side of the relay
+ * @see {@link Source} For the producing side
  *
- * @see {@link MediaPacket} For the units a sink receives
+ * @see {@link Relay.pipe} For attaching a sink
  */
 export interface Sink {
   /**
-   * Initialize the sink with the resolved stream layout.
+   * Prepare for the given stream layout.
    *
-   * Called once before any packet is written, giving the sink the chance to
-   * configure muxers, encoders, or output channels from the source's tracks.
+   * Throwing detaches the sink; the relay and the other sinks keep running.
    *
-   * @param info - The resolved stream information for the source being relayed
+   * @param info - The stream layout
    *
-   * @returns Nothing, or a promise that resolves once initialization completes
+   * @returns Nothing, or a promise that resolves once the sink is ready
    *
    * @example
    * ```typescript
@@ -531,16 +426,13 @@ export interface Sink {
   init(info: StreamInfo): Promise<void> | void;
 
   /**
-   * Write a single packet to the sink.
+   * Consume one packet.
    *
-   * Called per packet destined for this sink, already keyframe-gated by the
-   * relay. The packet is owned by the relay and freed once the returned promise
-   * resolves, so the sink must clone it to retain it beyond this call.
+   * Throwing detaches the sink.
    *
-   * @param packet - The media packet to consume
+   * @param packet - The packet, owned by the relay until the call resolves
    *
-   * @returns Nothing, or a promise that resolves once the packet has been
-   * consumed
+   * @returns Nothing, or a promise that resolves once the packet is consumed
    *
    * @example
    * ```typescript
@@ -550,12 +442,9 @@ export interface Sink {
   write(packet: MediaPacket): Promise<void> | void;
 
   /**
-   * Tear the sink down.
+   * Release everything acquired in `init()`.
    *
-   * Called when the relay stops, allowing the sink to flush and release any
-   * resources it acquired during `init`.
-   *
-   * @returns Nothing, or a promise that resolves once teardown completes
+   * @returns Nothing, or a promise that resolves once the sink is closed
    *
    * @example
    * ```typescript

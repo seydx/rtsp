@@ -7,7 +7,7 @@ import type { MediaPacket, Sink } from '../types.js';
 
 const NO_VIDEO = new Set<number>();
 
-/** A sink whose write() resolves only when the test releases it. */
+// write() resolves only when the test releases it
 function gatedSink(): { sink: Sink; written: MediaPacket[]; release: () => void; closed: () => boolean } {
   let closed = false;
   const written: MediaPacket[] = [];
@@ -43,7 +43,6 @@ describe('SinkChannel', () => {
     for (let i = 0; i < 3; i++) channel.offer(tracker.make({ streamIndex: 0, isKeyframe: false }));
 
     const closing = channel.drainAndClose();
-    // Release the writes one by one; the channel must deliver all of them.
     for (let i = 0; i < 3; i++) {
       await flush();
       gated.release();
@@ -68,7 +67,6 @@ describe('SinkChannel', () => {
     let closed = false;
     const closing = channel.close().then(() => (closed = true));
     await flush();
-    // The write is still pending — close() must not have completed yet.
     expect(closed).toBe(false);
     expect(gated.closed()).toBe(false);
 
@@ -99,8 +97,8 @@ describe('SinkChannel', () => {
     await flush();
 
     expect(errors).toHaveLength(1);
-    expect(channel.ready).toBe(false);
-    expect(tracker.live).toBe(0);
+    expect(channel.accepts(tracker.make({ streamIndex: 0, isKeyframe: true }))).toBe(false);
+    expect(tracker.live).toBe(1);
   });
 
   it('skips forward to the newest buffered keyframe on overflow instead of flushing', async () => {
@@ -110,30 +108,27 @@ describe('SinkChannel', () => {
     const channel = new SinkChannel(gated.sink, { videoIndexes, maxQueue: 4 });
     await channel.init({ tracks: [] });
 
-    // First keyframe goes straight into an in-flight (gated) write.
     channel.offer(tracker.make({ streamIndex: 0, isKeyframe: true }));
     await flush();
     expect(gated.written.length).toBe(1);
 
-    // Fill the queue behind the stalled write: two deltas, a fresh keyframe, one more delta.
     channel.offer(tracker.make({ streamIndex: 0, isKeyframe: false })); // d1
     channel.offer(tracker.make({ streamIndex: 0, isKeyframe: false })); // d2
     channel.offer(tracker.make({ streamIndex: 0, isKeyframe: true })); // KF1
-    channel.offer(tracker.make({ streamIndex: 0, isKeyframe: false })); // d3 — queue now at maxQueue
+    channel.offer(tracker.make({ streamIndex: 0, isKeyframe: false })); // d3, queue full
 
-    // This overflows: rather than dropping everything and re-gating, the channel
-    // skips forward to KF1 (freeing d1/d2) and keeps delivering — the gate stays open.
+    // the overflow skips to KF1 and frees d1 and d2, the gate stays open
     channel.offer(tracker.make({ streamIndex: 0, isKeyframe: false })); // d4
-    expect(channel.active).toBe(true);
+    const probe = tracker.make({ streamIndex: 0, isKeyframe: false });
+    expect(channel.accepts(probe)).toBe(true);
+    probe.free();
 
-    // Release the in-flight write and the kept tail (KF1, d3, d4).
     for (let i = 0; i < 5; i++) {
       gated.release();
       await flush();
     }
 
-    // The original keyframe plus the kept tail were written; the two stale
-    // deltas ahead of KF1 were dropped, not the whole backlog.
+    // the first keyframe plus KF1, d3 and d4
     expect(gated.written.length).toBe(4);
     await channel.close();
     expect(tracker.live).toBe(0);
@@ -148,14 +143,15 @@ describe('SinkChannel', () => {
 
     channel.offer(tracker.make({ streamIndex: 0, isKeyframe: true }));
     await flush();
-    // One write in flight; two more fill the queue, the next overflows it.
     channel.offer(tracker.make({ streamIndex: 0, isKeyframe: false }));
     channel.offer(tracker.make({ streamIndex: 0, isKeyframe: false }));
     channel.offer(tracker.make({ streamIndex: 0, isKeyframe: false }));
     await flush();
 
-    // Overflow re-gates: a delta frame is dropped, a keyframe reopens the gate.
-    channel.offer(tracker.make({ streamIndex: 0, isKeyframe: false }));
+    // the gate is closed again: a delta is dropped, a keyframe reopens it
+    const delta = tracker.make({ streamIndex: 0, isKeyframe: false });
+    expect(channel.accepts(delta)).toBe(false);
+    channel.offer(delta);
     channel.offer(tracker.make({ streamIndex: 0, isKeyframe: true }));
 
     gated.release();
@@ -163,7 +159,46 @@ describe('SinkChannel', () => {
     gated.release();
     await flush();
 
+    expect(gated.written.at(-1)?.isKeyframe).toBe(true);
     await channel.close();
     expect(tracker.live).toBe(0);
+  });
+
+  it('accepts nothing before init and closes itself when init fails', async () => {
+    const tracker = new PacketTracker();
+    const errors: unknown[] = [];
+    let closed = 0;
+    const sink: Sink = {
+      init: () => {
+        throw new Error('init failed');
+      },
+      write: () => undefined,
+      close: () => {
+        closed++;
+      },
+    };
+    const channel = new SinkChannel(sink, { videoIndexes: NO_VIDEO, maxQueue: 4, onError: (_channel, error) => errors.push(error) });
+    const packet = tracker.make({ streamIndex: 0, isKeyframe: true });
+    expect(channel.accepts(packet)).toBe(false);
+
+    await expect(channel.init({ tracks: [] })).resolves.toBeUndefined();
+    await channel.init({ tracks: [] });
+    expect(errors).toHaveLength(1);
+    expect(closed).toBe(1);
+    channel.offer(packet);
+    expect(tracker.live).toBe(0);
+  });
+
+  it('gates video sinks on a keyframe of a video track', async () => {
+    const tracker = new PacketTracker();
+    const channel = new SinkChannel(gatedSink().sink, { videoIndexes: new Set([0]), maxQueue: 4 });
+    await channel.init({ tracks: [] });
+    const audio = tracker.make({ streamIndex: 1, isKeyframe: true });
+    const delta = tracker.make({ streamIndex: 0, isKeyframe: false });
+    const keyframe = tracker.make({ streamIndex: 0, isKeyframe: true });
+    expect(channel.accepts(audio)).toBe(false);
+    expect(channel.accepts(delta)).toBe(false);
+    expect(channel.accepts(keyframe)).toBe(true);
+    for (const packet of [audio, delta, keyframe]) packet.free();
   });
 });

@@ -1,17 +1,43 @@
-import { AV_NOPTS_VALUE } from 'node-av';
+import { AV_NOPTS_VALUE } from 'node-av/constants';
 
+import type { Packet } from 'node-av/lib';
 import type { MediaPacket } from './types.js';
-import type { Packet } from 'node-av';
 
 /**
- * Convert a native packet timestamp to the {@link MediaPacket} number form.
+ * {@link MediaPacket} backed by a node-av packet.
  *
- * node-av reports timestamps as `bigint` with `AV_NOPTS_VALUE` marking "unset";
- * the relay contract exposes them as optional numbers instead.
+ * The routing fields are read from the native packet once and carried over to
+ * clones, so fanning a packet out costs one `av_packet_clone` per copy and no
+ * further native getter calls.
+ *
+ * @internal
+ */
+class AvMediaPacket implements MediaPacket {
+  constructor(
+    readonly av: Packet,
+    readonly streamIndex: number,
+    readonly isKeyframe: boolean,
+    readonly pts: number | undefined,
+    readonly dts: number | undefined,
+  ) {}
+
+  clone(): MediaPacket {
+    const copy = this.av.clone();
+    if (!copy) throw new Error('av_packet_clone failed');
+    return new AvMediaPacket(copy, this.streamIndex, this.isKeyframe, this.pts, this.dts);
+  }
+
+  free(): void {
+    this.av.free();
+  }
+}
+
+/**
+ * Convert a native timestamp to the optional number form of {@link MediaPacket}.
  *
  * @param value - The native `bigint` timestamp
  *
- * @returns The timestamp as a number, or `undefined` when unset
+ * @returns The timestamp as a number, or `undefined` for `AV_NOPTS_VALUE`
  *
  * @internal
  */
@@ -22,85 +48,59 @@ function toTimestamp(value: bigint): number | undefined {
 /**
  * Wrap a node-av packet as a relay media packet.
  *
- * Adapts a native node-av packet to the {@link MediaPacket} interface that the relay
- * fan-out machinery consumes, while keeping a direct reference to the native handle so
- * AV-backed sinks can recover it. Cloning is ref-counted and shares the payload buffer,
- * which keeps fanning a single demuxed packet out to many consumers cheap, and freeing
- * releases only the specific handle it is called on.
- *
- * The relay typically clones once per consumer and frees the original, leaving each
- * consumer responsible for freeing its own clone after it has been written.
+ * The wrapper keeps the native handle, so AV-backed sinks can still reach it
+ * through {@link MediaPacket.av}. Cloning shares the payload buffer by reference
+ * count. Freeing releases only the handle it is called on. Ownership of `packet`
+ * moves to the returned wrapper.
  *
  * @param packet - The native node-av packet to wrap
  *
- * @param streamIndex - Stream index to expose on the wrapper; defaults to the packet's
- * own index. Override it when several demuxers are merged into one source and a
- * per-demuxer index must be remapped onto a global stream index.
+ * @param streamIndex - Stream index exposed on the wrapper. Defaults to the
+ * packet's own index; override it when several inputs are merged into one
+ * global track space.
  *
- * @returns A {@link MediaPacket} backed by the given native packet
- *
- * @throws {Error} If a later `clone()` call fails because `av_packet_clone` returns null
+ * @returns A {@link MediaPacket} that owns the native packet
  *
  * @example
  * ```typescript
  * import { wrapAvPacket } from '@seydx/rtsp';
  *
  * const media = wrapAvPacket(nativePacket);
- * const copy = media.clone(); // cheap, ref-counted fan-out
+ * const copy = media.clone();
  * media.free();
  * ```
  *
- * @see {@link MediaPacket} For the relay packet contract
+ * @see {@link MediaPacket} For the packet contract
  *
- * @see {@link requireAvPacket} To recover the native handle from a media packet
+ * @see {@link requireAvPacket} To get the native handle back
  */
 export function wrapAvPacket(packet: Packet, streamIndex = packet.streamIndex): MediaPacket {
-  return {
-    streamIndex,
-    isKeyframe: packet.isKeyframe,
-    pts: toTimestamp(packet.pts),
-    dts: toTimestamp(packet.dts),
-    av: packet,
-    clone: () => {
-      const copy = packet.clone();
-      // av_packet_clone returns null on allocation failure; surface it rather than
-      // handing back a half-formed wrapper around a missing handle.
-      if (!copy) throw new Error('av_packet_clone failed');
-      return wrapAvPacket(copy, streamIndex);
-    },
-    free: () => packet.free(),
-  };
+  return new AvMediaPacket(packet, streamIndex, packet.isKeyframe, toTimestamp(packet.pts), toTimestamp(packet.dts));
 }
 
 /**
- * Narrow a media packet to its underlying node-av packet.
+ * Get the node-av packet behind a media packet.
  *
- * Recovers the native node-av handle carried by an AV-backed {@link MediaPacket}. Sinks
- * that operate on native packets (muxers, encoders, AV-aware writers) use this to assert
- * that the packet originated from an AV source rather than a plain JavaScript packet, and
- * to obtain the handle in a single, strongly typed step.
+ * Sinks that work on native packets (muxers, encoders) use this to assert that a
+ * packet came from an AV-backed source.
  *
- * @param packet - The media packet to narrow
+ * @param packet - The media packet to unwrap
  *
- * @returns The underlying native node-av packet
+ * @returns The underlying node-av packet
  *
- * @throws {Error} If the packet carries no native handle (i.e. it came from a non-AV source)
+ * @throws {Error} If the packet carries no native handle
  *
  * @example
  * ```typescript
  * import { requireAvPacket } from '@seydx/rtsp';
  *
  * const native = requireAvPacket(media);
- * await muxer.writePacket(native);
+ * await muxer.writePacket(native, 0);
  * ```
  *
- * @see {@link wrapAvPacket} To produce an AV-backed media packet
- *
- * @see {@link MediaPacket} For the relay packet contract
+ * @see {@link wrapAvPacket} To create an AV-backed media packet
  */
 export function requireAvPacket(packet: MediaPacket): Packet {
-  if (!packet.av) {
-    throw new Error('Sink requires an AV-backed source (packet has no node-av handle)');
-  }
+  if (!packet.av) throw new Error('Sink requires an AV-backed source (packet has no node-av handle)');
   return packet.av;
 }

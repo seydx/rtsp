@@ -1,150 +1,117 @@
-import { Muxer } from 'node-av';
+import { Muxer } from 'node-av/api';
 
-import type { Logger, MediaPacket, Sink, StreamInfo } from '../types.js';
-import type { IOOutputCallbacks } from 'node-av';
+import type { IOOutputCallbacks } from 'node-av/api';
 import type { Writable } from 'node:stream';
+import type { Logger, MediaPacket, Sink, StreamInfo } from '../types.js';
 
 /**
- * Output destination for an {@link FfmpegSink}.
- *
- * Resolves to whatever the underlying node-av muxer can write to: a filesystem
- * path or URL (string), a Node.js writable stream, or a set of low-level IO
- * callbacks for fully custom sinks.
+ * Destination of an {@link FfmpegSink}: a file path or URL, a writable stream or custom write callbacks.
  */
 export type FfmpegOutput = string | Writable | IOOutputCallbacks;
 
 /**
- * Options for creating an {@link FfmpegSink}.
- *
- * Configures where the remuxed stream is written and how the container is
- * formatted. Only `output` is required; the container format is inferred from a
- * path or URL when not given explicitly.
+ * Options for an {@link FfmpegSink}.
  */
 export interface FfmpegSinkOptions {
   /**
-   * The destination the remuxed stream is written to.
-   *
-   * Accepts a file path or URL (e.g. `out.mp4`, `rtmp://...`), a Node.js
-   * writable stream, or a set of node-av IO callbacks for custom transports.
+   * Where the muxed output goes.
    */
   output: FfmpegOutput;
 
   /**
-   * The container/muxer format to produce.
+   * Output container, for example `mp4`, `matroska` or `mpegts`.
    *
-   * Forwarded to node-av to select the output muxer (e.g. `mp4`, `flv`,
-   * `mpegts`). When omitted, the format is inferred from the file extension or
-   * URL scheme of `output`.
+   * Required for streams and callbacks; for paths libav can infer it from the extension.
    */
   format?: string;
 
   /**
-   * Extra format-specific muxer options.
-   *
-   * Key-value pairs passed straight through to the underlying libav muxer
-   * (e.g. `{ movflags: 'frag_keyframe+empty_moov' }`). Values may be strings or
-   * numbers; their meaning depends on the selected `format`.
+   * Extra libav muxer options, for example `{ movflags: 'frag_keyframe+empty_moov' }`.
    */
   options?: Record<string, string | number>;
 
   /**
-   * Optional logger for diagnostics.
-   *
-   * Receives errors raised while tearing down the muxer. When omitted, such
-   * errors are swallowed silently during {@link FfmpegSink.close}.
+   * Logger for close failures.
    */
   logger?: Logger;
 }
 
 /**
- * Sink that remuxes the relayed stream into another container.
+ * Sink that remuxes the relayed stream into any container libav can write.
  *
- * Pipes the relay's packets into a node-av muxer entirely in-process, with no
- * child process involved. Streams are copied rather than re-encoded, so the
- * operation stays cheap and lossless. Point it at a file, a streaming URL, or a
- * writable stream to record or republish the upstream media.
+ * Packets are copied without re-encoding, so recording or restreaming costs
+ * almost no CPU. The output opens when the sink is attached and is finalized
+ * when it is detached or the relay stops.
  *
  * @example
  * ```typescript
- * import { Relay, FfmpegSink } from '@seydx/rtsp';
+ * import { FfmpegSink } from '@seydx/rtsp';
  *
- * const sink = new FfmpegSink({ output: 'out.mp4' });
- * relay.pipe(sink);
+ * const recorder = relay.pipe(new FfmpegSink({ output: '/recordings/clip.mkv', format: 'matroska' }));
+ * setTimeout(() => relay.unpipe(recorder), 30_000);
  * ```
  *
  * @example
  * ```typescript
  * import { FfmpegSink } from '@seydx/rtsp';
  *
- * const sink = new FfmpegSink({
- *   output: 'rtmp://localhost/live/stream',
- *   format: 'flv',
- *   options: { flvflags: 'no_duration_filesize' },
- * });
+ * // fragmented MP4 into an HTTP response
+ * relay.pipe(new FfmpegSink({ output: response, format: 'mp4', options: { movflags: 'frag_keyframe+empty_moov+default_base_moof' } }));
  * ```
  *
- * @see {@link Relay} For wiring sinks to a source
+ * @see {@link Sink} For the sink contract
  *
- * @see {@link Sink} For the sink contract this implements
+ * @see {@link Relay.pipe} For attaching it
  */
 export class FfmpegSink implements Sink {
+  private readonly indexes = new Map<number, number>();
   private muxer?: Muxer;
-  /** Source track index → muxer stream index. */
-  private readonly map = new Map<number, number>();
 
   /**
-   * Create a new ffmpeg sink.
+   * Create a remuxing sink. Nothing opens until it is attached.
    *
-   * @param options - Output destination and muxer configuration
+   * @param options - Output, format and muxer options
    *
    * @example
    * ```typescript
-   * const sink = new FfmpegSink({ output: 'out.mp4', format: 'mp4' });
+   * const sink = new FfmpegSink({ output: 'out.ts', format: 'mpegts' });
    * ```
    */
   constructor(private readonly options: FfmpegSinkOptions) {}
 
   /**
-   * Initialize the muxer and map the source tracks onto it.
+   * Open the output and add every track with a native stream.
    *
-   * Opens the output destination, then registers each AV-backed track as a
-   * muxer stream so packets can later be routed to the correct output index.
-   * Tracks without a native handle are skipped, since they cannot be copied.
+   * @param info - The stream layout
    *
-   * @param info - Resolved description of the upstream tracks
+   * @returns A promise that resolves once the output is open
    *
-   * @returns Resolves once the muxer is open and all streams are mapped
-   *
-   * @throws {Error} If the output cannot be opened by node-av
+   * @throws {Error} If the output cannot be opened or a track cannot be added
    *
    * @example
    * ```typescript
-   * await sink.init(streamInfo);
+   * await sink.init(info);
    * ```
    */
   async init(info: StreamInfo): Promise<void> {
-    this.muxer = await Muxer.open(this.options.output as never, {
-      format: this.options.format as never,
+    const muxer = await Muxer.open(this.options.output as string, {
+      format: this.options.format,
       options: this.options.options as never,
     });
-
+    this.muxer = muxer;
     for (const track of info.tracks) {
-      // Only AV-backed tracks carry a native stream that can be copied through.
-      if (!track.native) continue;
-      const muxIndex = this.muxer.addStream(track.native);
-      this.map.set(track.index, muxIndex);
+      if (track.native) this.indexes.set(track.index, muxer.addStream(track.native));
     }
   }
 
   /**
-   * Write a single packet to the muxer.
+   * Write one packet to the output.
    *
-   * Routes the packet to its mapped output stream by index. Packets for unmapped
-   * tracks, or packets without an underlying AV payload, are dropped silently.
+   * @param packet - The packet, owned by the relay
    *
-   * @param packet - The media packet to remux
+   * @returns A promise that resolves once the packet is written
    *
-   * @returns Resolves once the packet has been handed to the muxer
+   * @throws {Error} If writing fails
    *
    * @example
    * ```typescript
@@ -152,20 +119,15 @@ export class FfmpegSink implements Sink {
    * ```
    */
   async write(packet: MediaPacket): Promise<void> {
-    const muxIndex = this.map.get(packet.streamIndex);
-    if (muxIndex === undefined || !this.muxer || !packet.av) return;
-    await this.muxer.writePacket(packet.av, muxIndex);
+    const index = this.indexes.get(packet.streamIndex);
+    if (index === undefined || !this.muxer || !packet.av) return;
+    await this.muxer.writePacket(packet.av, index);
   }
 
   /**
-   * Finalize and release the muxer.
+   * Finalize and close the output.
    *
-   * Flushes any buffered output, writes the container trailer, and frees the
-   * stream mapping. Safe to call when the sink was never initialized. Errors
-   * raised while closing are reported through the configured logger rather than
-   * thrown, so teardown of other sinks is not interrupted.
-   *
-   * @returns Resolves once the muxer has been closed
+   * @returns A promise that resolves once the output is closed
    *
    * @example
    * ```typescript
@@ -173,13 +135,11 @@ export class FfmpegSink implements Sink {
    * ```
    */
   async close(): Promise<void> {
-    // Detach state before awaiting so a concurrent write cannot reuse a closing muxer.
     const muxer = this.muxer;
     this.muxer = undefined;
-    this.map.clear();
-    if (!muxer) return;
+    this.indexes.clear();
     try {
-      await muxer.close();
+      await muxer?.close();
     } catch (error) {
       this.options.logger?.error?.('[rtsp] FfmpegSink close failed:', error);
     }

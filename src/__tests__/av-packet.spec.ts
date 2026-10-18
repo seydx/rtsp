@@ -1,9 +1,9 @@
-import { AV_NOPTS_VALUE } from 'node-av';
+import { AV_NOPTS_VALUE } from 'node-av/constants';
 import { describe, expect, it } from 'vitest';
 
 import { requireAvPacket, wrapAvPacket } from '../av-packet.js';
 
-import type { Packet } from 'node-av';
+import type { Packet } from 'node-av/lib';
 import type { MediaPacket } from '../types.js';
 
 /** Build a minimal fake native packet exposing just what wrapAvPacket reads. */

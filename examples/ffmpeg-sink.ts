@@ -1,48 +1,39 @@
 /**
  * FFmpeg Sink Recording
  *
- * Opens an RTSP source through a relay and pipes it into an FfmpegSink that remuxes
- * the stream into a container file. Streams are copied, not re-encoded, so recording
- * stays cheap and lossless.
+ * Records a relayed source into a container file with an FfmpegSink. Streams
+ * are copied, not re-encoded, so recording is cheap and lossless.
  *
  * Usage: tsx examples/ffmpeg-sink.ts <rtsp_url> [output] [format]
  *
  * Options:
  *   <rtsp_url>  RTSP input URL to record (default: rtsp://localhost:8554/stream)
  *   [output]    Destination file path (default: out.ts)
- *   [format]    Container/muxer format (default: mpegts)
+ *   [format]    Container format (default: mpegts)
  *
  * Examples:
  *   tsx examples/ffmpeg-sink.ts rtsp://camera/live
  *   tsx examples/ffmpeg-sink.ts rtsp://camera/live recording.mp4 mp4
  */
 
-import { Relay } from '../src/index.js';
-import { FfmpegSink } from '../src/sinks/index.js';
-import { AvSource } from '../src/sources/index.js';
+import { AvSource, FfmpegSink, Relay } from '../src/index.js';
 
 const url = process.argv[2] ?? 'rtsp://localhost:8554/stream';
 const output = process.argv[3] ?? 'out.ts';
 const format = process.argv[4] ?? 'mpegts';
 
-// Force TCP transport so the recording is not corrupted by UDP packet loss.
-const source = new AvSource(url, { transport: 'tcp' });
-const relay = new Relay({ source });
+const relay = new Relay({ source: new AvSource(url, { transport: 'tcp' }) });
 
-// Remux (copy) the relayed tracks into the chosen container; format is explicit
-// rather than inferred so the same code works for extension-less outputs too.
-const sink = new FfmpegSink({ output, format });
-relay.pipe(sink);
+// the recording starts at the next keyframe, so the file is playable from its first frame
+relay.pipe(new FfmpegSink({ output, format }));
 
-// EOF/disconnect: the relay flushes sinks (writing the container trailer) on its own.
-relay.on('end', () => console.log('Upstream ended; recording finalized.'));
-relay.on('error', (error) => console.error('Relay error:', error));
+relay.on('end', () => console.log('upstream ended, recording finalized'));
+relay.on('error', (error) => console.error('relay error:', error));
 
-// SIGINT must await stop() so the muxer writes its trailer and the file stays playable.
+// stop() waits for the muxer to write its trailer, without it an mp4 is unplayable
 process.on('SIGINT', () => {
-  console.log('\nStopping...');
-  relay.stop().then(() => process.exit(0));
+  void relay.stop().then(() => process.exit(0));
 });
 
 await relay.start();
-console.log(`Recording ${url} -> ${output} (${format}). Press Ctrl+C to stop.`);
+console.log(`recording ${url} to ${output} (${format}), press Ctrl+C to stop`);

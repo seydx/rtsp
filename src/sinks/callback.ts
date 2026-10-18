@@ -1,92 +1,81 @@
 import type { MediaPacket, Sink, StreamInfo } from '../types.js';
 
 /**
- * Lifecycle callbacks for a {@link CallbackSink}.
- *
- * Each handler is optional, so a consumer can subscribe to only the phases it
- * cares about. Handlers may be synchronous or asynchronous; when a handler
- * returns a promise the relay awaits it before proceeding, which provides
- * natural backpressure on the upstream packet flow.
+ * Callbacks of a {@link CallbackSink}. All are optional and may return a promise.
  */
 export interface CallbackSinkHandlers {
   /**
-   * Called once when the relay resolves the upstream stream layout.
+   * Called once with the stream layout before the first packet.
    *
-   * Receives the full {@link StreamInfo} (tracks plus any backchannel format)
-   * before the first packet is delivered, giving the consumer a chance to set up
-   * per-track state. If it returns a promise, the relay awaits it before
-   * delivering packets.
+   * Throwing detaches the sink.
+   *
+   * @param info - The stream layout
    */
   onInit?: (info: StreamInfo) => void | Promise<void>;
 
   /**
-   * Called for every keyframe-gated packet the relay delivers to this sink.
+   * Called for every packet from the first video keyframe on, one at a time.
    *
-   * The {@link MediaPacket} is only valid for the duration of this call: the
-   * relay frees it once the returned promise resolves, so any payload that must
-   * outlive the call has to be copied out (or the packet cloned) here.
+   * The packet is freed once the callback returned or its promise resolved;
+   * clone it to keep it longer. Throwing detaches the sink.
+   *
+   * @param packet - The packet
    */
   onPacket?: (packet: MediaPacket) => void | Promise<void>;
 
   /**
-   * Called once on teardown, after the last packet has been delivered.
-   *
-   * Use this to release any resources allocated in {@link onInit}. If it returns
-   * a promise, the relay awaits it as part of closing the sink.
+   * Called once when the sink is detached or the relay stops.
    */
   onClose?: () => void | Promise<void>;
 }
 
 /**
- * The simplest sink: hands every keyframe-gated packet to a callback.
+ * Sink that hands packets to plain callbacks.
  *
- * Wraps a set of lifecycle handlers behind the {@link Sink} interface so raw
- * consumers, tests, and ad-hoc integrations can observe the relayed stream
- * without implementing a full sink class. It is also the canonical reference
- * implementation of {@link Sink}. Each delivered packet is only valid for the
- * duration of the packet handler — copy out anything that must be kept.
+ * The quickest way to consume a relay in process, for example to inspect
+ * packets, count bytes or feed a custom pipeline. A returned promise applies
+ * backpressure: the next packet waits until it resolves, while the relay and
+ * the other sinks keep running.
  *
  * @example
  * ```typescript
  * import { CallbackSink } from '@seydx/rtsp';
  *
- * const sink = new CallbackSink({
- *   onInit: (info) => console.log('tracks:', info.tracks.length),
- *   onPacket: (packet) => console.log('packet on stream', packet.streamIndex),
- *   onClose: () => console.log('done'),
- * });
+ * relay.pipe(
+ *   new CallbackSink({
+ *     onInit: (info) => console.log(info.tracks.map((track) => track.codec)),
+ *     onPacket: (packet) => console.log(packet.streamIndex, packet.isKeyframe),
+ *   }),
+ * );
  * ```
  *
- * @see {@link Sink} For the sink contract this implements
+ * @see {@link Sink} For the sink contract
  *
- * @see {@link CallbackSinkHandlers} For the available lifecycle handlers
+ * @see {@link Relay.pipe} For attaching it
  */
 export class CallbackSink implements Sink {
   /**
-   * Create a callback-backed sink.
+   * Create a sink from callbacks.
    *
-   * @param handlers - Lifecycle callbacks invoked on init, per packet, and on close
+   * @param handlers - The callbacks to invoke
    *
    * @example
    * ```typescript
-   * const sink = new CallbackSink({ onPacket: (packet) => buffer.push(packet.clone()) });
+   * const sink = new CallbackSink({ onPacket: (packet) => handle(packet) });
    * ```
    */
   constructor(private readonly handlers: CallbackSinkHandlers) {}
 
   /**
-   * Initialize the sink with the resolved stream layout.
+   * Forward the stream layout to {@link CallbackSinkHandlers.onInit}.
    *
-   * Forwards to the {@link CallbackSinkHandlers.onInit} handler if one was
-   * provided; otherwise resolves immediately.
+   * @param info - The stream layout
    *
-   * @param info - Resolved description of the tracks the source carries
-   *
-   * @returns The handler's result, awaited by the relay before packets flow
+   * @returns The callback's result
    *
    * @example
    * ```typescript
-   * await sink.init(streamInfo);
+   * await sink.init(info);
    * ```
    */
   init(info: StreamInfo): void | Promise<void> {
@@ -94,15 +83,11 @@ export class CallbackSink implements Sink {
   }
 
   /**
-   * Deliver one packet to the consumer.
+   * Forward a packet to {@link CallbackSinkHandlers.onPacket}.
    *
-   * Forwards to the {@link CallbackSinkHandlers.onPacket} handler if one was
-   * provided. The packet is freed by the relay once the returned promise
-   * resolves, so the handler must copy out any payload it needs to retain.
+   * @param packet - The packet, owned by the relay
    *
-   * @param packet - The keyframe-gated media packet to consume
-   *
-   * @returns The handler's result, awaited by the relay before the next packet
+   * @returns The callback's result
    *
    * @example
    * ```typescript
@@ -114,12 +99,9 @@ export class CallbackSink implements Sink {
   }
 
   /**
-   * Tear down the sink.
+   * Invoke {@link CallbackSinkHandlers.onClose}.
    *
-   * Forwards to the {@link CallbackSinkHandlers.onClose} handler if one was
-   * provided; otherwise resolves immediately.
-   *
-   * @returns The handler's result, awaited by the relay during teardown
+   * @returns The callback's result
    *
    * @example
    * ```typescript

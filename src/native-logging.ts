@@ -1,6 +1,7 @@
-import { AV_LOG_ERROR, AV_LOG_WARNING, Log } from 'node-av';
+import { AV_LOG_ERROR, AV_LOG_WARNING } from 'node-av/constants';
+import { Log } from 'node-av/lib';
 
-import type { AVLogLevel } from 'node-av';
+import type { AVLogLevel } from 'node-av/constants';
 import type { Logger } from './types.js';
 
 /**
@@ -8,21 +9,18 @@ import type { Logger } from './types.js';
  */
 export interface NativeLoggingOptions {
   /**
-   * Highest (most verbose) FFmpeg level to forward.
+   * Most verbose FFmpeg level to forward.
    *
-   * Messages more verbose than this are dropped inside node-av before they ever
-   * reach JavaScript, so they neither hit the logger nor leak to stderr. Defaults
-   * to `AV_LOG_WARNING`, which keeps only warnings and errors and silently
-   * discards the usual encoder/muxer chatter (e.g. `Qavg`, queue-flush notices).
+   * More verbose messages are dropped inside node-av and never reach
+   * JavaScript or stderr. The default keeps warnings and errors.
+   *
+   * @default AV_LOG_WARNING
    */
   maxLevel?: AVLogLevel;
 
   /**
-   * Extra substrings/patterns whose messages should be dropped.
-   *
-   * Merged with a small built-in list of known-noise lines. Useful when a higher
-   * `maxLevel` is chosen for debugging but a few chatty lines should still be
-   * suppressed.
+   * Substrings or patterns of messages to drop, on top of a built-in list of
+   * known noise such as encoder statistics.
    */
   ignore?: (string | RegExp)[];
 }
@@ -31,61 +29,65 @@ export interface NativeLoggingOptions {
  * Handle returned by {@link installNativeLogging}.
  */
 export interface NativeLoggingHandle {
-  /** Remove the bridge and hand FFmpeg logging back to its default handler. */
+  /**
+   * Remove the bridge and give FFmpeg logging back to its default handler.
+   */
   dispose(): void;
 }
 
-// FFmpeg lines that are pure noise even at warning level / when verbosity is raised.
-const DEFAULT_IGNORE: (string | RegExp)[] = ['frames left in the queue', 'Qavg'];
+// harmless noise: encoder teardown stats, swscale on the full-range yuvj formats MJPEG decodes to,
+// the rtp jpeg packetizer and depacketizer on every frame of a camera that shares one quantization
+// table (the depacketizer only rejects lengths other than 64, 128, 192 or 256), and the cuda probe of
+// the device detection on every machine without an nvidia driver
+const DEFAULT_IGNORE: (string | RegExp)[] = [
+  'frames left in the queue',
+  'Qavg',
+  'deprecated pixel format used',
+  'RFC 2435 suggests two quantization tables',
+  /Invalid qtable length (64|192|256)\./,
+  'Cannot load libcuda.so.1',
+  'Could not dynamically load CUDA',
+];
 
-// FFmpeg's av_log callback is a single process-global slot, so only one bridge can
-// be active at a time. Track it so re-installing replaces cleanly (idempotent).
-let active: NativeLoggingHandle | null = null;
+// av_log has one process-wide callback slot, so only one bridge can be active
+let active: NativeLoggingHandle | undefined;
 
 /**
- * Bridge FFmpeg's internal logging into a {@link Logger}.
+ * Route FFmpeg's own log output into a {@link Logger}.
  *
- * node-av embeds FFmpeg in-process, and FFmpeg's `av_log` callback is a single
- * process-global slot. This installs that one callback and routes each message to
- * the given logger by severity, instead of letting FFmpeg print to stderr. Call it
- * **once per process** (e.g. at a worker/plugin bootstrap) with the process's
- * logger — not per stream/relay, since a later call replaces the previous bridge.
+ * node-av runs FFmpeg in process, and FFmpeg prints to stderr by default. This
+ * installs FFmpeg's single process-wide log callback and maps errors to
+ * `error`, warnings to `warn` and everything else to `debug`. Call it once per
+ * process; a later call replaces the earlier bridge.
  *
- * Because every forked process has its own FFmpeg instance, separate processes are
- * already isolated; this simply captures the FFmpeg output of the current process.
+ * @param logger - Destination of the messages
  *
- * @param logger - Destination logger; messages are mapped error/warn → `error`/`warn`, everything else → `debug`.
+ * @param options - Verbosity limit and extra patterns to drop
  *
- * @param options - Verbosity ceiling and extra ignore patterns.
- *
- * @returns A handle whose `dispose()` restores FFmpeg's default logging.
+ * @returns A handle that restores the default logging
  *
  * @example
  * ```typescript
  * import { installNativeLogging } from '@seydx/rtsp';
  *
- * const logging = installNativeLogging(myLogger);
- * // ...on shutdown
+ * const logging = installNativeLogging(console);
+ * // on shutdown
  * logging.dispose();
  * ```
  */
 export function installNativeLogging(logger: Logger, options: NativeLoggingOptions = {}): NativeLoggingHandle {
-  // Single global slot: drop any previous bridge before installing a new one.
   active?.dispose();
 
-  const maxLevel = options.maxLevel ?? AV_LOG_WARNING;
   const ignore = [...DEFAULT_IGNORE, ...(options.ignore ?? [])];
-  const ignored = (message: string): boolean => ignore.some((p) => (typeof p === 'string' ? message.includes(p) : p.test(message)));
-
   Log.setCallback(
     (level, message) => {
-      if (ignored(message)) return;
+      if (ignore.some((pattern) => (typeof pattern === 'string' ? message.includes(pattern) : pattern.test(message)))) return;
       const line = `[node-av] ${message}`;
       if (level <= AV_LOG_ERROR) logger.error?.(line);
       else if (level <= AV_LOG_WARNING) logger.warn?.(line);
       else logger.debug?.(line);
     },
-    { maxLevel },
+    { maxLevel: options.maxLevel ?? AV_LOG_WARNING },
   );
 
   let disposed = false;
@@ -93,11 +95,10 @@ export function installNativeLogging(logger: Logger, options: NativeLoggingOptio
     dispose(): void {
       if (disposed) return;
       disposed = true;
-      // Only relinquish the global slot if we still own it.
-      if (active === handle) {
-        Log.setCallback(null);
-        active = null;
-      }
+      // a newer bridge owns the slot now, leave it alone
+      if (active !== handle) return;
+      Log.setCallback(null);
+      active = undefined;
     },
   };
   active = handle;

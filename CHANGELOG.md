@@ -4,6 +4,57 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+Version 2 is a rework of the whole library: one shared demux and audio pipeline instead of several near-duplicates, a synchronous in-process transcoding path, video re-encoding (MJPEG to H.264 with hardware acceleration), a stricter RTSP server and a test suite that covers every module. The public surface is smaller and more consistent, which breaks some imports and option names; the migration section lists every change.
+
+### Migration from 1.x
+
+- **`relay.serveRtsp(options)` is gone.** Create the server yourself: `const server = await new RtspServerSink(relay, options).listen()`. `server.shutdown()` stops it and detaches it from the relay.
+- **`RtspServerSink` `backchannel`**: an advertised format moved into an object, `backchannel: { advertise: { codec, payloadType, clockRate, channels } }`. `backchannel: true` still advertises the upstream's own format.
+- **`RtspServerSink` `audioTranscode` replaced by `transcode`**: `transcode: { audio: { codec, sampleRate, channels, bitRate } }`. Video can be re-encoded too, and an audio track that already matches is now copied instead of re-encoded (set `force: true` for the old behavior), see below.
+- **Types**: `BackchannelAdvertise` is now `BackchannelFormat`. `AudioTranscodeTarget` is now `AudioTranscodeOptions`. `ForwardAudioTranscoder` was removed, `RtspServerSink` handles re-encoding itself.
+- **Transcoders are synchronous.** `BackchannelTranscoder.start()`, `BackchannelTranscoder.close()`, `RawAudioTranscoder.start()` and `RawAudioTranscoder.close()` return `void` and throw instead of rejecting. Code like `await transcoder.start()` keeps working, but `transcoder.close().catch(...)` and `transcoder.start().then(...)` must drop the promise handling.
+- **`AvSource` `timeout` is in milliseconds** (was microseconds), consistent with every other option.
+- **`AvReconnectOptions`**: `delayMs` is now `delay`, `maxDelayMs` is now `maxDelay`.
+- **Imports**: the transcoders moved to the new `@seydx/rtsp/transcode` entry point (still exported from the root). `@seydx/rtsp/sinks` no longer exports `BackchannelTranscoder`, and `RawAudioTranscoder` is no longer under `sources`.
+- **Requirements**: Node.js 24 or newer, `node-av` `^6.2.0-beta.32` as peer dependency. `get-port` is no longer a dependency.
+
+### Added
+
+- `TranscodeSink`: re-encodes tracks on their way into any sink, for example an MJPEG camera recorded as H.264 through an `FfmpegSink`. `RtspServerSink` `transcode` uses it, so both share the same options.
+- Video re-encoding to H.264 or HEVC, for example an MJPEG camera, with options for bit rate, GOP size and output size (`width` or `height` alone keeps the aspect ratio).
+- Hardware acceleration for the whole video path: one device decodes, scales and encodes, and each stage falls back to software on its own when the device cannot handle it. `transcode.hardware` defaults to the best device, detected once and shared by every transcoder of the process; `false`, `HardwareOptions` or an own `HardwareContext` are accepted too. New `HardwareSetting` type, and `HardwareContext` and `HardwareOptions` are re-exported as types.
+- Tracks that already have the requested format are copied instead of re-encoded, unless `force` is set. Low delay AAC never counts as a match.
+- `transcode.video` and `transcode.audio` accept a function that decides per track.
+- Video encoders get the source frame rate, measured over about the first half second when the source reports none (MJPEG over HTTP), while the timestamps keep their fine clock. Frames that piled up while a live input was probed or its sinks started are skipped, they arrive at whatever pace they are read, and a camera that delivers its frames in groups is measured over whole groups within about 1.5 seconds. Gives a correct H.264 level, working hardware rate control and a keyframe per second by default.
+- A hardware decoder that gets stuck mid-stream is replaced by a software decoder at the last keyframe.
+- `AvSource` and `MultiSource` `wallclock` option: stamp packets with their arrival time on a 90 kHz clock, for inputs without usable timestamps such as MJPEG over HTTP. Audio keeps its exact sample timeline while it stays close to the wall clock.
+- `AvSource` accepts a `Readable` input, like `MultiSource` already did.
+- `RtspServerSink` events `backchannel:start` and `backchannel:stop` (after `backchannel.idleTimeout`, default 2s), and a `backchannelFormat` getter.
+- `RtspServerSink` forwards viewer talkback to a source that supports it, unchanged when the formats match (with the payload type rewritten if needed) and transcoded otherwise.
+- RTSP server: real `RTP-Info` on PLAY, PAUSE support, `404` for unknown paths and tracks, `461` for non-TCP transports, Digest `stale=TRUE` for expired nonces, TCP keepalive, and viewers are disconnected when the upstream ends so they reconnect at once.
+- `RtspAuthResult` type: `verify()` now returns `'ok' | 'stale' | 'denied'`.
+- `@seydx/rtsp/transcode` entry point.
+
+### Changed
+
+- Talkback transcoding and raw audio transcoding run synchronously in-process. The localhost UDP loopback, the synthetic SDP and the `get-port` dependency are gone, which also removes the port collisions between concurrent transcoders that 1.0.5 worked around.
+- `RtspServerSink` packetizes every track once, whatever the number of viewers, and frames interleaved packets once per channel.
+- `MultiSource` reads its inputs concurrently with a bounded queue, fails as a whole when one input fails, and stops its readers when the consumer leaves early.
+- `AvSource` reconnects with exponential backoff, checks that a reopened input still has the same stream layout, and restarts a loop after a pass that ended in a read error (mpjpeg reports the end of a file that way).
+- `RawAudioTranscoder.close()` flushes the audio the encoder still holds.
+- `installNativeLogging` also drops the harmless swscale warning about full-range pixel formats that every MJPEG source triggers, the per-frame notes about a single quantization table from the RTP JPEG packetizer and depacketizer, and the CUDA probe errors of the hardware detection on machines without an NVIDIA driver.
+- Documentation rewritten in the style of node-av.
+
+### Fixed
+
+- `relay.pipe()` during a running `stop()` attached to the stopping stream and never started; it now starts a fresh stream once the stop finished. Concurrent `stop()` calls share one teardown.
+- A source whose `open()` finished after `stop()` was left open; it is closed now.
+- The stall watchdog uses a monotonic clock, so system clock changes no longer trigger or hide stalls.
+- A DESCRIBE racing a stream close could wait forever for an SDP that was never published.
+- A session that closed while its DESCRIBE was pending stayed referenced until the stream ended.
+- Credentials in `AvSource` URLs are masked in log output.
+- `TrackInfo.native` stays valid until the source closes. A looping or reconnecting `AvSource` used to free the streams sinks were initialized with.
+
 ## [1.0.5] - 2026-07-12
 
 ### Added

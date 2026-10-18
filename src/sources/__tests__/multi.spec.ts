@@ -1,121 +1,182 @@
-import { execFile } from 'node:child_process';
+import { AV_NOPTS_VALUE } from 'node-av/constants';
 import { createReadStream } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { promisify } from 'node:util';
-import { AV_NOPTS_VALUE, ffmpegPath, isFfmpegAvailable } from 'node-av';
+import { createServer } from 'node:net';
+import { setTimeout as delay } from 'node:timers/promises';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { Fixtures, hasFfmpeg } from '../../__tests__/helpers/media.js';
 import { Relay } from '../../relay.js';
 import { CallbackSink } from '../../sinks/callback.js';
 import { MultiSource } from '../multi.js';
 
-const execFileAsync = promisify(execFile);
-const suite = isFfmpegAvailable() ? describe : describe.skip;
+import type { Socket } from 'node:net';
+import type { MediaPacket, StreamInfo } from '../../types.js';
 
-suite('MultiSource (integration)', () => {
-  let dir: string;
+const suite = hasFfmpeg ? describe : describe.skip;
+
+async function drain(source: MultiSource, onPacket: (packet: MediaPacket) => void | Promise<void> = () => undefined): Promise<number> {
+  let count = 0;
+  for await (const packet of source.packets(new AbortController().signal)) {
+    count++;
+    await onPacket(packet);
+    packet.free();
+  }
+  return count;
+}
+
+suite('MultiSource', () => {
+  let fixtures: Fixtures;
   let h264: string;
   let aac: string;
 
   beforeAll(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'rtsp-multi-'));
-    h264 = join(dir, 'video.h264');
-    aac = join(dir, 'audio.aac');
-    await execFileAsync(ffmpegPath(), [
-      '-y',
-      '-f',
-      'lavfi',
-      '-i',
-      'testsrc=size=320x240:rate=15',
-      '-t',
-      '1',
-      '-c:v',
-      'libx264',
-      '-g',
-      '15',
-      '-pix_fmt',
-      'yuv420p',
-      '-bsf:v',
-      'h264_mp4toannexb',
-      '-f',
-      'h264',
-      h264,
-    ]);
-    await execFileAsync(ffmpegPath(), ['-y', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '1', '-c:a', 'aac', '-f', 'adts', aac]);
+    fixtures = await Fixtures.create();
+    [h264, aac] = await Promise.all([fixtures.clip('h264', 1), fixtures.clip('adts', 1)]);
   }, 30_000);
 
   afterAll(async () => {
-    if (dir) await rm(dir, { recursive: true, force: true });
+    await fixtures?.dispose();
   });
 
-  it('merges separate raw h264 + aac inputs into one multi-track source', async () => {
-    const source = new MultiSource([
+  function rawPair(): MultiSource {
+    return new MultiSource([
       { input: createReadStream(h264), format: 'h264' },
       { input: createReadStream(aac), format: 'aac' },
     ]);
-    const relay = new Relay({ source });
+  }
 
-    const indices = new Set<number>();
-    let firstVideoKeyframe = false;
-    let videoIndex = -1;
+  it('merges separate raw inputs into one source that feeds a relay', async () => {
+    const relay = new Relay({ source: rawPair() });
+    const indexes = new Set<number>();
+    let info: StreamInfo | undefined;
+    let firstVideo: boolean | undefined;
 
     await new Promise<void>((resolve, reject) => {
       relay.on('error', reject);
       relay.on('stop', resolve);
-      relay.on('start', (info) => {
-        videoIndex = info.tracks.find((t) => t.kind === 'video')?.index ?? -1;
-        expect(info.tracks.map((t) => t.kind).sort()).toEqual(['audio', 'video']);
-        expect(info.tracks.map((t) => t.codec).sort()).toEqual(['aac', 'h264']);
-      });
+      relay.on('start', (started) => (info = started));
       relay.pipe(
         new CallbackSink({
-          onPacket: (p) => {
-            indices.add(p.streamIndex);
-            if (p.streamIndex === videoIndex && p.isKeyframe && indices.size === 1) firstVideoKeyframe = true;
+          onPacket: (packet) => {
+            indexes.add(packet.streamIndex);
+            if (packet.streamIndex === 0) firstVideo ??= packet.isKeyframe;
           },
         }),
       );
     });
 
-    // Packets arrived from both merged inputs, gated to start at a keyframe.
-    expect(indices.size).toBe(2);
-    expect(firstVideoKeyframe).toBe(true);
-  }, 30_000);
+    expect(info?.tracks.map((track) => [track.index, track.kind, track.codec])).toEqual([
+      [0, 'video', 'h264'],
+      [1, 'audio', 'aac'],
+    ]);
+    expect([...indexes].sort()).toEqual([0, 1]);
+    expect(firstVideo).toBe(true);
+  });
 
-  it('synthesizes a monotonic CFR timeline for the timeless raw video stream', async () => {
+  it('numbers the tracks of every input one after another', async () => {
     const source = new MultiSource([
       { input: createReadStream(h264), format: 'h264' },
       { input: createReadStream(aac), format: 'aac' },
+      { input: h264, format: 'h264' },
     ]);
-    const relay = new Relay({ source });
+    const info = await source.open();
+    try {
+      expect(info.tracks.map((track) => [track.index, track.codec])).toEqual([
+        [0, 'h264'],
+        [1, 'aac'],
+        [2, 'h264'],
+      ]);
+      const counts = new Map<number, number>();
+      await drain(source, (packet) => void counts.set(packet.streamIndex, (counts.get(packet.streamIndex) ?? 0) + 1));
+      expect(counts.get(0)).toBe(15);
+      expect(counts.get(2)).toBe(15);
+      expect(counts.get(1)).toBeGreaterThan(40);
+    } finally {
+      await source.close();
+    }
+  });
 
-    let videoIndex = -1;
-    const videoPts: bigint[] = [];
-
-    await new Promise<void>((resolve, reject) => {
-      relay.on('error', reject);
-      relay.on('stop', resolve);
-      relay.on('start', (info) => {
-        videoIndex = info.tracks.find((t) => t.kind === 'video')?.index ?? -1;
+  it('synthesizes a monotonic constant frame rate for raw video', async () => {
+    const source = rawPair();
+    await source.open();
+    const pts: bigint[] = [];
+    try {
+      await drain(source, (packet) => {
+        if (packet.streamIndex === 0 && packet.av) pts.push(packet.av.pts);
       });
-      relay.pipe(
-        new CallbackSink({
-          onPacket: (p) => {
-            if (p.streamIndex === videoIndex && p.av) videoPts.push(p.av.pts);
-          },
-        }),
-      );
-    });
+    } finally {
+      await source.close();
+    }
 
-    // Raw Annex-B H.264 carries no container timing; the source must reconstruct it.
-    expect(videoPts.length).toBeGreaterThan(2);
-    expect(videoPts.every((pts) => pts !== AV_NOPTS_VALUE)).toBe(true);
-
-    // Strictly increasing, and at a constant cadence (15fps source -> equal steps).
-    const steps = videoPts.slice(1).map((pts, i) => pts - videoPts[i]);
-    expect(steps.every((s) => s > 0n)).toBe(true);
+    // annex-b h264 carries no timing, the 15 fps clip must come out in equal steps
+    expect(pts.length).toBe(15);
+    expect(pts.every((value) => value !== AV_NOPTS_VALUE)).toBe(true);
+    const steps = pts.slice(1).map((value, i) => value - pts[i]);
+    expect(steps.every((step) => step > 0n)).toBe(true);
     expect(new Set(steps.map(String)).size).toBe(1);
-  }, 30_000);
+  });
+
+  it('delivers everything to a slow consumer', async () => {
+    const fast = rawPair();
+    await fast.open();
+    const total = await drain(fast);
+    await fast.close();
+
+    const slow = rawPair();
+    await slow.open();
+    try {
+      expect(await drain(slow, () => delay(1))).toBe(total);
+    } finally {
+      await slow.close();
+    }
+  });
+
+  it('stops its readers when the consumer leaves early', async () => {
+    const source = new MultiSource([
+      { input: h264, format: 'h264' },
+      { input: aac, format: 'aac' },
+    ]);
+    await source.open();
+    let seen = 0;
+    for await (const packet of source.packets(new AbortController().signal)) {
+      packet.free();
+      if (++seen === 3) break;
+    }
+    const start = performance.now();
+    await source.close();
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+
+  it('fails the whole open when one input fails and closes the rest', async () => {
+    const source = new MultiSource([
+      { input: h264, format: 'h264' },
+      { input: fixtures.path('missing.aac'), format: 'aac' },
+    ]);
+    await expect(source.open()).rejects.toThrow();
+    await source.close();
+  });
+
+  it('aborts a pending open on close', async () => {
+    const sockets: Socket[] = [];
+    const server = createServer((socket) => sockets.push(socket));
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as { port: number };
+
+    const source = new MultiSource([{ input: h264, format: 'h264' }, { input: `rtsp://127.0.0.1:${port}/hang` }]);
+    try {
+      const opening = source.open();
+      await delay(100);
+      await source.close();
+      await expect(opening).rejects.toThrow();
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it('needs at least one input and an open before packets', async () => {
+    expect(() => new MultiSource([])).toThrow(/at least one input/);
+    const source = new MultiSource([{ input: h264, format: 'h264' }]);
+    await expect(drain(source)).rejects.toThrow(/open\(\) must be called/);
+  });
 });

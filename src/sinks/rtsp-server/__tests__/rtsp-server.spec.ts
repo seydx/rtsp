@@ -1,317 +1,456 @@
-import { execFile, spawn } from 'node:child_process';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_VIDEO } from 'node-av/constants';
+import { readFile } from 'node:fs/promises';
+import { PassThrough } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
-import { promisify } from 'node:util';
-import { Demuxer } from 'node-av';
-import { ffmpegPath, isFfmpegAvailable } from 'node-av';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
+import { Fixtures, hasFfmpeg, probe, RtspTestClient, runFfmpeg, until } from '../../../__tests__/helpers/media.js';
 import { Relay } from '../../../relay.js';
 import { AvSource } from '../../../sources/av.js';
+import { MultiSource } from '../../../sources/multi.js';
+import { TranscodeSink } from '../../../transcode/transcode-sink.js';
+import { RtspAuth } from '../auth.js';
 import { RtspServerSink } from '../rtsp-server-sink.js';
 
-import type { MediaPacket } from '../../../types.js';
+import type { MediaPacket, Sink, StreamInfo } from '../../../types.js';
+import type { RtspServerSinkOptions } from '../rtsp-server-sink.js';
 
-const execFileAsync = promisify(execFile);
-const suite = isFfmpegAvailable() ? describe : describe.skip;
+const suite = hasFfmpeg ? describe : describe.skip;
 
-/**
- * Run ffmpeg with a hard deadline, always settling with its stderr tail.
- *
- * `execFile`'s timeout sends SIGTERM, which ffmpeg ignores while parked in a
- * blocking socket read on a stalled stream — leaving the promise pending until
- * the test times out with zero diagnostics. This kills with SIGKILL instead
- * and rejects with the captured stderr, so a CI failure shows exactly where
- * ffmpeg's progress stopped.
- */
-function runFfmpeg(args: string[], timeoutMs: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(ffmpegPath(), args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    let stderr = '';
-    child.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString();
-      if (stderr.length > 64 * 1024) stderr = stderr.slice(-32 * 1024);
-    });
-    const deadline = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
-    child.on('error', (error) => {
-      clearTimeout(deadline);
-      reject(error);
-    });
-    child.on('close', (code, signal) => {
-      clearTimeout(deadline);
-      if (code === 0) resolve();
-      else reject(new Error(`ffmpeg exited with ${signal ?? code}; stderr tail:\n${stderr.slice(-4000)}`));
-    });
-  });
+function pull(url: string, out: string, seconds = 1): Promise<void> {
+  return runFfmpeg(['-rtsp_transport', 'tcp', '-i', url, '-t', String(seconds), '-c', 'copy', out]);
 }
 
-suite('RtspServerSink (integration)', () => {
-  let dir: string;
-  let sample: string;
+function portOf(server: RtspServerSink): number {
+  return Number(/:(\d+)\//.exec(server.url)![1]);
+}
+
+suite('RtspServerSink serving', () => {
+  let fixtures: Fixtures;
+  let av: string;
+
+  // looped and paced, so the file behaves like a live camera
+  async function serve(options: RtspServerSinkOptions = {}, source = new AvSource(av, { readrate: 1, loop: true })): Promise<{ relay: Relay; server: RtspServerSink }> {
+    const relay = new Relay({ source });
+    const server = await new RtspServerSink(relay, options).listen();
+    return { relay, server };
+  }
+
+  async function shutdown({ relay, server }: { relay: Relay; server: RtspServerSink }): Promise<void> {
+    await server.shutdown();
+    await relay.stop();
+  }
 
   beforeAll(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'rtsp-srv-'));
-    sample = join(dir, 'sample.mp4');
-    await execFileAsync(ffmpegPath(), [
-      '-y',
-      '-f',
-      'lavfi',
-      '-i',
-      'testsrc=size=320x240:rate=15',
-      '-f',
-      'lavfi',
-      '-i',
-      'sine=frequency=440:sample_rate=48000',
-      '-t',
-      '2',
-      '-c:v',
-      'libx264',
-      '-g',
-      '15',
-      '-pix_fmt',
-      'yuv420p',
-      '-c:a',
-      'aac',
-      '-shortest',
-      sample,
-    ]);
+    fixtures = await Fixtures.create();
+    av = await fixtures.clip('av');
   }, 30_000);
 
   afterAll(async () => {
-    if (dir) await rm(dir, { recursive: true, force: true });
+    await fixtures?.dispose();
   });
 
-  it('serves a single upstream to a pulling ffmpeg client', async () => {
-    // Looped + paced so the source behaves like a live feed and the client
-    // reliably catches a keyframe after PLAY.
-    const relay = new Relay({ source: new AvSource(sample, { readrate: 1, loop: true }) });
-    const server = await relay.serveRtsp({ path: 'live' });
-
-    expect(server.url).toMatch(/^rtsp:\/\/127\.0\.0\.1:\d+\/live$/);
-
-    const out = join(dir, 'pulled.mp4');
+  it('serves one upstream to a pulling ffmpeg client', async () => {
+    const served = await serve();
+    expect(served.server.url).toMatch(/^rtsp:\/\/127\.0\.0\.1:\d+\/live$/);
     try {
-      await execFileAsync(ffmpegPath(), ['-y', '-rtsp_transport', 'tcp', '-i', server.url, '-t', '1', '-c', 'copy', out], { timeout: 25_000 });
-
-      // The pulled file must be a real A/V recording.
-      expect((await stat(out)).size).toBeGreaterThan(0);
-      const demuxer = await Demuxer.open(out);
-      const codecs = demuxer.streams.map((s) => s.codecpar.codecId);
-      await demuxer.close();
-      expect(codecs.length).toBeGreaterThanOrEqual(2);
+      const out = fixtures.path('pulled.mp4');
+      await pull(served.server.url, out);
+      expect((await probe(out)).map((stream) => stream.codec)).toEqual(['h264', 'aac']);
     } finally {
+      await shutdown(served);
+    }
+  }, 30_000);
+
+  it('opens the upstream once for concurrent viewers and counts them', async () => {
+    const served = await serve();
+    let starts = 0;
+    let peak = 0;
+    served.relay.on('start', () => starts++);
+    served.server.on('viewer:added', (count) => (peak = Math.max(peak, count)));
+    const removed: number[] = [];
+    served.server.on('viewer:removed', (count) => removed.push(count));
+    try {
+      await Promise.all([pull(served.server.url, fixtures.path('a.mp4')), pull(served.server.url, fixtures.path('b.mp4'))]);
+      expect(starts).toBe(1);
+      expect(peak).toBe(2);
+      await until(() => removed.length === 2, 5000, 'both viewers to leave');
+      expect(served.server.viewers).toBe(0);
+    } finally {
+      await shutdown(served);
+    }
+  }, 40_000);
+
+  it('answers 404 for another path and does not touch the upstream', async () => {
+    const served = await serve();
+    const client = await RtspTestClient.connect(portOf(served.server));
+    try {
+      const response = await client.request('DESCRIBE', `rtsp://127.0.0.1:${portOf(served.server)}/other`);
+      expect(response.status).toBe(404);
+      expect(served.relay.status).toBe('idle');
+    } finally {
+      client.close();
+      await shutdown(served);
+    }
+  });
+
+  it('sends a real RTP-Info on PLAY and streams interleaved media', async () => {
+    const served = await serve();
+    const base = `rtsp://127.0.0.1:${portOf(served.server)}/live`;
+    const client = await RtspTestClient.connect(portOf(served.server));
+    try {
+      const describe = await client.request('DESCRIBE', base);
+      expect(describe.status).toBe(200);
+      expect(describe.body).toContain('a=control:streamid=0');
+      expect(describe.body).toContain('a=control:streamid=1');
+
+      const setup = await client.request('SETUP', `${base}/streamid=0`, { Transport: 'RTP/AVP/TCP;unicast;interleaved=0-1' });
+      const session = setup.headers.session.split(';')[0];
+      await client.request('SETUP', `${base}/streamid=1`, { Transport: 'RTP/AVP/TCP;unicast;interleaved=2-3', Session: session });
+      const play = await client.request('PLAY', base, { Session: session });
+
+      expect(play.status).toBe(200);
+      expect(play.headers['rtp-info']).toMatch(new RegExp(`^url=${base}/streamid=0;seq=\\d+;rtptime=\\d+,url=${base}/streamid=1;seq=\\d+;rtptime=\\d+$`));
+      await until(() => client.frames > 10, 5000, 'interleaved media');
+    } finally {
+      client.close();
+      await shutdown(served);
+    }
+  }, 15_000);
+
+  it('disconnects its viewers when the upstream ends', async () => {
+    const served = await serve({}, new AvSource(av, { readrate: 1 }));
+    const base = `rtsp://127.0.0.1:${portOf(served.server)}/live`;
+    const client = await RtspTestClient.connect(portOf(served.server));
+    try {
+      await client.request('DESCRIBE', base);
+      await client.request('SETUP', `${base}/streamid=0`, { Transport: 'RTP/AVP/TCP;unicast;interleaved=0-1' });
+      await client.request('PLAY', base);
+      await client.waitClosed();
+      expect(served.relay.status).not.toBe('running');
+    } finally {
+      client.close();
+      await shutdown(served);
+    }
+  }, 15_000);
+
+  it('requires credentials when auth is set', async () => {
+    const served = await serve({ auth: new RtspAuth({ username: 'viewer', password: 'secret' }) });
+    expect(served.server.url).toMatch(/^rtsp:\/\/viewer:\*\*\*@127\.0\.0\.1:\d+\/live$/);
+    const url = `rtsp://127.0.0.1:${portOf(served.server)}/live`;
+    try {
+      await expect(pull(url, fixtures.path('denied.mp4'))).rejects.toThrow(/401|Unauthorized/);
+      const out = fixtures.path('authorized.mp4');
+      await pull(url.replace('rtsp://', 'rtsp://viewer:secret@'), out);
+      expect((await probe(out)).length).toBe(2);
+    } finally {
+      await shutdown(served);
+    }
+  }, 40_000);
+
+  it('re-encodes audio across a loop boundary', async () => {
+    // the transcoder emits its first packet late, the SDP must wait for it, and a pull longer than
+    // the 2s clip crosses a loop boundary where timestamps must stay monotonic
+    const served = await serve({ transcode: { audio: { codec: 'aac', sampleRate: 16000, channels: 1, bitRate: 32_000 } } });
+    try {
+      const out = fixtures.path('transcoded-audio.mp4');
+      await pull(served.server.url, out, 3);
+      const streams = await probe(out);
+      expect(streams.map((stream) => stream.codec)).toEqual(['h264', 'aac']);
+    } finally {
+      await shutdown(served);
+    }
+  }, 45_000);
+});
+
+suite('RtspServerSink MJPEG to H.264', () => {
+  let fixtures: Fixtures;
+  let mjpeg: string;
+
+  beforeAll(async () => {
+    fixtures = await Fixtures.create();
+    mjpeg = await fixtures.clip('mjpeg');
+  }, 30_000);
+
+  afterAll(async () => {
+    await fixtures?.dispose();
+  });
+
+  async function pullTranscoded(hardware: boolean): Promise<{ codec: string | null; type: number }[]> {
+    const relay = new Relay({ source: new AvSource(mjpeg, { format: 'mpjpeg', readrate: 1, loop: true }) });
+    const server = await new RtspServerSink(relay, { transcode: { hardware, video: { codec: 'h264', bitRate: 500_000 } } }).listen();
+    try {
+      const out = fixtures.path(`mjpeg-${hardware ? 'hw' : 'sw'}.mp4`);
+      await pull(server.url, out);
+      return await probe(out);
+    } finally {
+      await server.shutdown();
+      await relay.stop();
+    }
+  }
+
+  it('serves a software encoded H.264 stream', async () => {
+    expect(await pullTranscoded(false)).toEqual([{ type: AVMEDIA_TYPE_VIDEO, codec: 'h264' }]);
+  }, 30_000);
+
+  it('serves H.264 with hardware encoding, falling back to software', async () => {
+    expect(await pullTranscoded(true)).toEqual([{ type: AVMEDIA_TYPE_VIDEO, codec: 'h264' }]);
+  }, 30_000);
+
+  it('serves live MJPEG with the audio of a second input', async () => {
+    // an mjpeg camera sends audio on a connection of its own, both arrive untimed
+    const [video, audio] = await Promise.all([readFile(await fixtures.clip('mjpeg', 4)), readFile(await fixtures.clip('mulaw', 4))]);
+    const feeds = [
+      { feed: new PassThrough(), data: video },
+      { feed: new PassThrough(), data: audio },
+    ];
+    const source = new MultiSource([
+      { input: feeds[0].feed, format: 'mpjpeg', wallclock: true },
+      { input: feeds[1].feed, format: 'wav', wallclock: true },
+    ]);
+    const relay = new Relay({ source });
+    // mpjpeg reports the end of the feed as invalid data
+    relay.on('error', () => undefined);
+    const server = await new RtspServerSink(relay, { transcode: { hardware: false, video: { codec: 'h264' }, audio: { codec: 'aac' } } }).listen();
+    try {
+      const out = fixtures.path('mjpeg-audio.mp4');
+      const pulled = pull(server.url, out, 2);
+      // four seconds of both, at the pace a camera sends them
+      const chunks = 80;
+      for (let i = 0; i < chunks; i++) {
+        for (const { feed, data } of feeds) {
+          const size = Math.ceil(data.length / chunks);
+          feed.write(data.subarray(i * size, (i + 1) * size));
+        }
+        await delay(50);
+      }
+      await pulled;
+      expect(await probe(out)).toEqual([
+        { type: AVMEDIA_TYPE_VIDEO, codec: 'h264' },
+        { type: AVMEDIA_TYPE_AUDIO, codec: 'aac' },
+      ]);
+    } finally {
+      for (const { feed } of feeds) feed.end();
       await server.shutdown();
       await relay.stop();
     }
   }, 30_000);
+});
 
-  it('keeps one upstream connection across two concurrent pullers', async () => {
-    const source = new AvSource(sample, { readrate: 1, loop: true });
-    const relay = new Relay({ source });
-    let opens = 0;
-    relay.on('start', () => opens++);
+suite('RtspServerSink stream lifecycle', () => {
+  let fixtures: Fixtures;
+  let av: string;
+  let info: StreamInfo;
+  let source: AvSource;
+  let packets: MediaPacket[];
 
-    const server = await relay.serveRtsp({ path: 'live' });
-    const out1 = join(dir, 'a.mp4');
-    const out2 = join(dir, 'b.mp4');
+  beforeAll(async () => {
+    fixtures = await Fixtures.create();
+    av = await fixtures.clip('av', 1);
+    source = new AvSource(av);
+    info = await source.open();
+    packets = [];
+    for await (const packet of source.packets(new AbortController().signal)) packets.push(packet);
+  }, 30_000);
 
-    try {
-      await Promise.all([
-        execFileAsync(ffmpegPath(), ['-y', '-rtsp_transport', 'tcp', '-i', server.url, '-t', '1', '-c', 'copy', out1], { timeout: 25_000 }),
-        execFileAsync(ffmpegPath(), ['-y', '-rtsp_transport', 'tcp', '-i', server.url, '-t', '1', '-c', 'copy', out2], { timeout: 25_000 }),
-      ]);
+  afterAll(async () => {
+    for (const packet of packets ?? []) packet.free();
+    await source?.close();
+    await fixtures?.dispose();
+  });
 
-      expect((await stat(out1)).size).toBeGreaterThan(0);
-      expect((await stat(out2)).size).toBeGreaterThan(0);
-      // Both clients were served from a single upstream open.
-      expect(opens).toBe(1);
-    } finally {
-      await server.shutdown();
-      await relay.stop();
+  function feed(sink: RtspServerSink, filter: (packet: MediaPacket) => boolean = () => true): void {
+    for (const packet of packets) {
+      if (!filter(packet)) continue;
+      const copy = packet.clone();
+      try {
+        sink.write(copy);
+      } finally {
+        copy.free();
+      }
     }
-  }, 40_000);
+  }
 
-  it('serves transcoded audio across a loop boundary: the SDP waits for the re-encoded track header', async () => {
-    // Regression 1: the transcode path buffers before it muxes its first packet.
-    // The SDP must not be generated until that header exists, or the audio
-    // media section carries unresolved codec parameters and clients fail SETUP.
-    // Regression 2: pulling for longer than the 2s sample forces the client
-    // across a loop boundary — without timestamp rebasing the stream turns
-    // non-monotonic there and the pull never completes.
-    // Server-side diagnostics go to the test output: on slow CI runners this
-    // test is the first to surface timing bugs, and without the sink/session
-    // logs a failure here is undiagnosable.
-    const logger = {
-      debug: (...args: unknown[]) => console.log('[server:debug]', ...args),
-      warn: (...args: unknown[]) => console.warn('[server:warn]', ...args),
-      error: (...args: unknown[]) => console.error('[server:error]', ...args),
-    };
-    const relay = new Relay({ source: new AvSource(sample, { readrate: 1, loop: true, logger }), logger });
-    relay.on('error', (error) => console.error('[relay:error]', error));
-    relay.on('sink:error', (_sink, error) => console.error('[relay:sink-error]', error));
-    relay.on('end', () => console.log('[relay:end]'));
-    const server = await relay.serveRtsp({ path: 'live', audioTranscode: { codec: 'aac', bitRate: 32_000 } });
+  // the sink only uses pipe and unpipe of its relay here, there is no TCP and no pump
+  function fakeRelay(hooks: { pipe?: (sink: Sink) => void; unpipe?: (sink: Sink) => Promise<void> } = {}): Relay {
+    return { pipe: hooks.pipe ?? (() => undefined), unpipe: hooks.unpipe ?? (() => Promise.resolve()), source } as unknown as Relay;
+  }
 
-    const out = join(dir, 'transcoded.mp4');
+  it('leaves a track out that produces no data within sdpTimeout', async () => {
+    const sink = new RtspServerSink(fakeRelay(), { sdpTimeout: 300 });
     try {
-      // Hard-killed deadline well below the test timeout: teardown must run
-      // inside the test's lifetime, and the rejection carries ffmpeg's stderr
-      // tail so a stall is diagnosable from the CI log alone.
-      await runFfmpeg(['-y', '-rtsp_transport', 'tcp', '-i', server.url, '-t', '3', '-c', 'copy', out], 25_000);
+      sink.init(info);
+      const sdp = sink.describe({} as never);
+      const video = info.tracks.find((track) => track.kind === 'video')!;
+      feed(sink, (packet) => packet.streamIndex === video.index);
 
-      const demuxer = await Demuxer.open(out);
-      const kinds = demuxer.streams.map((s) => s.codecpar.codecType);
-      await demuxer.close();
-      // Both the passthrough video and the re-encoded audio arrived intact.
-      expect(kinds.length).toBeGreaterThanOrEqual(2);
+      const text = await sdp;
+      expect(text).toContain('m=video');
+      expect(text).not.toContain('m=audio');
+      // the remaining track keeps its id, viewers may have cached it
+      expect(text).toContain(`a=control:streamid=${info.tracks.indexOf(video)}`);
+      expect(sink.trackKind(info.tracks.findIndex((track) => track.kind === 'audio'))).toBeUndefined();
     } finally {
-      await server.shutdown();
-      await relay.stop();
+      sink.close();
     }
-  }, 45_000);
+  });
 
-  it('excludes a track that produces no RTP header within sdpTimeout', async () => {
-    const source = new AvSource(sample);
-    const info = await source.open();
-    // Drive the sink directly (no relay pump, no TCP) so we control exactly
-    // which tracks receive packets.
-    const fakeRelay = { pipe: () => undefined } as unknown as Relay;
-    const sink = new RtspServerSink(fakeRelay, { sdpTimeout: 300 });
-
+  it('rejects DESCRIBE when no track produces data within sdpTimeout', async () => {
+    const sink = new RtspServerSink(fakeRelay(), { sdpTimeout: 200 });
     try {
-      await sink.init(info);
-      const sdpPromise = sink.activate();
-
-      // Feed only video — the audio track never muxes and must be excluded.
-      const videoIndex = info.tracks.find((t) => t.kind === 'video')!.index;
-      const controller = new AbortController();
-      const feeding = (async () => {
-        for await (const packet of source.packets(controller.signal)) {
-          if (packet.streamIndex === videoIndex) await sink.write(packet);
-          packet.free();
-        }
-      })();
-
-      const sdp = await sdpPromise;
-      controller.abort();
-      await feeding;
-
-      expect(sdp).toContain('m=video');
-      expect(sdp).not.toContain('m=audio');
-      // The surviving track keeps its original streamid (its position in the
-      // servable track list), even though the audio section was removed.
-      const expectedId = info.tracks.findIndex((t) => t.kind === 'video');
-      expect(sdp).toContain(`a=control:streamid=${expectedId}`);
+      sink.init(info);
+      await expect(sink.describe({} as never)).rejects.toThrow(/no track produced data/i);
     } finally {
-      await sink.close();
-      await source.close();
+      sink.close();
     }
-  }, 15_000);
+  });
 
-  it('detaches from the relay only after the grace period, and not at all when a client returns', async () => {
-    const source = new AvSource(sample);
-    const info = await source.open();
+  it('rejects a waiting DESCRIBE when the stream closes', async () => {
+    const sink = new RtspServerSink(fakeRelay(), { sdpTimeout: 0 });
+    sink.init(info);
+    const sdp = sink.describe({} as never);
+    sink.close();
+    await expect(sdp).rejects.toThrow(/closed before its SDP/);
+  });
+
+  it('detaches only after the grace period and stays when a viewer returns', async () => {
     const calls = { pipe: 0, unpipe: 0 };
-    let sink: RtspServerSink = undefined!;
-    const fakeRelay = {
-      pipe: () => calls.pipe++,
-      unpipe: async () => {
-        calls.unpipe++;
-        await sink.close();
-      },
-    } as unknown as Relay;
-    sink = new RtspServerSink(fakeRelay, { detachDelay: 150, sdpTimeout: 0 });
-
+    const sink: RtspServerSink = new RtspServerSink(
+      fakeRelay({
+        pipe: () => {
+          calls.pipe++;
+          sink.init(info);
+        },
+        unpipe: () => {
+          calls.unpipe++;
+          sink.close();
+          return Promise.resolve();
+        },
+      }),
+      { detachDelay: 150, sdpTimeout: 0 },
+    );
     try {
-      await sink.init(info);
-      void sink.activate().catch(() => undefined);
-      const gone = {} as never;
-
-      // Last session leaves — the detach is scheduled, not immediate.
-      sink.sessionClosed(gone);
+      void sink.describe({} as never).catch(() => undefined);
+      sink.sessionClosed({} as never);
       expect(calls.unpipe).toBe(0);
 
-      // A DESCRIBE inside the window cancels it: the sink stays attached and
-      // its warm muxer/SDP state survives the client's reconnect gap.
+      // a DESCRIBE inside the window keeps the warm stream
       await delay(50);
-      void sink.activate().catch(() => undefined);
+      void sink.describe({} as never).catch(() => undefined);
       await delay(250);
       expect(calls.unpipe).toBe(0);
+      expect(calls.pipe).toBe(1);
 
-      // Nobody returns this time — detached exactly once after the delay.
-      sink.sessionClosed(gone);
+      sink.sessionClosed({} as never);
       await delay(250);
       expect(calls.unpipe).toBe(1);
     } finally {
-      await sink.close();
-      await source.close();
+      sink.close();
     }
-  }, 15_000);
+  });
 
-  it('re-attaches a DESCRIBE that races the detach begun by the last client leaving', async () => {
-    const source = new AvSource(sample);
-    const info = await source.open();
-    const packets: MediaPacket[] = [];
-    for await (const packet of source.packets(new AbortController().signal)) packets.push(packet);
-
-    let sink: RtspServerSink = undefined!;
+  it('re-attaches a DESCRIBE that races the detach of the last viewer', async () => {
     let pipes = 0;
-    let initDone = Promise.resolve();
-    const fakeRelay = {
-      // Mirror the real relay: piping (re-)initializes the sink for the upstream.
-      pipe: () => {
-        pipes++;
-        initDone = sink.init(info);
-      },
-      unpipe: async () => sink.close(),
-    } as unknown as Relay;
-    sink = new RtspServerSink(fakeRelay, { detachDelay: 0, sdpTimeout: 0 });
-
-    const feedAll = async (): Promise<void> => {
-      for (const packet of packets) {
-        const copy = packet.clone();
-        await sink.write(copy);
-        copy.free();
-      }
-    };
-
+    let release!: () => void;
+    const sink: RtspServerSink = new RtspServerSink(
+      fakeRelay({
+        pipe: () => {
+          pipes++;
+          sink.init(info);
+        },
+        // a slow unpipe, the next DESCRIBE has to wait it out
+        unpipe: async () => {
+          await new Promise<void>((resolve) => (release = resolve));
+          sink.close();
+        },
+      }),
+      { detachDelay: 0, sdpTimeout: 0 },
+    );
     try {
-      const first = sink.activate();
-      await initDone;
-      await feedAll();
+      const first = sink.describe({} as never);
+      feed(sink);
       expect(await first).toContain('m=video');
 
-      // Last client leaves — with detachDelay 0 the teardown starts right
-      // away. The next DESCRIBE races it and must wait it out and re-attach,
-      // not be handed the stale SDP of a sink that is closing under it.
       sink.sessionClosed({} as never);
-      const second = sink.activate();
+      const second = sink.describe({} as never);
+      await delay(20);
+      expect(pipes).toBe(1);
+      release();
       await vi.waitFor(() => expect(pipes).toBe(2));
-      await initDone;
-      await feedAll();
+      feed(sink);
       expect(await second).toContain('m=video');
     } finally {
-      for (const packet of packets) packet.free();
-      await sink.close();
-      await source.close();
+      sink.close();
     }
-  }, 15_000);
+  });
 
-  it('rejects pending DESCRIBEs when no track produces a header within sdpTimeout', async () => {
-    const source = new AvSource(sample);
-    const info = await source.open();
-    const fakeRelay = { pipe: () => undefined } as unknown as Relay;
-    const sink = new RtspServerSink(fakeRelay, { sdpTimeout: 200 });
-
+  it('advertises the talkback track after the media tracks', async () => {
+    const sink = new RtspServerSink(fakeRelay(), {
+      sdpTimeout: 0,
+      backchannel: { advertise: { codec: 'pcm_alaw', payloadType: 8, clockRate: 8000, channels: 1 } },
+    });
     try {
-      await sink.init(info);
-      // No packets are ever written — the SDP must fail instead of hanging.
-      await expect(sink.activate()).rejects.toThrow(/no track produced an rtp header/i);
+      sink.init(info);
+      const sdp = sink.describe({} as never);
+      feed(sink);
+      const text = await sdp;
+      expect(text.endsWith('m=audio 0 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\na=sendonly\r\na=control:streamid=2\r\n')).toBe(true);
+      expect(sink.backchannelTrack).toBe(2);
+      expect(sink.trackKind(2)).toBe('audio');
+      expect(sink.backchannelFormat).toEqual({ codec: 'pcm_alaw', payloadType: 8, clockRate: 8000, channels: 1, fmtp: undefined });
     } finally {
-      await sink.close();
-      await source.close();
+      sink.close();
     }
-  }, 15_000);
+  });
+
+  it('refuses a stream without servable tracks', () => {
+    const sink = new RtspServerSink(fakeRelay());
+    expect(() => sink.init({ tracks: [{ index: 0, kind: 'data', codec: 'bin_data' }] })).toThrow(/no servable/);
+    expect(() => sink.init({ tracks: [{ index: 0, kind: 'audio', codec: 'aac' }] })).toThrow(/no servable/);
+    sink.close();
+  });
+
+  it('attaches through a transcoder when re-encoding is configured', async () => {
+    const piped: Sink[] = [];
+    const unpiped: Sink[] = [];
+    const relay = fakeRelay({
+      pipe: (sink) => piped.push(sink),
+      unpipe: (sink) => {
+        unpiped.push(sink);
+        return Promise.resolve();
+      },
+    });
+    const sink = new RtspServerSink(relay, { sdpTimeout: 0, detachDelay: 0, transcode: { hardware: false, video: { codec: 'h264' } } });
+    const describing = sink.describe({} as never).catch(() => undefined);
+    expect(piped[0]).toBeInstanceOf(TranscodeSink);
+    expect((piped[0] as TranscodeSink).sink).toBe(sink);
+    sink.sessionClosed({} as never);
+    await until(() => unpiped.length > 0, 1000, 'detach');
+    expect(unpiped[0]).toBe(piped[0]);
+    sink.close();
+    await describing;
+  });
+
+  it('stops listening on shutdown and can listen again', async () => {
+    const relay = new Relay({ source: new AvSource(av) });
+    const server = new RtspServerSink(relay);
+    await server.listen();
+    expect(await server.listen()).toBe(server);
+    const port = portOf(server);
+    await server.shutdown();
+    await expect(RtspTestClient.connect(port)).rejects.toThrow();
+    await server.listen();
+    await server.shutdown();
+  });
+
+  it('reports a port that is already taken', async () => {
+    const relay = new Relay({ source: new AvSource(av) });
+    const first = await new RtspServerSink(relay).listen();
+    const second = new RtspServerSink(relay, { port: portOf(first) });
+    try {
+      await expect(second.listen()).rejects.toThrow(/EADDRINUSE/);
+    } finally {
+      await first.shutdown();
+    }
+  });
 });

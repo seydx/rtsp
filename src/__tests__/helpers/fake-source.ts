@@ -1,17 +1,17 @@
 import type { MediaPacket, Source, StreamInfo } from '../../types.js';
 
 /**
- * Tracks how many packets are currently alive (cloned but not freed) so tests
- * can assert the relay never leaks native handles.
+ * Creates plain media packets and counts the live ones, so tests can assert
+ * that nothing leaks or is freed twice.
  */
 export class PacketTracker {
   live = 0;
-  totalCreated = 0;
+  created = 0;
 
-  make(init: { streamIndex: number; isKeyframe: boolean; pts?: number; tag?: string }): MediaPacket {
+  make(init: { streamIndex: number; isKeyframe: boolean; pts?: number }): MediaPacket {
     const create = (): MediaPacket => {
       this.live++;
-      this.totalCreated++;
+      this.created++;
       let freed = false;
       return {
         streamIndex: init.streamIndex,
@@ -29,7 +29,15 @@ export class PacketTracker {
   }
 }
 
-/** A push-driven {@link Source} for deterministic relay tests. */
+export interface FakeSourceOptions {
+  failOpen?: Error;
+  openDelay?: number;
+  closeDelay?: number;
+}
+
+/**
+ * A push-driven source for deterministic relay tests.
+ */
 export class FakeSource implements Source {
   opened = false;
   closed = false;
@@ -38,56 +46,66 @@ export class FakeSource implements Source {
 
   private buffer: MediaPacket[] = [];
   private ended = false;
+  private failure?: Error;
   private waiters: (() => void)[] = [];
 
   constructor(
     private readonly info: StreamInfo,
-    private readonly opts: { failOpen?: Error; openDelay?: number } = {},
+    private readonly options: FakeSourceOptions = {},
   ) {}
 
   async open(): Promise<StreamInfo> {
     this.openCount++;
-    if (this.opts.openDelay) await new Promise((resolve) => setTimeout(resolve, this.opts.openDelay));
-    if (this.opts.failOpen) throw this.opts.failOpen;
+    this.ended = false;
+    this.failure = undefined;
+    if (this.options.openDelay) await delay(this.options.openDelay);
+    if (this.options.failOpen) throw this.options.failOpen;
     this.opened = true;
+    this.closed = false;
     return this.info;
   }
 
-  /** Feed one packet to the (single) active iterator. */
   push(packet: MediaPacket): void {
     this.buffer.push(packet);
     this.notify();
   }
 
-  /** Signal end-of-stream. */
   end(): void {
     this.ended = true;
     this.notify();
   }
 
+  fail(error: Error): void {
+    this.failure = error;
+    this.notify();
+  }
+
   async *packets(signal: AbortSignal): AsyncIterable<MediaPacket> {
-    while (true) {
+    for (;;) {
       if (signal.aborted) return;
-      if (this.buffer.length > 0) {
-        yield this.buffer.shift()!;
+      const packet = this.buffer.shift();
+      if (packet) {
+        yield packet;
         continue;
       }
+      if (this.failure) throw this.failure;
       if (this.ended) return;
-      await this.waitNext(signal);
+      await this.next(signal);
     }
   }
 
   async close(): Promise<void> {
     this.closeCount++;
+    if (this.options.closeDelay) await delay(this.options.closeDelay);
+    this.opened = false;
     this.closed = true;
-    // Drop anything still buffered so the tracker can settle.
     for (const packet of this.buffer) packet.free();
     this.buffer = [];
   }
 
-  private waitNext(signal: AbortSignal): Promise<void> {
+  private next(signal: AbortSignal): Promise<void> {
     return new Promise<void>((resolve) => {
-      const done = () => {
+      const done = (): void => {
         signal.removeEventListener('abort', done);
         resolve();
       };
@@ -99,11 +117,17 @@ export class FakeSource implements Source {
   private notify(): void {
     const waiters = this.waiters;
     this.waiters = [];
-    for (const w of waiters) w();
+    for (const wake of waiters) wake();
   }
 }
 
-/** Resolve after the current microtask/timer queue drains. */
+/**
+ * Wait for timers and microtasks to settle.
+ */
 export function flush(ms = 0): Promise<void> {
+  return delay(ms);
+}
+
+function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

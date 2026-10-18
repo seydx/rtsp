@@ -1,11 +1,9 @@
-// CallbackSink
 export { CallbackSink } from './callback.js';
-export type { CallbackSinkHandlers } from './callback.js';
-
-// FfmpegSink
 export { FfmpegSink } from './ffmpeg.js';
-export type { FfmpegSinkOptions, FfmpegOutput } from './ffmpeg.js';
+export { RtspAuth } from './rtsp-server/auth.js';
+export { RtspServerSink } from './rtsp-server/rtsp-server-sink.js';
 
-// RTSP server sink
-export { RtspServerSink, RtspAuth } from './rtsp-server/index.js';
-export type { RtspServerSinkOptions, RtspServerEvents, RtspAuthConfig } from './rtsp-server/index.js';
+export type { CallbackSinkHandlers } from './callback.js';
+export type { FfmpegOutput, FfmpegSinkOptions } from './ffmpeg.js';
+export type { RtspAuthConfig, RtspAuthResult } from './rtsp-server/auth.js';
+export type { RtspBackchannelOptions, RtspServerEvents, RtspServerSinkOptions } from './rtsp-server/rtsp-server-sink.js';

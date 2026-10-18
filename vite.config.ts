@@ -15,19 +15,19 @@ export default defineConfig({
     }),
   ],
   build: {
-    target: 'node22',
+    target: 'node24',
     lib: {
       entry: {
         index: resolve(__dirname, 'src/index.ts'),
         'sources/index': resolve(__dirname, 'src/sources/index.ts'),
         'sinks/index': resolve(__dirname, 'src/sinks/index.ts'),
+        'transcode/index': resolve(__dirname, 'src/transcode/index.ts'),
       },
       formats: ['es'],
       fileName: (_format, entryName) => `${entryName}.js`,
     },
     rollupOptions: {
-      // Keep node built-ins and the native node-av binding external.
-      external: [/^node:/, 'node-av', /^node-av\//, 'get-port'],
+      external: [/^node:/, 'node-av', /^node-av\//],
       output: {
         preserveModules: false,
       },

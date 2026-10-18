@@ -1,152 +1,78 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 
 /**
- * Credentials and scheme configuration for RTSP server authentication.
- *
- * Describes the single account that an {@link RtspServerSink} will require
- * clients to authenticate against, along with the authentication scheme to
- * advertise and the protection realm presented in the challenge.
+ * Credentials and scheme of an {@link RtspAuth}.
  */
 export interface RtspAuthConfig {
   /**
-   * The account name a client must present.
-   *
-   * Compared verbatim against the username supplied by the client (the Basic
-   * credential pair or the Digest `username` parameter).
+   * Username clients must present.
    */
   username: string;
 
   /**
-   * The secret associated with {@link RtspAuthConfig.username}.
-   *
-   * Used to build the expected Basic credential or the Digest HA1 hash. Stored
-   * as provided; it is never sent to the client.
+   * Password clients must present.
    */
   password: string;
 
   /**
-   * The authentication scheme to advertise and enforce.
+   * Authentication scheme.
    *
-   * `Digest` performs a challenge-response exchange and never transmits the
-   * password over the wire, while `Basic` sends base64-encoded credentials and
-   * should only be used over a secured transport. Defaults to `Digest`.
+   * `Digest` never sends the password over the wire. `Basic` sends it base64
+   * encoded and should only be used on trusted networks.
+   *
+   * @default 'Digest'
    */
   method?: 'Basic' | 'Digest';
 
   /**
-   * The protection realm presented in the authentication challenge.
+   * Realm announced in the challenge.
    *
-   * Surfaced to clients in the `WWW-Authenticate` header and, for Digest, mixed
-   * into the HA1 hash. Defaults to `seydx-rtsp`.
+   * @default 'seydx-rtsp'
    */
   realm?: string;
 }
 
 /**
- * Compute the hex-encoded MD5 digest of a string.
+ * Outcome of checking a request's credentials.
  *
- * @param input - The string to hash
- *
- * @returns The lowercase hexadecimal MD5 digest
- *
- * @internal
+ * `stale` means the credentials are right but the Digest nonce expired, so the
+ * client can retry with a fresh nonce without asking the user again.
  */
-function md5(input: string): string {
-  return createHash('md5').update(input).digest('hex');
-}
+export type RtspAuthResult = 'ok' | 'stale' | 'denied';
 
-/**
- * Compare two strings in length- and content-constant time.
- *
- * Uses a timing-safe comparison so that credential checks do not leak
- * information about how many leading characters matched.
- *
- * @param a - The first string to compare
- *
- * @param b - The second string to compare
- *
- * @returns `true` if the strings are byte-for-byte equal
- *
- * @internal
- */
-function safeEqual(a: string, b: string): boolean {
-  const ba = Buffer.from(a);
-  const bb = Buffer.from(b);
-  return ba.length === bb.length && timingSafeEqual(ba, bb);
-}
-
-/**
- * Parse a `key=value, key="value"` parameter list from a Digest auth header.
- *
- * Keys are lowercased and quoted values are unquoted; both quoted and bare
- * value forms are accepted and trimmed.
- *
- * @param input - The parameter portion of the Authorization header
- *
- * @returns A map of lowercased parameter names to their values
- *
- * @internal
- */
-function parseParams(input: string): Record<string, string> {
-  const params: Record<string, string> = {};
-  const re = /(\w+)=(?:"([^"]*)"|([^,]*))/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(input)) !== null) {
-    params[m[1].toLowerCase()] = (m[2] ?? m[3] ?? '').trim();
-  }
-  return params;
-}
-
-// How long an issued Digest nonce stays acceptable. Long enough for a client
-// to complete its challenge/response handshake and keep re-using the nonce for
-// follow-up requests in the same session, short enough that a captured
-// Authorization header cannot be replayed indefinitely.
+// long enough for a session to reuse its nonce, short enough to limit replays of a captured header
 const NONCE_TTL_MS = 5 * 60 * 1000;
-
-// Upper bound on concurrently valid nonces, so a client hammering DESCRIBE
-// cannot grow the nonce table unbounded. Oldest entries are evicted first.
 const MAX_NONCES = 64;
 
 /**
- * Server-side RTSP authenticator for a single set of credentials.
+ * Basic or Digest authentication for {@link RtspServerSink}.
  *
- * Validates incoming client requests against one configured account using
- * either Basic or Digest authentication. It produces the challenge string the
- * server returns when credentials are missing or invalid, and verifies the
- * Authorization header that clients send in response. For Digest, every
- * challenge issues a fresh nonce with a limited lifetime, so a captured
- * Authorization header cannot be replayed after the window closes; all
- * credential comparisons run in constant time.
+ * Every request must carry valid credentials. Digest nonces expire after five
+ * minutes; a client that presents an expired nonce with the right credentials
+ * receives a `stale` challenge and retries transparently.
  *
  * @example
  * ```typescript
- * import { RtspAuth } from '@seydx/rtsp';
+ * import { RtspAuth, RtspServerSink } from '@seydx/rtsp';
  *
- * const auth = new RtspAuth({ username: 'admin', password: 'secret' });
- *
- * // On a missing or rejected request, return the challenge to the client:
- * const wwwAuthenticate = auth.challenge();
- *
- * // When a client retries with an Authorization header, verify it:
- * const ok = auth.verify('DESCRIBE', 'rtsp://host/stream', authorizationHeader);
+ * const auth = new RtspAuth({ username: 'viewer', password: 'secret' });
+ * const server = await new RtspServerSink(relay, { auth }).listen();
  * ```
  *
- * @see {@link RtspServerSink} For the sink that enforces authentication
+ * @see {@link RtspServerSink} For the server that uses it
  */
 export class RtspAuth {
   private readonly realm: string;
-
-  /** Issued Digest nonces mapped to their expiry timestamp (insertion-ordered). */
   private readonly nonces = new Map<string, number>();
 
   /**
-   * Create an authenticator for a single account.
+   * Create an authenticator.
    *
-   * @param config - Credentials, scheme, and realm to enforce
+   * @param config - Credentials, scheme and realm
    *
    * @example
    * ```typescript
-   * const auth = new RtspAuth({ username: 'admin', password: 'secret', method: 'Digest' });
+   * const auth = new RtspAuth({ username: 'viewer', password: 'secret', method: 'Basic' });
    * ```
    */
   constructor(private readonly config: RtspAuthConfig) {
@@ -154,15 +80,11 @@ export class RtspAuth {
   }
 
   /**
-   * The authentication scheme this instance enforces.
-   *
-   * Resolves the configured method, defaulting to `Digest` when unset.
+   * The authentication scheme in use.
    *
    * @example
    * ```typescript
-   * if (auth.method === 'Basic') {
-   *   // credentials will be sent base64-encoded
-   * }
+   * console.log(auth.method); // 'Digest'
    * ```
    */
   get method(): 'Basic' | 'Digest' {
@@ -170,11 +92,11 @@ export class RtspAuth {
   }
 
   /**
-   * The account name clients must present.
+   * The expected username.
    *
    * @example
    * ```typescript
-   * console.log(`expecting login for ${auth.username}`);
+   * console.log(auth.username);
    * ```
    */
   get username(): string {
@@ -182,79 +104,63 @@ export class RtspAuth {
   }
 
   /**
-   * Build the value for the `WWW-Authenticate` response header.
+   * Build the `WWW-Authenticate` header for a 401 response.
    *
-   * Returns the challenge appropriate to the configured scheme: a realm-only
-   * challenge for Basic, or a realm plus a freshly issued, time-limited nonce
-   * for Digest. Send this when a request arrives without credentials or fails
-   * verification.
+   * @param stale - Mark the challenge stale after an expired Digest nonce
    *
-   * @returns The header value to return to the client
+   * @returns The header value with a fresh nonce for Digest
    *
    * @example
    * ```typescript
-   * response.setHeader('WWW-Authenticate', auth.challenge());
+   * const header = auth.challenge();
    * ```
    */
-  challenge(): string {
-    if (this.method === 'Basic') {
-      return `Basic realm="${this.realm}"`;
-    }
-    return `Digest realm="${this.realm}", nonce="${this.issueNonce()}"`;
+  challenge(stale = false): string {
+    if (this.method === 'Basic') return `Basic realm="${this.realm}"`;
+    return `Digest realm="${this.realm}", nonce="${this.issueNonce()}"${stale ? ', stale=TRUE' : ''}`;
   }
 
   /**
-   * Validate the `Authorization` header for a given RTSP request.
+   * Check the `Authorization` header of a request.
    *
-   * For Basic, compares the supplied base64 credentials against the configured
-   * pair. For Digest, recomputes the expected response from the realm, nonce,
-   * method, and URI and matches it against the client's value. All comparisons
-   * are constant-time, and a missing or malformed header is rejected.
+   * @param method - RTSP method of the request, for example `DESCRIBE`
    *
-   * @param rtspMethod - The RTSP method of the request (e.g. `DESCRIBE`, `SETUP`)
+   * @param uri - Request URI, used when the header names none
    *
-   * @param uri - The request URI, used as the Digest fallback when the header omits one
+   * @param header - The `Authorization` header, if present
    *
-   * @param header - The raw `Authorization` header value, if present
-   *
-   * @returns `true` if the credentials are valid for this request
+   * @returns `ok`, `stale` for right credentials with an expired nonce, or `denied`
    *
    * @example
    * ```typescript
-   * if (!auth.verify(method, uri, request.headers['authorization'])) {
-   *   response.statusCode = 401;
-   *   response.setHeader('WWW-Authenticate', auth.challenge());
-   * }
+   * if (auth.verify('DESCRIBE', uri, headers.authorization) !== 'ok') reject();
    * ```
    */
-  verify(rtspMethod: string, uri: string, header: string | undefined): boolean {
-    if (!header) return false;
-    const [scheme, ...rest] = header.split(' ');
-    const value = rest.join(' ');
+  verify(method: string, uri: string, header: string | undefined): RtspAuthResult {
+    if (!header) return 'denied';
+    const space = header.indexOf(' ');
+    const scheme = (space === -1 ? header : header.slice(0, space)).toLowerCase();
+    const value = space === -1 ? '' : header.slice(space + 1).trim();
 
     if (this.method === 'Basic') {
-      if (scheme.toLowerCase() !== 'basic') return false;
+      if (scheme !== 'basic') return 'denied';
       const expected = Buffer.from(`${this.config.username}:${this.config.password}`).toString('base64');
-      return safeEqual(value, expected);
+      return safeEqual(value, expected) ? 'ok' : 'denied';
     }
 
-    if (scheme.toLowerCase() !== 'digest') return false;
-    const p = parseParams(value);
-    if (p.username !== this.config.username || !p.nonce || !this.isNonceValid(p.nonce)) return false;
-
+    if (scheme !== 'digest') return 'denied';
+    const params = parseParams(value);
+    if (params.username !== this.config.username || !params.nonce) return 'denied';
     const ha1 = md5(`${this.config.username}:${this.realm}:${this.config.password}`);
-    const ha2 = md5(`${rtspMethod}:${p.uri || uri}`);
-    const expected = md5(`${ha1}:${p.nonce}:${ha2}`);
-    return safeEqual(p.response ?? '', expected);
+    const ha2 = md5(`${method}:${params.uri || uri}`);
+    if (!safeEqual(params.response ?? '', md5(`${ha1}:${params.nonce}:${ha2}`))) return 'denied';
+    return this.isNonceValid(params.nonce) ? 'ok' : 'stale';
   }
 
   /**
-   * Generate, register, and return a fresh Digest nonce.
+   * Create and remember a nonce, evicting the oldest beyond the limit.
    *
-   * The nonce is stored with its expiry; the oldest entries are evicted once
-   * the table exceeds its bound so hostile clients cannot grow it unbounded.
-   *
-   * @returns The newly issued nonce value
+   * @returns The nonce
    *
    * @internal
    */
@@ -262,19 +168,19 @@ export class RtspAuth {
     this.pruneNonces();
     const nonce = randomBytes(16).toString('hex');
     this.nonces.set(nonce, Date.now() + NONCE_TTL_MS);
-    while (this.nonces.size > MAX_NONCES) {
-      const oldest = this.nonces.keys().next().value!;
+    for (const oldest of this.nonces.keys()) {
+      if (this.nonces.size <= MAX_NONCES) break;
       this.nonces.delete(oldest);
     }
     return nonce;
   }
 
   /**
-   * Check whether a client-presented nonce was issued here and is still fresh.
+   * Whether a nonce was issued here and has not expired.
    *
-   * @param nonce - The nonce from the Authorization header
+   * @param nonce - The nonce to check
    *
-   * @returns `true` if the nonce is known and unexpired
+   * @returns `true` if it is still valid
    *
    * @internal
    */
@@ -284,7 +190,7 @@ export class RtspAuth {
   }
 
   /**
-   * Drop expired nonces from the table.
+   * Drop expired nonces.
    *
    * @internal
    */
@@ -294,4 +200,51 @@ export class RtspAuth {
       if (expires <= now) this.nonces.delete(nonce);
     }
   }
+}
+
+/**
+ * Hex MD5 digest of a string.
+ *
+ * @param input - The string to hash
+ *
+ * @returns The digest
+ *
+ * @internal
+ */
+function md5(input: string): string {
+  return createHash('md5').update(input).digest('hex');
+}
+
+/**
+ * Constant-time string comparison.
+ *
+ * @param a - First string
+ *
+ * @param b - Second string
+ *
+ * @returns `true` if both are equal
+ *
+ * @internal
+ */
+function safeEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+/**
+ * Parse the comma-separated `key=value` list of a Digest header.
+ *
+ * @param input - The header value after the scheme
+ *
+ * @returns The parameters with lower-case keys
+ *
+ * @internal
+ */
+function parseParams(input: string): Record<string, string> {
+  const params: Record<string, string> = {};
+  for (const match of input.matchAll(/(\w+)=(?:"([^"]*)"|([^,]*))/g)) {
+    params[match[1].toLowerCase()] = (match[2] ?? match[3] ?? '').trim();
+  }
+  return params;
 }

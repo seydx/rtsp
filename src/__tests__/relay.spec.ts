@@ -1,10 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import { Relay } from '../relay.js';
 import { CallbackSink } from '../sinks/callback.js';
 import { FakeSource, flush, PacketTracker } from './helpers/fake-source.js';
 
-import type { MediaPacket, StreamInfo } from '../types.js';
+import type { MediaPacket, Sink, StreamInfo } from '../types.js';
 
 const AV_INFO: StreamInfo = {
   tracks: [
@@ -13,129 +13,276 @@ const AV_INFO: StreamInfo = {
   ],
 };
 
-const AUDIO_ONLY: StreamInfo = {
-  tracks: [{ index: 0, kind: 'audio', codec: 'aac' }],
-};
+const AUDIO_ONLY: StreamInfo = { tracks: [{ index: 0, kind: 'audio', codec: 'aac' }] };
 
-function collector() {
+const relays: Relay[] = [];
+
+afterEach(async () => {
+  await Promise.all(relays.splice(0).map((relay) => relay.stop()));
+});
+
+function createRelay(...args: ConstructorParameters<typeof Relay>): Relay {
+  const relay = new Relay(...args);
+  relays.push(relay);
+  return relay;
+}
+
+function collector(options: { slow?: number } = {}) {
   const packets: MediaPacket[] = [];
-  let inited: StreamInfo | undefined;
-  let closed = false;
+  const state = { info: undefined as StreamInfo | undefined, closed: false, inits: 0 };
   const sink = new CallbackSink({
     onInit: (info) => {
-      inited = info;
+      state.info = info;
+      state.inits++;
     },
-    onPacket: (p) => {
-      packets.push(p);
+    onPacket: async (packet) => {
+      packets.push(packet);
+      if (options.slow) await flush(options.slow);
     },
     onClose: () => {
-      closed = true;
+      state.closed = true;
     },
   });
-  return {
-    sink,
-    packets,
-    get inited() {
-      return inited;
-    },
-    get closed() {
-      return closed;
-    },
-  };
+  return { sink, packets, state };
 }
 
 describe('Relay lifecycle', () => {
-  it('lazily opens the source on the first sink and closes when the last leaves', async () => {
+  it('opens the source for the first sink and closes it after the last one left', async () => {
     const source = new FakeSource(AV_INFO);
-    const relay = new Relay({ source });
-
+    const relay = createRelay({ source });
     expect(relay.status).toBe('idle');
-    expect(source.openCount).toBe(0);
 
     const c = collector();
     relay.pipe(c.sink);
     await flush();
-
     expect(source.openCount).toBe(1);
     expect(relay.status).toBe('running');
-    expect(c.inited).toEqual(AV_INFO);
+    expect(relay.info).toEqual(AV_INFO);
+    expect(c.state.info).toEqual(AV_INFO);
 
     await relay.unpipe(c.sink);
     await flush();
-
     expect(source.closeCount).toBe(1);
     expect(relay.status).toBe('idle');
-    expect(c.closed).toBe(true);
+    expect(relay.info).toBeUndefined();
+    expect(c.state.closed).toBe(true);
   });
 
-  it('keeps a single upstream connection for many sinks', async () => {
+  it('holds one upstream connection for many sinks', async () => {
     const source = new FakeSource(AV_INFO);
-    const relay = new Relay({ source });
-
-    const a = collector();
-    const b = collector();
-    const cc = collector();
-    relay.pipe(a.sink);
-    relay.pipe(b.sink);
-    relay.pipe(cc.sink);
+    const relay = createRelay({ source });
+    for (let i = 0; i < 3; i++) relay.pipe(collector().sink);
     await flush();
-
     expect(source.openCount).toBe(1);
     expect(relay.sinkCount).toBe(3);
   });
 
-  it('respects idleTimeout before tearing down', async () => {
+  it('keeps the upstream open for idleTimeout after the last sink left', async () => {
     const source = new FakeSource(AV_INFO);
-    const relay = new Relay({ source, idleTimeout: 50 });
-
+    const relay = createRelay({ source, idleTimeout: 50 });
     const c = collector();
     relay.pipe(c.sink);
     await flush();
     await relay.unpipe(c.sink);
-
-    // Still alive immediately after the last sink leaves.
     expect(relay.status).toBe('running');
 
     await flush(80);
     expect(relay.status).toBe('idle');
     expect(source.closeCount).toBe(1);
   });
+
+  it('reuses the running upstream when a sink returns within idleTimeout', async () => {
+    const source = new FakeSource(AV_INFO);
+    const relay = createRelay({ source, idleTimeout: 50 });
+    const first = collector();
+    relay.pipe(first.sink);
+    await flush();
+    await relay.unpipe(first.sink);
+
+    relay.pipe(collector().sink);
+    await flush(80);
+    expect(relay.status).toBe('running');
+    expect(source.openCount).toBe(1);
+  });
+
+  it('opens right away with autoStart and stays up without sinks', async () => {
+    const source = new FakeSource(AV_INFO);
+    const relay = createRelay({ source, autoStart: true });
+    await flush(20);
+    expect(relay.status).toBe('running');
+    expect(source.openCount).toBe(1);
+  });
+
+  it('emits sink:added and sink:removed', async () => {
+    const relay = createRelay({ source: new FakeSource(AV_INFO) });
+    const events: string[] = [];
+    relay.on('sink:added', () => events.push('added'));
+    relay.on('sink:removed', () => events.push('removed'));
+    const c = collector();
+    relay.pipe(c.sink);
+    await flush();
+    await relay.unpipe(c.sink);
+    expect(events).toEqual(['added', 'removed']);
+  });
+
+  it('ignores unpipe of an unknown sink', async () => {
+    const relay = createRelay({ source: new FakeSource(AV_INFO) });
+    await expect(relay.unpipe(collector().sink)).resolves.toBeUndefined();
+  });
+});
+
+describe('Relay start and stop races', () => {
+  it('restarts for a sink piped while the previous cycle is stopping', async () => {
+    const source = new FakeSource(AV_INFO, { closeDelay: 30 });
+    const tracker = new PacketTracker();
+    const relay = createRelay({ source });
+
+    const first = collector();
+    relay.pipe(first.sink);
+    await flush();
+    void relay.unpipe(first.sink);
+    await flush(5);
+    expect(relay.status).toBe('stopping');
+
+    const second = collector();
+    relay.pipe(second.sink);
+    await flush(60);
+    expect(relay.status).toBe('running');
+    expect(source.openCount).toBe(2);
+    expect(second.state.inits).toBe(1);
+
+    source.push(tracker.make({ streamIndex: 0, isKeyframe: true }));
+    await flush();
+    expect(second.packets).toHaveLength(1);
+  });
+
+  it('shares one teardown between concurrent stop calls', async () => {
+    const source = new FakeSource(AV_INFO, { closeDelay: 20 });
+    const relay = createRelay({ source });
+    let stops = 0;
+    relay.on('stop', () => stops++);
+    relay.pipe(collector().sink);
+    await flush();
+
+    const first = relay.stop();
+    const second = relay.stop();
+    await second;
+    expect(relay.status).toBe('idle');
+    await first;
+    expect(stops).toBe(1);
+    expect(source.closeCount).toBe(1);
+  });
+
+  it('never goes running after a stop during a pending start', async () => {
+    const source = new FakeSource(AV_INFO, { openDelay: 20 });
+    const relay = createRelay({ source });
+    const errors: unknown[] = [];
+    relay.on('error', (error) => errors.push(error));
+
+    const started = relay.start();
+    expect(relay.status).toBe('starting');
+    await relay.stop();
+    expect(relay.status).toBe('idle');
+
+    await flush(50);
+    expect(relay.status).toBe('idle');
+    await started;
+    expect(errors).toHaveLength(0);
+    // the open finished after the teardown, the relay closes it again
+    expect(source.opened).toBe(false);
+  });
+
+  it('starts again after a stop that interrupted a start', async () => {
+    const source = new FakeSource(AV_INFO, { openDelay: 10 });
+    const relay = createRelay({ source });
+    void relay.start();
+    await relay.stop();
+    await flush(30);
+
+    const c = collector();
+    relay.pipe(c.sink);
+    await flush(30);
+    expect(relay.status).toBe('running');
+    expect(c.state.info).toEqual(AV_INFO);
+  });
+
+  it('shares one start between concurrent start calls', async () => {
+    const source = new FakeSource(AV_INFO, { openDelay: 10 });
+    const relay = createRelay({ source });
+    await Promise.all([relay.start(), relay.start(), relay.start()]);
+    expect(source.openCount).toBe(1);
+    expect(relay.status).toBe('running');
+  });
+});
+
+describe('Relay upstream end', () => {
+  it('writes the backlog of every sink, then emits end and stop', async () => {
+    const source = new FakeSource(AUDIO_ONLY);
+    const tracker = new PacketTracker();
+    const relay = createRelay({ source });
+    const events: string[] = [];
+    relay.on('end', () => events.push('end'));
+    relay.on('stop', () => events.push('stop'));
+
+    const slow = collector({ slow: 5 });
+    relay.pipe(slow.sink);
+    await flush();
+    for (let i = 0; i < 5; i++) source.push(tracker.make({ streamIndex: 0, isKeyframe: true }));
+    source.end();
+    await flush(80);
+
+    expect(slow.packets).toHaveLength(5);
+    expect(slow.state.closed).toBe(true);
+    expect(events).toEqual(['end', 'stop']);
+    expect(relay.status).toBe('idle');
+    expect(tracker.live).toBe(0);
+  });
+
+  it('emits error and stops when the running upstream fails', async () => {
+    const source = new FakeSource(AUDIO_ONLY);
+    const relay = createRelay({ source });
+    const errors: unknown[] = [];
+    relay.on('error', (error) => errors.push(error));
+    relay.pipe(collector().sink);
+    await flush();
+
+    source.fail(new Error('connection reset'));
+    await flush(20);
+    expect(errors).toHaveLength(1);
+    expect(relay.status).toBe('idle');
+    expect(source.closed).toBe(true);
+  });
 });
 
 describe('Relay keyframe gating', () => {
-  it('mutes a video sink until the next keyframe', async () => {
+  it('holds a video sink back until the next keyframe', async () => {
     const source = new FakeSource(AV_INFO);
     const tracker = new PacketTracker();
-    const relay = new Relay({ source });
-
+    const relay = createRelay({ source });
     const c = collector();
     relay.pipe(c.sink);
     await flush();
 
-    // Pre-roll: delta video + audio before any keyframe — all dropped.
     source.push(tracker.make({ streamIndex: 0, isKeyframe: false }));
     source.push(tracker.make({ streamIndex: 1, isKeyframe: true }));
     await flush();
-    expect(c.packets.length).toBe(0);
+    expect(c.packets).toHaveLength(0);
 
-    // Keyframe opens the gate; subsequent packets flow.
     source.push(tracker.make({ streamIndex: 0, isKeyframe: true }));
     source.push(tracker.make({ streamIndex: 1, isKeyframe: true }));
     source.push(tracker.make({ streamIndex: 0, isKeyframe: false }));
     await flush();
-
-    expect(c.packets.map((p) => [p.streamIndex, p.isKeyframe])).toEqual([
+    expect(c.packets.map((packet) => [packet.streamIndex, packet.isKeyframe])).toEqual([
       [0, true],
       [1, true],
       [0, false],
     ]);
   });
 
-  it('delivers immediately for audio-only sources (no keyframe gate)', async () => {
+  it('does not gate audio-only sources', async () => {
     const source = new FakeSource(AUDIO_ONLY);
     const tracker = new PacketTracker();
-    const relay = new Relay({ source });
-
+    const relay = createRelay({ source });
     const c = collector();
     relay.pipe(c.sink);
     await flush();
@@ -143,188 +290,176 @@ describe('Relay keyframe gating', () => {
     source.push(tracker.make({ streamIndex: 0, isKeyframe: false }));
     source.push(tracker.make({ streamIndex: 0, isKeyframe: false }));
     await flush();
-
-    expect(c.packets.length).toBe(2);
+    expect(c.packets).toHaveLength(2);
   });
 
-  it('gates a late joiner independently of established sinks', async () => {
+  it('gates a late sink independently of the established ones', async () => {
     const source = new FakeSource(AV_INFO);
     const tracker = new PacketTracker();
-    const relay = new Relay({ source });
-
+    const relay = createRelay({ source });
     const early = collector();
     relay.pipe(early.sink);
     await flush();
-
     source.push(tracker.make({ streamIndex: 0, isKeyframe: true }));
     source.push(tracker.make({ streamIndex: 0, isKeyframe: false }));
     await flush();
-    expect(early.packets.length).toBe(2);
 
-    // Late joiner mid-GOP — must wait for the next keyframe.
     const late = collector();
     relay.pipe(late.sink);
     await flush();
-
     source.push(tracker.make({ streamIndex: 0, isKeyframe: false }));
     await flush();
-    expect(late.packets.length).toBe(0);
-    expect(early.packets.length).toBe(3);
+    expect(late.packets).toHaveLength(0);
+    expect(early.packets).toHaveLength(3);
 
     source.push(tracker.make({ streamIndex: 0, isKeyframe: true }));
     await flush();
-    expect(late.packets.length).toBe(1);
-    expect(early.packets.length).toBe(4);
+    expect(late.packets).toHaveLength(1);
+    expect(early.packets).toHaveLength(4);
   });
 });
 
 describe('Relay packet ownership', () => {
-  it('frees every packet it clones and drops (no leaks)', async () => {
+  it('hands the original packet to a single sink without cloning', async () => {
     const source = new FakeSource(AV_INFO);
     const tracker = new PacketTracker();
-    const relay = new Relay({ source });
+    const relay = createRelay({ source });
+    const c = collector();
+    relay.pipe(c.sink);
+    await flush();
 
+    const packet = tracker.make({ streamIndex: 0, isKeyframe: true });
+    source.push(packet);
+    await flush();
+    expect(c.packets[0]).toBe(packet);
+    expect(tracker.created).toBe(1);
+  });
+
+  it('clones only for sinks that accept the packet', async () => {
+    const source = new FakeSource(AV_INFO);
+    const tracker = new PacketTracker();
+    const relay = createRelay({ source });
     const a = collector();
-    const b = collector();
     relay.pipe(a.sink);
+    await flush();
+    source.push(tracker.make({ streamIndex: 0, isKeyframe: true }));
+    await flush();
+
+    // b waits for a keyframe, so the delta frames cost no clone
+    const b = collector();
     relay.pipe(b.sink);
     await flush();
+    for (let i = 0; i < 3; i++) source.push(tracker.make({ streamIndex: 0, isKeyframe: false }));
+    await flush();
+    expect(tracker.created).toBe(4);
 
-    for (let i = 0; i < 10; i++) {
-      source.push(tracker.make({ streamIndex: 0, isKeyframe: i === 0, pts: i }));
-    }
+    source.push(tracker.make({ streamIndex: 0, isKeyframe: true }));
+    await flush();
+    expect(tracker.created).toBe(6);
+    expect(b.packets).toHaveLength(1);
+  });
+
+  it('frees every packet it cloned or dropped', async () => {
+    const source = new FakeSource(AV_INFO);
+    const tracker = new PacketTracker();
+    const relay = createRelay({ source });
+    relay.pipe(collector().sink);
+    relay.pipe(collector().sink);
     await flush();
 
+    for (let i = 0; i < 10; i++) source.push(tracker.make({ streamIndex: 0, isKeyframe: i === 0, pts: i }));
+    await flush();
     await relay.stop();
-    await flush();
-
     expect(tracker.live).toBe(0);
-    expect(tracker.totalCreated).toBeGreaterThan(0);
+    expect(tracker.created).toBeGreaterThan(10);
   });
 });
 
 describe('Relay error handling', () => {
   it('emits error and stays idle when the source fails to open', async () => {
-    const source = new FakeSource(AV_INFO, { failOpen: new Error('boom') });
-    const relay = new Relay({ source });
+    const relay = createRelay({ source: new FakeSource(AV_INFO, { failOpen: new Error('boom') }) });
     const errors: unknown[] = [];
-    relay.on('error', (e) => errors.push(e));
-
+    relay.on('error', (error) => errors.push(error));
     const c = collector();
     relay.pipe(c.sink);
     await flush();
-
     expect(relay.status).toBe('idle');
     expect(errors).toHaveLength(1);
+    expect(c.state.closed).toBe(true);
   });
 
-  it('tears down with an error when the running upstream goes silent past stallTimeout', async () => {
+  it('rejects start() when the source fails to open', async () => {
+    const relay = createRelay({ source: new FakeSource(AV_INFO, { failOpen: new Error('boom') }) });
+    await expect(relay.start()).rejects.toThrow('boom');
+  });
+
+  it('stops with an error when the upstream stalls past stallTimeout', async () => {
     const source = new FakeSource(AUDIO_ONLY);
     const tracker = new PacketTracker();
-    const relay = new Relay({ source, stallTimeout: 120 });
+    const relay = createRelay({ source, stallTimeout: 120 });
     const errors: unknown[] = [];
     let stopped = false;
-    relay.on('error', (e) => errors.push(e));
+    relay.on('error', (error) => errors.push(error));
     relay.on('stop', () => (stopped = true));
-
-    const c = collector();
-    relay.pipe(c.sink);
+    relay.pipe(collector().sink);
     await flush();
 
-    // A couple of packets flow, then the source wedges: no more packets, no end,
-    // no error — the exact "session started but frames stopped" failure.
     source.push(tracker.make({ streamIndex: 0, isKeyframe: true }));
-    source.push(tracker.make({ streamIndex: 0, isKeyframe: false }));
     await flush(30);
     expect(relay.status).toBe('running');
-    expect(errors).toHaveLength(0);
 
-    // Within the stall window the watchdog aborts the pump, surfaces an error and stops.
-    await flush(250);
+    await flush(300);
     expect(errors).toHaveLength(1);
-    expect(String((errors[0] as Error).message)).toMatch(/stalled/i);
+    expect((errors[0] as Error).message).toMatch(/stalled/);
     expect(stopped).toBe(true);
     expect(relay.status).toBe('idle');
-    expect(source.closed).toBe(true);
     expect(tracker.live).toBe(0);
   });
 
-  it('does not trip the stall watchdog while packets keep flowing', async () => {
+  it('keeps running while packets arrive within stallTimeout', async () => {
     const source = new FakeSource(AUDIO_ONLY);
     const tracker = new PacketTracker();
-    const relay = new Relay({ source, stallTimeout: 120 });
+    const relay = createRelay({ source, stallTimeout: 120 });
     const errors: unknown[] = [];
-    relay.on('error', (e) => errors.push(e));
-
-    const c = collector();
-    relay.pipe(c.sink);
+    relay.on('error', (error) => errors.push(error));
+    relay.pipe(collector().sink);
     await flush();
 
-    // Deliver a packet every 40ms for ~300ms — comfortably under the 120ms
-    // timeout each time, so the watchdog must never fire.
     for (let i = 0; i < 8; i++) {
-      source.push(tracker.make({ streamIndex: 0, isKeyframe: i === 0 }));
+      source.push(tracker.make({ streamIndex: 0, isKeyframe: true }));
       await flush(40);
     }
-
     expect(errors).toHaveLength(0);
     expect(relay.status).toBe('running');
-
-    await relay.stop();
-    expect(tracker.live).toBe(0);
   });
 
-  it('does not crash the process when the source fails and no error listener exists', async () => {
+  it('leaves no unhandled rejection without an error listener', async () => {
     const rejections: unknown[] = [];
     const onRejection = (reason: unknown): void => {
       rejections.push(reason);
     };
     process.on('unhandledRejection', onRejection);
     try {
-      const source = new FakeSource(AV_INFO, { failOpen: new Error('boom') });
-      // No 'error' listener on purpose — must neither throw nor reject unhandled.
-      const relay = new Relay({ source });
-      const c = collector();
-      relay.pipe(c.sink);
+      createRelay({ source: new FakeSource(AV_INFO, { failOpen: new Error('boom') }) }).pipe(collector().sink);
+      createRelay({ source: new FakeSource(AV_INFO, { failOpen: new Error('boom') }), autoStart: true });
       await flush(20);
-
-      expect(relay.status).toBe('idle');
-      expect(c.closed).toBe(true);
       expect(rejections).toHaveLength(0);
     } finally {
       process.off('unhandledRejection', onRejection);
     }
   });
 
-  it('does not leave an unhandled rejection behind on autoStart failure', async () => {
-    const rejections: unknown[] = [];
-    const onRejection = (reason: unknown): void => {
-      rejections.push(reason);
-    };
-    process.on('unhandledRejection', onRejection);
-    try {
-      const source = new FakeSource(AV_INFO, { failOpen: new Error('boom') });
-      const relay = new Relay({ source, autoStart: true });
-      await flush(20);
-
-      expect(relay.status).toBe('idle');
-      expect(rejections).toHaveLength(0);
-    } finally {
-      process.off('unhandledRejection', onRejection);
-    }
-  });
-
-  it('emits sink:error and isolates the sink when a write fails', async () => {
+  it('isolates a sink whose write fails', async () => {
     const source = new FakeSource(AV_INFO);
     const tracker = new PacketTracker();
-    const relay = new Relay({ source });
-    const sinkErrors: { sink: unknown; error: unknown }[] = [];
-    relay.on('sink:error', (sink, error) => sinkErrors.push({ sink, error }));
+    const relay = createRelay({ source });
+    const failures: Sink[] = [];
+    relay.on('sink:error', (sink) => failures.push(sink));
 
     const healthy = collector();
     const broken = new CallbackSink({
       onPacket: () => {
-        throw new Error('write blew up');
+        throw new Error('write failed');
       },
     });
     relay.pipe(healthy.sink);
@@ -334,95 +469,56 @@ describe('Relay error handling', () => {
     source.push(tracker.make({ streamIndex: 0, isKeyframe: true }));
     source.push(tracker.make({ streamIndex: 0, isKeyframe: false }));
     await flush();
-
-    expect(sinkErrors).toHaveLength(1);
-    expect(sinkErrors[0].sink).toBe(broken);
+    expect(failures).toEqual([broken]);
     expect(relay.sinkCount).toBe(1);
-    // The healthy sink keeps receiving despite its broken sibling.
-    expect(healthy.packets.length).toBe(2);
+    expect(healthy.packets).toHaveLength(2);
     expect(relay.status).toBe('running');
   });
 
-  it('emits sink:error when a late-piped sink fails to init', async () => {
-    const source = new FakeSource(AV_INFO);
-    const relay = new Relay({ source });
-    const sinkErrors: unknown[] = [];
-    relay.on('sink:error', (_sink, error) => sinkErrors.push(error));
-
-    const healthy = collector();
-    relay.pipe(healthy.sink);
-    await flush();
-    expect(relay.status).toBe('running');
-
-    const removed: unknown[] = [];
+  it('detaches a late sink whose init fails', async () => {
+    const relay = createRelay({ source: new FakeSource(AV_INFO) });
+    const failures: unknown[] = [];
+    const removed: Sink[] = [];
+    relay.on('sink:error', (_sink, error) => failures.push(error));
     relay.on('sink:removed', (sink) => removed.push(sink));
+    relay.pipe(collector().sink);
+    await flush();
+
     const broken = new CallbackSink({
       onInit: () => {
-        throw new Error('init blew up');
+        throw new Error('init failed');
       },
     });
     relay.pipe(broken);
     await flush();
-
-    expect(sinkErrors).toHaveLength(1);
+    expect(failures).toHaveLength(1);
     expect(removed).toContain(broken);
     expect(relay.status).toBe('running');
   });
 
-  it('returns to idle when the only sink dies during startup init', async () => {
+  it('returns to idle when every sink fails during the start', async () => {
     const source = new FakeSource(AV_INFO);
-    const relay = new Relay({ source });
-
-    const broken = new CallbackSink({
-      onInit: () => {
-        throw new Error('init blew up');
-      },
-    });
-    relay.pipe(broken);
+    const relay = createRelay({ source });
+    relay.pipe(
+      new CallbackSink({
+        onInit: () => {
+          throw new Error('init failed');
+        },
+      }),
+    );
     await flush(20);
-
-    // The relay must not keep pumping a source nobody consumes.
     expect(relay.sinkCount).toBe(0);
     expect(relay.status).toBe('idle');
     expect(source.closeCount).toBe(1);
   });
-});
 
-describe('Relay stop/start races', () => {
-  it('stop() during a pending start never lets the relay go running', async () => {
-    const source = new FakeSource(AV_INFO, { openDelay: 20 });
-    const relay = new Relay({ source });
-    const errors: unknown[] = [];
-    relay.on('error', (e) => errors.push(e));
-
-    const started = relay.start();
-    expect(relay.status).toBe('starting');
-    await relay.stop();
-
-    expect(relay.status).toBe('idle');
-    // Let the delayed open() resolve — the relay must stay idle regardless.
-    await flush(50);
-    expect(relay.status).toBe('idle');
-
-    // A deliberate stop is not an error, and the start promise must settle.
-    await started.catch(() => undefined);
-    expect(errors).toHaveLength(0);
-  });
-
-  it('can start again after a stop that interrupted a pending start', async () => {
+  it('returns to idle when the only sink leaves during the start', async () => {
     const source = new FakeSource(AV_INFO, { openDelay: 10 });
-    const relay = new Relay({ source });
-
-    void relay.start().catch(() => undefined);
-    await relay.stop();
-    await flush(30);
-
+    const relay = createRelay({ source });
     const c = collector();
     relay.pipe(c.sink);
+    await relay.unpipe(c.sink);
     await flush(30);
-
-    expect(relay.status).toBe('running');
-    expect(c.inited).toEqual(AV_INFO);
-    await relay.stop();
+    expect(relay.status).toBe('idle');
   });
 });

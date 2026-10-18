@@ -1,9 +1,9 @@
 /**
  * Two-Way Audio with Transcoding
  *
- * Relays an RTSP camera and re-serves it with an ONVIF backchannel advertised in a
- * different codec than the camera natively accepts. Viewers push Opus talkback and
- * the relay transcodes it on the fly into the camera's own backchannel codec.
+ * Serves a camera with a talkback codec that differs from the one the camera
+ * accepts. Viewers send PCMA, which every RTSP client supports, and the server
+ * converts it to the camera's own backchannel codec on the fly.
  *
  * Usage: tsx examples/backchannel-transcode.ts <rtsp_url> [port] [path]
  *
@@ -12,36 +12,32 @@
  *   tsx examples/backchannel-transcode.ts rtsp://cam.local/onvif 8554 talk
  */
 
-import { Relay } from '../src/index.js';
-import { AvSource } from '../src/sources/index.js';
+import { AvSource, Relay, RtspServerSink } from '../src/index.js';
 
-import type { BackchannelAdvertise } from '../src/sinks/rtsp-server/index.js';
+import type { BackchannelFormat } from '../src/index.js';
 
 const input = process.argv[2] ?? 'rtsp://127.0.0.1:8554/camera';
 const port = Number(process.argv[3] ?? 8554);
 const path = process.argv[4] ?? 'live';
 
-// Request the camera's backchannel so its native talkback codec is discovered;
-// the transcoder uses that as the encode target when viewers send Opus.
 const source = new AvSource(input, { transport: 'tcp', backchannel: true, logger: console });
-
 const relay = new Relay({ source, logger: console });
 
-// Codec advertised to *viewers*. It deliberately differs from the camera's codec
-// (commonly G.711) — the relay transcodes inbound viewer RTP to the camera format.
-const advertise: BackchannelAdvertise = { codec: 'opus', payloadType: 97, clockRate: 48000, channels: 2 };
+// what viewers see, the camera keeps its own codec
+const advertise: BackchannelFormat = { codec: 'pcm_alaw', payloadType: 8, clockRate: 8000, channels: 1 };
 
-const server = await relay.serveRtsp({ port, path, backchannel: advertise });
+const server = await new RtspServerSink(relay, { port, path, backchannel: { advertise, idleTimeout: 2000 }, logger: console }).listen();
 
-console.log(`Serving ${server.url}`);
-console.log(`Talkback advertised as ${advertise.codec}/${advertise.clockRate}/${advertise.channels} (pt ${advertise.payloadType})`);
+console.log(`serving ${server.url}, talkback advertised as ${advertise.codec}/${advertise.clockRate}`);
 
-server.on('viewer:added', (count) => console.log(`viewer connected (${count} active)`));
-server.on('viewer:removed', (count) => console.log(`viewer left (${count} active)`));
+server.on('viewer:added', (count) => console.log(`viewer joined (${count} playing)`));
+server.on('viewer:removed', (count) => console.log(`viewer left (${count} playing)`));
+server.on('backchannel:start', () => console.log('talkback started'));
+server.on('backchannel:stop', () => console.log('talkback stopped'));
 
-// Graceful shutdown: stopping the relay tears down the server sink, the transcoder,
-// and the upstream camera connection.
 process.on('SIGINT', () => {
-  console.log('\nShutting down...');
-  relay.stop().then(() => process.exit(0));
+  void server
+    .shutdown()
+    .then(() => relay.stop())
+    .then(() => process.exit(0));
 });

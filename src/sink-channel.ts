@@ -1,94 +1,52 @@
-import type { Logger, MediaPacket, Sink } from './types.js';
+import type { Logger, MediaPacket, Sink, StreamInfo } from './types.js';
 
 /**
- * Configuration for a single per-sink fan-out channel.
+ * Configuration for one per-sink fan-out channel.
  *
  * @internal
  */
 export interface SinkChannelOptions {
-  /**
-   * Stream indexes that carry video.
-   *
-   * Used to decide whether a packet is a video packet and whether the channel
-   * must wait for a keyframe before it starts forwarding. An empty set means the
-   * source has no video, so the channel opens its gate on the first packet.
-   */
+  /** Stream indexes that carry video; an empty set disables keyframe gating. */
   videoIndexes: ReadonlySet<number>;
 
-  /**
-   * Maximum number of packets buffered before the backlog is dropped.
-   *
-   * When the outbound queue reaches this length the entire backlog is flushed
-   * and the channel re-gates on the next keyframe. This bounds memory and keeps
-   * a slow sink from stalling the shared upstream pull, at the cost of a brief
-   * glitch on the affected consumer.
-   */
+  /** Queue length at which the backlog is cut back to a keyframe or dropped. */
   maxQueue: number;
 
-  /**
-   * Optional logger for overflow, write-failure, and close diagnostics.
-   */
+  /** Logger for overflow, failure and close diagnostics. */
   logger?: Logger;
 
-  /**
-   * Callback invoked exactly once when the channel tears itself down.
-   *
-   * Fired after the underlying sink is closed, whether the teardown was caused
-   * by a write error or an explicit close. Lets the owning relay drop its
-   * reference to this channel.
-   */
+  /** Called once after the channel closed its sink, for whatever reason. */
   onClosed?: (channel: SinkChannel) => void;
 
-  /**
-   * Callback invoked when the underlying sink fails.
-   *
-   * Fired with the error raised by a failing `write()` before the channel closes
-   * itself, so the owning relay can surface the failure to its consumer instead
-   * of only logging it.
-   */
+  /** Called when the sink fails to initialize or write, before the channel closes. */
   onError?: (channel: SinkChannel, error: unknown) => void;
 }
 
 /**
- * Per-consumer fan-out wrapper around a single sink.
+ * Per-consumer wrapper around one sink.
  *
- * Couples one sink to the relay with keyframe gating and a bounded outbound
- * queue. A freshly added consumer is held muted until it can start cleanly, and
- * its writes are drained on an independent loop so that one slow consumer never
- * blocks the shared upstream. The channel takes ownership of every packet it is
- * offered and releases it once the packet has been written or dropped.
+ * Holds a new consumer back until a video keyframe arrives, buffers packets in a
+ * bounded queue and writes them on its own loop, so one slow sink never blocks
+ * the shared upstream. The channel owns every packet it accepts and frees it
+ * once written or dropped.
  *
  * @internal
- *
- * @see {@link Sink} For the wrapped consumer contract
- *
- * @see {@link MediaPacket} For the packet ownership model
  */
 export class SinkChannel {
-  /**
-   * Whether the channel is forwarding packets.
-   *
-   * Starts `false` and flips to `true` once the keyframe gate opens. Resets to
-   * `false` when the queue overflows so the channel resynchronises on the next
-   * keyframe instead of continuing mid-GOP.
-   */
-  active = false;
-
   private readonly queue: MediaPacket[] = [];
-  private draining = false;
-  private closed = false;
-  private acceptOffers = true;
-  private inited = false;
-  private initPromise?: Promise<void>;
   private idleWaiters: (() => void)[] = [];
+  private gateOpen = false;
+  private draining = false;
+  private accepting = true;
+  private closed = false;
+  private initialized = false;
+  private initPromise?: Promise<void>;
   private lastWriteAt = 0;
 
   /**
-   * Create a fan-out channel for one sink.
+   * @param sink - The consumer this channel drives
    *
-   * @param sink - The downstream consumer this channel drives
-   *
-   * @param options - Gating, queue-bound, logging, and teardown configuration
+   * @param options - Gating, queue and callback configuration
    *
    * @internal
    */
@@ -98,127 +56,72 @@ export class SinkChannel {
   ) {}
 
   /**
-   * Whether the channel is initialized and open.
+   * Initialize the sink once with the stream layout.
    *
-   * Becomes `true` once {@link init} has resolved and remains so until the
-   * channel is closed.
+   * Concurrent and repeated calls share one attempt. A failing `init()` is
+   * reported through `onError` and closes the channel, so the returned promise
+   * never rejects.
    *
-   * @example
-   * ```typescript
-   * if (channel.ready) {
-   *   channel.offer(packet);
-   * }
-   * ```
+   * @param info - The resolved stream layout
+   *
+   * @returns A promise that settles once the attempt finished
+   *
+   * @internal
    */
-  get ready(): boolean {
-    return this.inited && !this.closed;
-  }
-
-  /**
-   * Offer one owned packet to the channel.
-   *
-   * The channel takes ownership of the packet and always consumes it: it is
-   * either queued for writing or freed immediately. Packets are dropped while
-   * the keyframe gate is closed, after the channel has closed, or when the queue
-   * overflows and the backlog is flushed for resynchronisation.
-   *
-   * @param packet - An owned packet to forward; ownership transfers to the channel
-   *
-   * @example
-   * ```typescript
-   * channel.offer(packet.clone());
-   * ```
-   */
-  offer(packet: MediaPacket): void {
-    if (this.closed || !this.acceptOffers) {
-      packet.free();
-      return;
-    }
-
-    if (!this.active) {
-      if (!this.requiresKeyframe) {
-        this.active = true;
-      } else if (this.isVideo(packet) && packet.isKeyframe) {
-        this.active = true;
-      } else {
-        packet.free();
-        return;
-      }
-    }
-
-    if (this.queue.length >= this.options.maxQueue) {
-      const age = this.lastWriteAt === 0 ? 'never wrote' : `last write ${((Date.now() - this.lastWriteAt) / 1000).toFixed(1)}s ago`;
-      // Prefer skipping forward to the newest keyframe already buffered: the
-      // consumer resumes seamlessly at a clean GOP with no output gap. This is
-      // the common shape after an upstream burst (a stalled camera flushing
-      // several seconds at once) — the burst itself usually contains the
-      // keyframe needed to continue. Only when the kept tail would not relieve
-      // the pressure does the channel fall back to dropping everything and
-      // re-gating on the next arriving keyframe.
-      const cut = this.newestKeyframeIndex();
-      if (cut > 0 && this.queue.length - cut <= this.options.maxQueue / 2) {
-        this.options.logger?.warn?.(`[rtsp] sink queue overflow (${this.queue.length} packets, ${age}) — skipping forward to the newest buffered keyframe`);
-        for (let i = 0; i < cut; i++) this.queue[i].free();
-        this.queue.splice(0, cut);
-        this.queue.push(packet);
-        this.drain();
-        return;
-      }
-      this.options.logger?.warn?.(`[rtsp] sink queue overflow (${this.queue.length} packets, ${age}) — dropping backlog and resyncing`);
-      this.flushQueue();
-      // Re-gate so we restart cleanly at the next keyframe instead of mid-GOP.
-      this.active = false;
-      packet.free();
-      return;
-    }
-
-    this.queue.push(packet);
-    this.drain();
-  }
-
-  /**
-   * Initialize the underlying sink with the resolved stream layout.
-   *
-   * Idempotent: the wrapped sink's `init()` is invoked at most once, and
-   * concurrent or repeated calls share the same in-flight promise.
-   *
-   * @param info - Resolved stream information forwarded to the sink
-   *
-   * @returns A promise that resolves once the sink has been initialized
-   *
-   * @example
-   * ```typescript
-   * await channel.init(streamInfo);
-   * ```
-   */
-  async init(info: Parameters<Sink['init']>[0]): Promise<void> {
-    this.initPromise ??= (async () => {
-      await this.sink.init(info);
-      this.inited = true;
-    })();
+  init(info: StreamInfo): Promise<void> {
+    this.initPromise ??= this.runInit(info);
     return this.initPromise;
   }
 
   /**
-   * Gracefully close the channel after draining the backlog.
+   * Whether {@link offer} would keep this packet rather than drop it.
    *
-   * Stops accepting new packets, waits for the queued backlog to finish writing,
-   * then closes the sink. Use this for clean end-of-stream teardown; for aborts
-   * and errors prefer {@link close}, which discards the backlog immediately.
+   * Lets the relay skip cloning for channels that are closed, not yet
+   * initialized or still waiting for a keyframe.
    *
-   * @returns A promise that resolves once the backlog is flushed and the sink is closed
+   * @param packet - The packet about to be offered
    *
-   * @example
-   * ```typescript
-   * // upstream ended cleanly
-   * await channel.drainAndClose();
-   * ```
+   * @returns `true` if the channel would queue the packet
    *
-   * @see {@link close} For immediate teardown that drops the backlog
+   * @internal
+   */
+  accepts(packet: MediaPacket): boolean {
+    if (!this.initialized || this.closed || !this.accepting) return false;
+    return this.gateOpen || this.options.videoIndexes.size === 0 || this.isVideoKeyframe(packet);
+  }
+
+  /**
+   * Hand one owned packet to the channel.
+   *
+   * The channel always takes ownership: the packet is queued or freed.
+   *
+   * @param packet - The packet to forward
+   *
+   * @internal
+   */
+  offer(packet: MediaPacket): void {
+    if (!this.accepts(packet)) {
+      packet.free();
+      return;
+    }
+    this.gateOpen = true;
+    if (this.queue.length >= this.options.maxQueue) {
+      this.relieve(packet);
+      return;
+    }
+    this.queue.push(packet);
+    void this.drain();
+  }
+
+  /**
+   * Stop accepting packets, write the backlog, then close the sink.
+   *
+   * @returns A promise that resolves once the sink is closed
+   *
+   * @internal
    */
   async drainAndClose(): Promise<void> {
-    if (this.closed) return;
-    this.acceptOffers = false;
+    this.accepting = false;
     while (!this.closed && (this.queue.length > 0 || this.draining)) {
       await this.whenDrainIdle();
     }
@@ -226,32 +129,19 @@ export class SinkChannel {
   }
 
   /**
-   * Close the channel immediately, discarding any backlog.
+   * Close the channel now, dropping the backlog.
    *
-   * Marks the channel closed, frees all queued packets, closes the underlying
-   * sink, and fires the configured close callback. Idempotent: repeated calls
-   * after the first are no-ops. Sink close failures are logged rather than
-   * propagated so teardown always completes.
+   * Waits for a write that is already running, because closing a sink under an
+   * in-flight write frees native state (muxers, filters) mid-call. Idempotent.
    *
-   * @returns A promise that resolves once the sink is closed and the callback has run
+   * @returns A promise that resolves once the sink is closed
    *
-   * @example
-   * ```typescript
-   * await channel.close();
-   * ```
-   *
-   * @see {@link drainAndClose} For graceful teardown that flushes the backlog first
+   * @internal
    */
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    this.flushQueue();
-    // Wait for any in-flight write to finish before tearing the sink down. The
-    // drain loop's `!closed` check only stops the *next* write; a write already
-    // awaiting inside sink.write() would otherwise have its native resources
-    // (muxer, bitstream filter) freed by sink.close() mid-call, which surfaces as
-    // an "Invalid packet" error at best and a process-killing use-after-free at
-    // worst. draining always clears in drain()'s finally, so this can't hang.
+    this.flush();
     while (this.draining) {
       await this.whenDrainIdle();
     }
@@ -264,41 +154,66 @@ export class SinkChannel {
   }
 
   /**
-   * Whether the channel must wait for a keyframe before forwarding.
+   * Run the sink's `init()` and report a failure.
    *
-   * True when the source carries at least one video stream, in which case the
-   * gate only opens on a video keyframe. False for audio/data-only sources,
-   * where the gate opens on the first packet.
+   * @param info - The resolved stream layout
    *
-   * @returns `true` if a keyframe is required to start
+   * @returns A promise that resolves once the attempt finished
    *
    * @internal
    */
-  private get requiresKeyframe(): boolean {
-    return this.options.videoIndexes.size > 0;
+  private async runInit(info: StreamInfo): Promise<void> {
+    try {
+      await this.sink.init(info);
+      this.initialized = true;
+    } catch (error) {
+      this.options.logger?.error?.('[rtsp] sink init failed:', error);
+      this.options.onError?.(this, error);
+      await this.close();
+    }
   }
 
   /**
-   * Test whether a packet belongs to a video stream.
+   * Make room in a full queue.
    *
-   * @param packet - The packet to classify
+   * Prefers cutting the backlog at the newest buffered keyframe, which keeps the
+   * consumer on a clean GOP without an output gap (the usual case after a burst
+   * from a stalled upstream). Otherwise drops everything and restarts at the
+   * next keyframe, which may be the incoming packet itself.
    *
-   * @returns `true` if the packet's stream index is a known video index
+   * @param packet - The packet that did not fit
    *
    * @internal
    */
-  private isVideo(packet: MediaPacket): boolean {
-    return this.options.videoIndexes.has(packet.streamIndex);
+  private relieve(packet: MediaPacket): void {
+    const age = this.lastWriteAt === 0 ? 'never wrote' : `last write ${((performance.now() - this.lastWriteAt) / 1000).toFixed(1)}s ago`;
+    const cut = this.newestKeyframeIndex();
+    if (cut > 0 && this.queue.length - cut <= this.options.maxQueue / 2) {
+      this.options.logger?.warn?.(`[rtsp] sink queue overflow (${this.queue.length} packets, ${age}), skipping to the newest buffered keyframe`);
+      for (const dropped of this.queue.splice(0, cut)) dropped.free();
+      this.queue.push(packet);
+      void this.drain();
+      return;
+    }
+
+    this.options.logger?.warn?.(`[rtsp] sink queue overflow (${this.queue.length} packets, ${age}), dropping the backlog`);
+    this.flush();
+    if (this.options.videoIndexes.size > 0 && !this.isVideoKeyframe(packet)) {
+      this.gateOpen = false;
+      packet.free();
+      return;
+    }
+    this.queue.push(packet);
+    void this.drain();
   }
 
   /**
-   * Drain the outbound queue into the sink.
+   * Write queued packets to the sink in order, one at a time.
    *
-   * Runs as a single self-guarded loop: only one drain is ever in flight, so
-   * packets are written strictly in order. A write failure logs the error, frees
-   * the offending packet, and closes the channel.
+   * Only one drain loop runs at a time. A failing write is reported through
+   * `onError` and closes the channel.
    *
-   * @returns A promise that resolves when the queue is empty or the channel closes
+   * @returns A promise that resolves when the queue is empty or the channel closed
    *
    * @internal
    */
@@ -310,15 +225,15 @@ export class SinkChannel {
         const packet = this.queue.shift()!;
         try {
           await this.sink.write(packet);
-          this.lastWriteAt = Date.now();
+          this.lastWriteAt = performance.now();
         } catch (error) {
-          this.options.logger?.error?.('[rtsp] sink write failed — closing channel:', error);
-          packet.free();
+          this.options.logger?.error?.('[rtsp] sink write failed, closing channel:', error);
           this.options.onError?.(this, error);
           void this.close();
           return;
+        } finally {
+          packet.free();
         }
-        packet.free();
       }
     } finally {
       this.draining = false;
@@ -327,13 +242,9 @@ export class SinkChannel {
   }
 
   /**
-   * Resolve once the current drain pass has finished.
+   * Resolve on the next exit of the drain loop.
    *
-   * Resolves on the next {@link notifyDrainIdle}, i.e. whenever `drain()` exits
-   * its loop (queue empty, channel closed, or write failure). Callers loop on
-   * their own condition, so a single resolution per drain pass is sufficient.
-   *
-   * @returns A promise that resolves when the in-flight drain settles
+   * @returns A promise that resolves when the running drain pass ends
    *
    * @internal
    */
@@ -342,7 +253,7 @@ export class SinkChannel {
   }
 
   /**
-   * Wake every caller waiting on the drain loop to settle.
+   * Wake everything waiting on {@link whenDrainIdle}.
    *
    * @internal
    */
@@ -353,17 +264,28 @@ export class SinkChannel {
   }
 
   /**
-   * Index of the newest video keyframe in the queue, or `-1` when none is
-   * buffered.
+   * Whether the packet is a keyframe on a video track.
    *
-   * @returns The queue index of the last buffered keyframe.
+   * @param packet - The packet to test
+   *
+   * @returns `true` for video keyframes
+   *
+   * @internal
+   */
+  private isVideoKeyframe(packet: MediaPacket): boolean {
+    return packet.isKeyframe && this.options.videoIndexes.has(packet.streamIndex);
+  }
+
+  /**
+   * Queue index of the newest buffered video keyframe.
+   *
+   * @returns The index, or `-1` when no keyframe is buffered
    *
    * @internal
    */
   private newestKeyframeIndex(): number {
     for (let i = this.queue.length - 1; i >= 0; i--) {
-      const packet = this.queue[i];
-      if (packet.isKeyframe && this.isVideo(packet)) return i;
+      if (this.isVideoKeyframe(this.queue[i])) return i;
     }
     return -1;
   }
@@ -373,7 +295,7 @@ export class SinkChannel {
    *
    * @internal
    */
-  private flushQueue(): void {
+  private flush(): void {
     for (const packet of this.queue) packet.free();
     this.queue.length = 0;
   }

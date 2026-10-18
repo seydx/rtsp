@@ -18,7 +18,7 @@
     "esModuleInterop": true,
     "preserveConstEnums": true,
     "skipLibCheck": true,
-    "useUnknownInCatchVariables": false,
+    "useUnknownInCatchVariables": true,
     "allowSyntheticDefaultImports": true,
     "resolveJsonModule": true,
     "experimentalDecorators": true,
@@ -31,6 +31,7 @@
     "examples/**/**/*.ts",
   ],
   "exclude": [
+    "examples/internal",
     "src",
     "node_modules",
     "dist",

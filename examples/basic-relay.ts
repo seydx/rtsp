@@ -1,10 +1,9 @@
 /**
  * Basic RTSP Relay
  *
- * Quickstart that pulls a single RTSP camera over TCP and re-serves it as a local
- * RTSP endpoint. The upstream is opened lazily on the first viewer and, thanks to
- * the idle timeout, kept warm briefly after the last viewer leaves so reconnects
- * reuse the existing camera connection.
+ * Pulls one RTSP camera over TCP and serves it again as a local RTSP endpoint.
+ * The camera connection opens with the first viewer and stays warm for a few
+ * seconds after the last one left, so a quick reconnect reuses it.
  *
  * Usage: tsx examples/basic-relay.ts <rtsp_url>
  *
@@ -12,24 +11,19 @@
  *   tsx examples/basic-relay.ts rtsp://user:pass@camera.local/stream
  */
 
-import { Relay } from '../src/index.js';
-import { AvSource } from '../src/sources/index.js';
+import { AvSource, Relay, RtspServerSink } from '../src/index.js';
 
-// Camera URL is the first CLI arg; fall back to a placeholder so the file is self-contained.
 const input = process.argv[2] ?? 'rtsp://user:pass@camera.local/stream';
 
-// TCP transport is firewall-friendly and avoids UDP packet loss for the upstream pull.
-const source = new AvSource(input, { transport: 'tcp' });
+const relay = new Relay({ source: new AvSource(input, { transport: 'tcp' }), idleTimeout: 10_000 });
 
-// idleTimeout keeps the upstream open 10s after the last viewer so quick reconnects reuse it.
-const relay = new Relay({ source, idleTimeout: 10_000 });
-
-// serveRtsp starts listening immediately; it only attaches to the camera once a client connects.
-const server = await relay.serveRtsp({ path: 'live' });
-
+// listens at once, the camera is only contacted when a viewer asks for the stream
+const server = await new RtspServerSink(relay, { path: 'live' }).listen();
 console.log('RTSP relay ready at', server.url);
 
-// Tear the relay (and its server sink) down cleanly on Ctrl+C.
 process.on('SIGINT', () => {
-  relay.stop().then(() => process.exit(0));
+  void server
+    .shutdown()
+    .then(() => relay.stop())
+    .then(() => process.exit(0));
 });

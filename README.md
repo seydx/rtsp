@@ -5,16 +5,17 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg)](https://www.typescriptlang.org/)
 
-A small, modern media relay: connect **one** upstream source and fan it out to **many** consumers — the source only ever holds a single connection.
+A small media relay for Node.js. It connects to **one** upstream source and fans it out to **many** consumers, so a camera only ever holds a single connection, however many viewers, recorders and analyzers use the stream.
 
 ```
-Source ──▶ Relay (fan-out hub) ──▶ Sink…
-                                 ├─ RTSP server  (many rtsp:// pullers)
-                                 ├─ FFmpeg        (transcode / remux)
-                                 └─ Callback      (raw packets)
+Source ──▶ Relay ──▶ Sinks
+                     ├─ RtspServerSink  many rtsp:// viewers, optional re-encoding and talkback
+                     ├─ FfmpegSink      recording and remuxing
+                     ├─ CallbackSink    raw packets in your code
+                     └─ TranscodeSink   re-encoding in front of any of them
 ```
 
-All codec and protocol heavy-lifting is delegated to [`node-av`](https://github.com/seydx/node-av); this package is the orchestration layer plus a lean multi-client RTSP server.
+Demuxing, decoding, encoding and muxing are done by [node-av](https://github.com/seydx/node-av), which ships prebuilt FFmpeg binaries with hardware acceleration. This package adds the orchestration and a lean multi-client RTSP server.
 
 **[Documentation](https://seydx.github.io/rtsp)**
 
@@ -24,7 +25,10 @@ All codec and protocol heavy-lifting is delegated to [`node-av`](https://github.
 - [Quick Start](#quick-start)
 - [Sources](#sources)
 - [Sinks](#sinks)
+- [RTSP Server](#rtsp-server)
+- [Transcoding](#transcoding)
 - [Two-Way Audio](#two-way-audio)
+- [Raw Audio Frames](#raw-audio-frames)
 - [Lifecycle](#lifecycle)
 - [Examples](#examples)
 - [License](#license)
@@ -35,98 +39,196 @@ All codec and protocol heavy-lifting is delegated to [`node-av`](https://github.
 npm install @seydx/rtsp node-av
 ```
 
-_It ships the prebuilt FFmpeg binaries, so no separate FFmpeg install is needed._
+Requires Node.js 24 or newer. node-av brings its own FFmpeg, no separate install is needed.
 
 ## Quick Start
 
 ```typescript
-import { Relay, CallbackSink, FfmpegSink } from '@seydx/rtsp';
-import { AvSource } from '@seydx/rtsp/sources';
+import { AvSource, CallbackSink, FfmpegSink, Relay, RtspServerSink } from '@seydx/rtsp';
 
 const relay = new Relay({
-  source: new AvSource('rtsp://user:pass@cam/stream', { transport: 'tcp' }),
-  idleTimeout: 5_000, // tear down the upstream when the last sink leaves
+  source: new AvSource('rtsp://user:pass@camera.local/stream', { transport: 'tcp', reconnect: true }),
+  // close the camera connection 5s after the last consumer left
+  idleTimeout: 5000,
 });
 
-// Fan out to many RTSP pullers from a single upstream connection.
-const server = await relay.serveRtsp({ path: 'live' });
-console.log(server.url); // rtsp://127.0.0.1:<port>/live
+// many viewers, one camera connection
+const server = await new RtspServerSink(relay, { port: 8554, path: 'live' }).listen();
+console.log(server.url); // rtsp://127.0.0.1:8554/live
 
-// …or pipe to ffmpeg / a raw callback.
-relay.pipe(new FfmpegSink({ output: 'out.ts', format: 'mpegts' }));
-relay.pipe(new CallbackSink({ onPacket: (packet) => {/* raw packets */} }));
+// record and inspect the same stream
+relay.pipe(new FfmpegSink({ output: 'recording.ts', format: 'mpegts' }));
+relay.pipe(new CallbackSink({ onPacket: (packet) => console.log(packet.streamIndex, packet.isKeyframe) }));
 ```
 
-The upstream is lazy: it opens on the first sink and, after `idleTimeout`, closes once the last sink leaves.
+The upstream is lazy. It opens when the first sink is piped and closes after `idleTimeout` once the last one left. Every sink starts at a video keyframe, and a slow sink skips ahead instead of holding up the others.
 
 ## Sources
 
-A source is a single-connection upstream. Two are built in (importable from `@seydx/rtsp/sources`):
+A source is one upstream connection. Two are built in.
 
-- **`AvSource`** — a node-av-backed demuxer for RTSP, files, and byte streams. Supports transport selection, read-rate pacing, looping, and the ONVIF backchannel.
-- **`MultiSource`** — merges several inputs (e.g. a camera that exposes audio and video as separate streams) into one flattened multi-track source.
+**`AvSource`** demuxes anything FFmpeg can open: RTSP, HTTP, files, a `Buffer` or a `Readable`. It can pace files at their natural rate, loop them, reconnect with backoff, stamp packets with their arrival time for inputs without usable timestamps, and request the ONVIF backchannel.
 
 ```typescript
-import { MultiSource } from '@seydx/rtsp/sources';
+import { AvSource } from '@seydx/rtsp';
+
+const camera = new AvSource('rtsp://camera.local/stream', {
+  transport: 'tcp',
+  timeout: 10_000,
+  reconnect: { delay: 1000, maxDelay: 30_000 },
+});
+```
+
+**`MultiSource`** merges several inputs into one source, for devices that deliver video and audio as separate raw streams.
+
+```typescript
+import { MultiSource } from '@seydx/rtsp';
 
 const source = new MultiSource([
-  { input: 'rtsp://cam/video' },
-  { input: 'rtsp://cam/audio' },
+  { input: videoStream, format: 'h264', options: { framerate: 15 } },
+  { input: audioStream, format: 'aac' },
 ]);
 ```
 
-Implement the `Source` contract to add your own.
+Implement the `Source` interface to bring your own.
 
 ## Sinks
 
-A sink consumes the relayed stream. Three are built in (importable from `@seydx/rtsp/sinks`):
+A sink consumes the relayed stream. Four are built in.
 
-- **`RtspServerSink`** — re-serves the relay as a multi-client `rtsp://` endpoint. Created via `relay.serveRtsp()`.
-- **`FfmpegSink`** — remuxes the stream into another container, in-process, via a node-av muxer (stream copy, no child process).
-- **`CallbackSink`** — delivers raw packets to your own callback.
+- **`RtspServerSink`** serves the relay to many RTSP viewers, see below.
+- **`FfmpegSink`** muxes the stream into a file, a `Writable` or custom I/O callbacks, without re-encoding.
+- **`CallbackSink`** hands every packet to your callback.
+- **`TranscodeSink`** re-encodes tracks on their way into another sink, see [Transcoding](#transcoding).
 
-Implement the `Sink` contract to add your own.
+Implement the `Sink` interface to bring your own. A packet belongs to the relay and is freed once `write()` settled, so clone it to keep it longer.
+
+## RTSP Server
+
+`RtspServerSink` is a multi-client RTSP server over TCP-interleaved transport. It attaches to the relay when the first viewer asks for the stream and detaches a few seconds after the last one left. Every track is packetized once, whatever the number of viewers.
+
+```typescript
+import { RtspAuth, RtspServerSink } from '@seydx/rtsp';
+
+const server = await new RtspServerSink(relay, {
+  host: '0.0.0.0',
+  port: 8554,
+  path: 'camera',
+  auth: new RtspAuth({ username: 'viewer', password: 'secret' }),
+}).listen();
+
+server.on('viewer:added', (count) => console.log(`${count} watching`));
+```
+
+Tracks can be re-encoded on the way, once for all viewers, with the options described under [Transcoding](#transcoding). A typical case is an MJPEG camera served as H.264:
+
+```typescript
+const relay = new Relay({ source: new AvSource('http://camera.local/video.mjpg', { format: 'mpjpeg', wallclock: true, reconnect: true }) });
+
+const server = await new RtspServerSink(relay, {
+  transcode: { video: { codec: 'h264', bitRate: 2_000_000 } },
+}).listen();
+```
+
+## Transcoding
+
+`TranscodeSink` wraps any sink and re-encodes tracks before they reach it. Video becomes H.264 or HEVC, audio any format FFmpeg can encode. A track that already has the requested format is copied instead, so only the tracks that need it pay for re-encoding.
+
+```typescript
+import { FfmpegSink, TranscodeSink } from '@seydx/rtsp';
+
+// record a camera as 720p H.264 with AAC audio
+relay.pipe(
+  new TranscodeSink(new FfmpegSink({ output: 'camera.mp4', format: 'mp4' }), {
+    video: { codec: 'h264', height: 720, bitRate: 2_000_000 },
+    audio: { codec: 'aac' },
+  }),
+);
+```
+
+Video runs on one hardware device from start to end. Decoding, scaling and encoding stay on the GPU where it can handle them, and each stage falls back to software on its own, for example when the GPU cannot decode the camera's codec. By default the best device is detected once and shared by every transcoder of the process. `hardware: false` stays in software, `HardwareOptions` open a dedicated device and a `HardwareContext` from node-av is used as given:
+
+```typescript
+import { AV_HWDEVICE_TYPE_VAAPI } from 'node-av/constants';
+
+new TranscodeSink(sink, { hardware: { prefer: AV_HWDEVICE_TYPE_VAAPI, device: '/dev/dri/renderD129' }, video: { codec: 'hevc' } });
+```
+
+Options can be decided per track, and `force` re-encodes a track even when it already matches:
+
+```typescript
+new TranscodeSink(sink, {
+  // only the main stream, a second video track passes through
+  video: (track) => (track.index === 0 ? { codec: 'h264', width: 1280 } : undefined),
+  audio: { codec: 'aac', sampleRate: 16000, channels: 1, force: true },
+});
+```
+
+Width or height alone keeps the aspect ratio. The wrapped sink is initialized once every re-encoded track produced its first packet, so it sees the final codec parameters; a track that stays silent for `timeout` (10 seconds by default) is left out. Video from sources that report no frame rate, such as MJPEG over HTTP, starts half a second to two seconds late, because the encoder needs the measured rate for its level, rate control and keyframe interval.
 
 ## Two-Way Audio
 
-Talkback (ONVIF backchannel) sends audio from a viewer back to the camera. The source must request the backchannel:
+Viewers can send talkback audio back to the camera over the ONVIF backchannel. Request it on the source and enable it on the server:
 
 ```typescript
-const relay = new Relay({
-  source: new AvSource('rtsp://cam/stream', { transport: 'tcp', backchannel: true }),
-});
+const relay = new Relay({ source: new AvSource('rtsp://camera.local/stream', { transport: 'tcp', backchannel: true }) });
 
-// Pass-through: advertise the camera's own talkback codec; forward viewer RTP as-is.
-await relay.serveRtsp({ path: 'live', backchannel: true });
+// advertise the camera's own talkback format, viewer audio is forwarded unchanged
+await new RtspServerSink(relay, { backchannel: true }).listen();
+```
 
-// …or transcode: advertise a different codec to viewers; the relay converts it
-// to the camera's codec in-process.
-await relay.serveRtsp({
-  path: 'live',
-  backchannel: { codec: 'opus', payloadType: 97, clockRate: 48000, channels: 2 },
+Advertise a different format to viewers and the server converts it to the camera's codec:
+
+```typescript
+await new RtspServerSink(relay, {
+  backchannel: { advertise: { codec: 'pcm_alaw', payloadType: 8, clockRate: 8000, channels: 1 } },
+}).listen();
+```
+
+The server emits every talkback packet as `backchannel` and the bursts as `backchannel:start` and `backchannel:stop`, so devices with proprietary talkback can be fed with a `BackchannelTranscoder`.
+
+## Raw Audio Frames
+
+Some devices deliver bare audio frames without any container, for example raw AAC-ELD. `RawAudioTranscoder` turns them into an ADTS stream that a source can demux:
+
+```typescript
+import { buildAacEldConfig, MultiSource, RawAudioTranscoder } from '@seydx/rtsp';
+
+const audio = new RawAudioTranscoder({
+  from: { codec: 'aac', decoder: 'libfdk_aac', sampleRate: 16000, channels: 1, samplesPerFrame: 480, config: buildAacEldConfig(16000, 1, 480) },
 });
+audio.start();
+device.on('audio', (frame: Buffer) => audio.push(frame));
+
+const source = new MultiSource([
+  { input: videoStream, format: 'h264' },
+  { input: audio.stream, format: 'aac' },
+]);
 ```
 
 ## Lifecycle
 
-The relay is an event emitter. A newly attached sink is held until the next keyframe so it starts on a clean GOP, and a slow sink is isolated from the rest.
+The relay is an event emitter:
 
 ```typescript
-relay.on('start', (info) => console.log('upstream live:', info.tracks.length, 'tracks'));
-relay.on('sink:added', () => {});
-relay.on('sink:removed', () => {});
-relay.on('end', () => {}); // upstream ended on its own
-relay.on('error', (err) => console.error(err));
+relay.on('start', (info) => console.log(`upstream open with ${info.tracks.length} tracks`));
+relay.on('end', () => console.log('upstream ended'));
+relay.on('error', (error) => console.error(error));
+relay.on('sink:error', (sink, error) => console.error('a sink failed', error));
 
-await relay.stop(); // tear down the upstream and every sink
+await relay.stop();
 ```
+
+Set `stallTimeout` to fail a stream whose upstream stays connected but stops sending. Route FFmpeg's own log output into your logger with `installNativeLogging(logger)`.
 
 ## Examples
 
-Runnable examples live in [`examples/`](https://github.com/seydx/rtsp/tree/main/examples). Run any with `tsx`:
+Runnable examples live in [`examples/`](https://github.com/seydx/rtsp/tree/main/examples):
 
 ```bash
-tsx examples/basic-relay.ts rtsp://user:pass@cam/stream
+tsx examples/basic-relay.ts rtsp://user:pass@camera.local/stream
+tsx examples/mjpeg-to-h264.ts http://camera.local/video.mjpg
+tsx examples/transcode-sink.ts rtsp://user:pass@camera.local/stream camera.mp4
 ```
 
 ## License

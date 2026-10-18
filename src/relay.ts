@@ -1,236 +1,199 @@
 import { SinkChannel } from './sink-channel.js';
-import { BackchannelTranscoder } from './sinks/rtsp-server/backchannel-transcoder.js';
-import { RtspServerSink } from './sinks/rtsp-server/rtsp-server-sink.js';
 import { TypedEmitter } from './util/emitter.js';
 
-import { supportsBackchannel } from './types.js';
-
-import type { RtspServerSinkOptions } from './sinks/rtsp-server/rtsp-server-sink.js';
 import type { Logger, MediaPacket, Sink, Source, StreamInfo } from './types.js';
 
 /**
- * Options for relay creation.
+ * Options for a {@link Relay}.
  *
- * Configures the single upstream source, its idle lifecycle, per-sink buffering,
- * and startup behavior. Only `source` is required; the remaining fields tune how
- * aggressively the relay holds the upstream open and how it copes with slow sinks.
+ * Only `source` is required. The other fields tune how long the upstream stays
+ * open and how the relay copes with slow sinks and dead upstreams.
  */
 export interface RelayOptions {
   /**
-   * The single upstream that feeds every attached sink.
+   * The upstream that feeds every attached sink.
    *
-   * Exactly one connection to this source is held regardless of how many sinks
-   * are piped; the relay opens it lazily (or eagerly with `autoStart`) and fans
-   * each demuxed packet out to all ready consumers.
+   * The relay holds exactly one connection to it, however many sinks are piped.
    */
   source: Source;
 
   /**
-   * How long, in milliseconds, to keep the upstream alive after the last sink
-   * leaves before tearing it down.
+   * Time in milliseconds to keep the upstream open after the last sink left.
    *
-   * When a positive value is given the relay waits that long before closing the
-   * source, letting a reconnecting client reuse the already-open upstream. A
-   * value of `0` (the default) stops the upstream immediately once the final
-   * sink detaches.
+   * A sink that attaches within this window reuses the running upstream. With
+   * `0` the upstream closes as soon as the last sink leaves.
+   *
+   * @default 0
    */
   idleTimeout?: number;
 
   /**
-   * Per-sink buffer depth, in packets, before backpressure kicks in.
+   * Per-sink queue length in packets.
    *
-   * Each sink has its own queue; when a sink falls behind and its queue exceeds
-   * this depth, packets are dropped and the sink is re-synced at the next
-   * keyframe rather than blocking the whole fan-out. Defaults to 512.
+   * A sink that falls this far behind is cut back to the newest buffered
+   * keyframe, or loses its backlog and restarts at the next keyframe. The
+   * upstream and the other sinks are not slowed down.
+   *
+   * @default 512
    */
   maxQueue?: number;
 
   /**
-   * Open the upstream eagerly during construction instead of on the first sink.
+   * Open the upstream right away instead of on the first {@link Relay.pipe}.
    *
-   * When `true` the relay calls {@link Relay.start} immediately so the source is
-   * connected before any sink is piped; otherwise the upstream stays idle until
-   * the first {@link Relay.pipe}. Defaults to `false`.
+   * @default false
    */
   autoStart?: boolean;
 
   /**
-   * How long, in milliseconds, the running upstream may deliver no packet at all
-   * before it is treated as a silent stall and torn down.
+   * Time in milliseconds the running upstream may deliver no packet before it
+   * counts as stalled.
    *
-   * A live source can wedge without ever ending: it delivers neither packets nor
-   * an end-of-stream nor an error — the classic symptom is a camera whose
-   * session "starts" but never sends a frame, or a network link that freezes
-   * mid-stream. The pump loop would otherwise wait on the next packet forever,
-   * leaving every consumer staring at a dead stream. With a positive value the
-   * relay watches the gap since the last dispatched packet; if it exceeds the
-   * timeout the pump is aborted, `error` is emitted, and the relay stops — so a
-   * consumer (or a reconnecting client) can restart it and force a fresh upstream
-   * session. Measured only while `running`, and reset by every packet, so a
-   * healthy stream never trips it. A value of `0` (the default) disables the
-   * watchdog and waits indefinitely. Set it above the largest legitimate gap the
-   * source can produce (several seconds for a low-frame-rate camera).
+   * A live source can hang without ending or failing, for example a camera
+   * whose session starts but never sends a frame. When the gap since the last
+   * packet exceeds this value, the relay emits `error` and stops, so the next
+   * {@link Relay.pipe} opens a fresh upstream session. Set it above the largest
+   * normal gap of the source. `0` disables the check.
+   *
+   * @default 0
    */
   stallTimeout?: number;
 
   /**
-   * Optional logger for diagnostic and error output.
-   *
-   * Receives non-fatal warnings and errors raised while pumping the upstream,
-   * initializing sinks, or closing the source. Propagated to sinks created via
-   * {@link Relay.serveRtsp}. When omitted no diagnostics are emitted.
+   * Logger for warnings and errors from the relay and its sink channels.
    */
   logger?: Logger;
 }
 
 /**
- * Lifecycle state of a relay.
+ * Lifecycle state of a {@link Relay}.
  *
- * Transitions follow `idle` -> `starting` -> `running` -> `stopping` -> `idle`.
- * The relay reports its current phase through {@link Relay.status}.
+ * Moves through `idle`, `starting`, `running`, `stopping` and back to `idle`.
  */
 export type RelayState = 'idle' | 'starting' | 'running' | 'stopping';
 
 /**
- * Event map emitted by a relay.
- *
- * Describes the signatures of every event a {@link Relay} can emit, used to type
- * the `on`/`off`/`emit` surface inherited from the typed emitter.
+ * Events emitted by a {@link Relay}.
  */
 export interface RelayEvents {
   /**
-   * Fired once the upstream is open and the stream layout is resolved.
+   * The upstream is open and every attached sink is initialized.
    *
-   * Carries the {@link StreamInfo} describing the tracks (and optional
-   * backchannel) the relay will fan out. Emitted exactly once per running cycle,
-   * after attached sinks have been initialized.
+   * Emitted once per running cycle with the resolved stream layout.
    */
   start: (info: StreamInfo) => void;
 
   /**
-   * Fired after the upstream and every sink have been torn down.
+   * The upstream and every sink attached at that time are closed.
    *
-   * Emitted on both explicit {@link Relay.stop} and end-of-stream teardown,
-   * signalling that the relay has returned to the `idle` state.
+   * Follows an explicit {@link Relay.stop}, an idle teardown, an upstream end
+   * and an upstream failure alike.
    */
   stop: () => void;
 
   /**
-   * Fired when the upstream ends on its own (EOF or disconnect).
+   * The upstream ended on its own.
    *
-   * Indicates the source stopped producing packets without a caller-initiated
-   * stop; the relay then drains and closes its sinks, after which `stop` follows.
+   * The relay writes the remaining backlog of every sink before closing it;
+   * `stop` follows.
    */
   end: () => void;
 
   /**
-   * Fired when the relay encounters a non-recoverable error.
+   * The upstream failed to open, failed while running or stalled.
    *
-   * Carries the offending error. Raised when the upstream fails to open or the
-   * pump loop throws; the relay tears itself down afterwards. Emitting this
-   * event without a registered listener is safe — unlike a raw Node.js
-   * EventEmitter it does not throw, so consumers may opt out of error handling
-   * without risking a process crash.
+   * The relay tears itself down afterwards. Emitting `error` without a listener
+   * does not throw.
    */
   error: (error: unknown) => void;
 
   /**
-   * Fired when an individual sink fails while being initialized or written to.
+   * A sink failed in `init()` or `write()`.
    *
-   * Carries the offending {@link Sink} and the error it raised. The relay
-   * isolates the failure — the sink's channel is closed (followed by
-   * `sink:removed`) while the upstream and all other sinks keep running — but
-   * surfaces it here so consumers can react instead of only seeing a log line.
+   * The sink is closed and removed (`sink:removed` follows); the upstream and
+   * the other sinks keep running.
    */
   'sink:error': (sink: Sink, error: unknown) => void;
 
   /**
-   * Fired immediately after a sink is piped onto the relay.
+   * A sink was piped onto the relay.
    *
-   * Carries the newly attached {@link Sink}. Emitted before the sink has been
-   * synced to a keyframe, so the sink may not yet be receiving packets.
+   * Emitted before the sink is initialized or receives packets.
    */
   'sink:added': (sink: Sink) => void;
 
   /**
-   * Fired once a previously attached sink has been detached and closed.
+   * A sink was closed and detached.
    *
-   * Carries the removed {@link Sink}. May be triggered by {@link Relay.unpipe},
-   * by the sink closing itself, or by relay teardown.
+   * Follows {@link Relay.unpipe}, a sink failure and relay teardown.
    */
   'sink:removed': (sink: Sink) => void;
 }
 
-/**
- * Default per-sink queue depth, in packets, used when `maxQueue` is unset.
- *
- * @internal
- */
 const DEFAULT_MAX_QUEUE = 512;
+const MIN_STALL_CHECK_MS = 250;
 
 /**
  * Single-source, multi-sink media relay.
  *
- * Connects one upstream source and fans its packets out to many sinks while
- * holding exactly one upstream connection regardless of how many consumers are
- * attached. The upstream is lazy by default: it opens when the first sink is
- * piped and, after the configured idle timeout, closes once the last sink
- * leaves. Slow sinks are isolated by per-sink queues and re-synced at the next
- * keyframe rather than stalling the whole fan-out.
+ * Connects one upstream source and fans its packets out to any number of sinks
+ * over a single upstream connection. The upstream opens when the first sink is
+ * piped and closes after {@link RelayOptions.idleTimeout} once the last one
+ * left. Every sink starts at a video keyframe and has its own bounded queue, so
+ * a slow sink never holds up the others.
  *
  * @example
  * ```typescript
- * import { Relay } from '@seydx/rtsp';
+ * import { AvSource, CallbackSink, Relay } from '@seydx/rtsp';
  *
- * const relay = new Relay({ source });
- * relay.pipe(sink);
- * await relay.start();
+ * const relay = new Relay({ source: new AvSource('rtsp://camera.local/stream') });
+ * relay.pipe(new CallbackSink({ onPacket: (packet) => console.log(packet.streamIndex) }));
  * ```
  *
  * @example
  * ```typescript
- * import { Relay } from '@seydx/rtsp';
+ * import { AvSource, Relay, RtspServerSink } from '@seydx/rtsp';
  *
- * const relay = new Relay({ source, idleTimeout: 5000 });
- * const server = await relay.serveRtsp({ port: 8554, path: 'live' });
+ * const relay = new Relay({ source: new AvSource('rtsp://camera.local/stream'), idleTimeout: 5000 });
+ * const server = await new RtspServerSink(relay, { port: 8554 }).listen();
+ * console.log(server.url);
  * ```
  *
  * @see {@link Source} For the upstream contract
  *
  * @see {@link Sink} For the consumer contract
  *
- * @see {@link RtspServerSink} For exposing the relay as an RTSP endpoint
+ * @see {@link RtspServerSink} For serving the relay over RTSP
  */
 export class Relay extends TypedEmitter<RelayEvents> {
-  private readonly source: Source;
+  readonly source: Source;
+
   private readonly logger?: Logger;
   private readonly idleTimeout: number;
   private readonly maxQueue: number;
   private readonly stallTimeout: number;
-
   private readonly channels = new Set<SinkChannel>();
   private readonly videoIndexes = new Set<number>();
-
   private state: RelayState = 'idle';
+  private sinkSeen = false;
   private streamInfo?: StreamInfo;
-  private startPromise?: Promise<void>;
+  private starting?: Promise<void>;
+  private stopping?: Promise<void>;
   private pullAbort?: AbortController;
-  private idleTimer?: ReturnType<typeof setTimeout>;
+  private idleTimer?: NodeJS.Timeout;
 
   /**
-   * Create a relay around a single upstream source.
+   * Create a relay around one upstream source.
    *
-   * Stores the source and lifecycle tuning but does not open the upstream unless
-   * `autoStart` is set; otherwise the connection is deferred until the first
-   * sink is piped or {@link Relay.start} is called.
+   * Nothing is opened here unless {@link RelayOptions.autoStart} is set.
    *
-   * @param options - Relay configuration including the source and lifecycle options
+   * @param options - The source and lifecycle options
    *
    * @example
    * ```typescript
    * import { Relay } from '@seydx/rtsp';
    *
-   * const relay = new Relay({ source, autoStart: true });
+   * const relay = new Relay({ source, idleTimeout: 10_000, stallTimeout: 8_000 });
    * ```
    */
   constructor(options: RelayOptions) {
@@ -241,22 +204,16 @@ export class Relay extends TypedEmitter<RelayEvents> {
     this.maxQueue = options.maxQueue ?? DEFAULT_MAX_QUEUE;
     this.stallTimeout = options.stallTimeout ?? 0;
 
-    // Fire-and-forget: runStart() already logs and emits 'error' on failure, so
-    // an eager start must not surface as an unhandled rejection.
+    // runStart already reports the failure through 'error'
     if (options.autoStart) void this.start().catch(() => undefined);
   }
 
   /**
-   * Current lifecycle phase of the relay.
-   *
-   * Reflects whether the upstream is idle, opening, actively pumping, or being
-   * torn down.
+   * Current lifecycle state.
    *
    * @example
    * ```typescript
-   * if (relay.status === 'running') {
-   *   console.log('upstream is live');
-   * }
+   * if (relay.status === 'running') console.log('upstream is live');
    * ```
    */
   get status(): RelayState {
@@ -264,9 +221,7 @@ export class Relay extends TypedEmitter<RelayEvents> {
   }
 
   /**
-   * Resolved stream layout of the open upstream, if any.
-   *
-   * Populated once the upstream is open and `undefined` while the relay is idle.
+   * Stream layout of the open upstream, `undefined` while idle.
    *
    * @example
    * ```typescript
@@ -278,14 +233,11 @@ export class Relay extends TypedEmitter<RelayEvents> {
   }
 
   /**
-   * Number of sinks currently attached to the relay.
-   *
-   * Counts every piped sink regardless of whether it has finished syncing to a
-   * keyframe and started receiving packets.
+   * Number of attached sinks, including those still waiting for a keyframe.
    *
    * @example
    * ```typescript
-   * console.log(`${relay.sinkCount} consumers attached`);
+   * console.log(`${relay.sinkCount} sinks attached`);
    * ```
    */
   get sinkCount(): number {
@@ -293,20 +245,20 @@ export class Relay extends TypedEmitter<RelayEvents> {
   }
 
   /**
-   * Attach a sink to the relay.
+   * Attach a sink.
    *
-   * Wraps the sink in an isolated channel, lazily starts the upstream if it is
-   * not already running, and syncs the sink at the next keyframe before it begins
-   * receiving packets. The same sink instance is returned for convenient
-   * chaining.
+   * Starts the upstream if needed. The sink is initialized with the stream
+   * layout and receives packets from the next video keyframe on. Piping while
+   * the relay is stopping waits for the teardown and then opens a fresh
+   * upstream.
    *
-   * @param sink - The consumer to attach to the relayed stream
+   * @param sink - The consumer to attach
    *
-   * @returns The same sink instance that was passed in
+   * @returns The same sink, for chaining
    *
    * @example
    * ```typescript
-   * const attached = relay.pipe(new CallbackSink({ onPacket: (packet) => handle(packet) }));
+   * const sink = relay.pipe(new CallbackSink({ onPacket: (packet) => handle(packet) }));
    * ```
    *
    * @see {@link Relay.unpipe} To detach a sink
@@ -316,27 +268,26 @@ export class Relay extends TypedEmitter<RelayEvents> {
       videoIndexes: this.videoIndexes,
       maxQueue: this.maxQueue,
       logger: this.logger,
-      onClosed: (c) => this.handleChannelClosed(c),
-      onError: (c, error) => this.emit('sink:error', c.sink, error),
+      onClosed: (closed) => this.handleChannelClosed(closed),
+      onError: (failed, error) => this.emit('sink:error', failed.sink, error),
     });
     this.channels.add(channel);
+    this.sinkSeen = true;
     this.cancelIdleTimer();
     this.emit('sink:added', sink);
-    void this.activateChannel(channel);
+    void this.activate(channel);
     return sink;
   }
 
   /**
-   * Detach a previously piped sink.
+   * Detach a sink and close it.
    *
-   * Closes the sink's channel, which flushes and releases it and emits
-   * `sink:removed`. If the detached sink was the last one and the relay is
-   * running, the idle teardown timer is scheduled. Detaching a sink that is not
-   * attached is a no-op.
+   * Detaching the last sink schedules the idle teardown. Unknown sinks are
+   * ignored.
    *
    * @param sink - The sink to detach
    *
-   * @returns A promise that resolves once the sink has been closed
+   * @returns A promise that resolves once the sink is closed
    *
    * @example
    * ```typescript
@@ -346,67 +297,23 @@ export class Relay extends TypedEmitter<RelayEvents> {
    * @see {@link Relay.pipe} To attach a sink
    */
   async unpipe(sink: Sink): Promise<void> {
-    const channel = this.findChannel(sink);
-    if (channel) await channel.close();
-  }
-
-  /**
-   * Expose this relay as a multi-client RTSP endpoint.
-   *
-   * Creates and starts an RTSP server sink bound to this relay. The returned sink
-   * begins listening immediately and lazily attaches to the relay when the first
-   * client connects. When a backchannel is requested, inbound viewer talkback is
-   * either forwarded straight to the source (pass-through) or transcoded to the
-   * camera's codec, depending on the option shape.
-   *
-   * @param options - RTSP server sink options such as host, port, path, auth, and backchannel
-   *
-   * @returns A promise resolving to the listening RTSP server sink
-   *
-   * @example
-   * ```typescript
-   * const server = await relay.serveRtsp({ port: 8554, path: 'cam' });
-   * ```
-   *
-   * @example
-   * ```typescript
-   * // Advertise a backchannel; relay transcodes viewer audio to the camera codec.
-   * const server = await relay.serveRtsp({
-   *   port: 8554,
-   *   backchannel: { codec: 'opus', payloadType: 96, clockRate: 48000, channels: 1 },
-   * });
-   * ```
-   *
-   * @see {@link RtspServerSink} For the underlying server sink
-   *
-   * @see {@link BackchannelSource} For sources that accept talkback audio
-   */
-  async serveRtsp(options?: RtspServerSinkOptions): Promise<RtspServerSink> {
-    const sink = new RtspServerSink(this, { logger: this.logger, ...options });
-    await sink.listen();
-
-    if (options?.backchannel === true) {
-      // Pass-through: forward inbound viewer RTP straight to the source.
-      sink.on('backchannel', (rtp) => {
-        if (supportsBackchannel(this.source)) this.source.sendBackchannel(rtp);
-      });
-    } else if (options?.backchannel) {
-      this.wireBackchannelTranscode(sink, options.backchannel);
+    for (const channel of this.channels) {
+      if (channel.sink === sink) {
+        await channel.close();
+        return;
+      }
     }
-    return sink;
   }
 
   /**
-   * Open the upstream and begin pumping packets.
+   * Open the upstream and start pumping packets.
    *
-   * Resolves the stream layout, initializes any already-attached sinks, emits
-   * `start`, and kicks off the pump loop. Idempotent and safe to call
-   * concurrently: repeated calls share the same in-flight start, and calling it
-   * while already running resolves immediately.
+   * Concurrent calls share one start. Calling it while running resolves at once;
+   * calling it while stopping waits for the teardown and starts again.
    *
-   * @returns A promise that resolves once the upstream is running
+   * @returns A promise that resolves once the relay is running
    *
-   * @throws {Error} If the upstream source fails to open
+   * @throws {Error} If the source fails to open
    *
    * @example
    * ```typescript
@@ -417,21 +324,19 @@ export class Relay extends TypedEmitter<RelayEvents> {
    */
   start(): Promise<void> {
     if (this.state === 'running') return Promise.resolve();
-    this.startPromise ??= this.runStart();
-    return this.startPromise;
+    if (this.stopping) return this.stopping.then(() => this.start());
+    this.starting ??= this.runStart();
+    return this.starting;
   }
 
   /**
-   * Tear down the upstream and every attached sink.
+   * Close the upstream and every attached sink.
    *
-   * Aborts the pump loop, closes all sink channels immediately (without draining
-   * their backlog), closes the source, resets internal state to idle, and emits
-   * `stop`. Safe to call while a start is still in flight: the pending open is
-   * aborted (via the source's `close()`) and awaited before teardown, so the
-   * relay can never transition to `running` after this resolves. A no-op when
-   * the relay is already idle or stopping.
+   * Queued packets are dropped. Stopping during a pending start aborts the open,
+   * and the relay never turns `running` afterwards. Concurrent calls share one
+   * teardown and all resolve when it is complete.
    *
-   * @returns A promise that resolves once teardown is complete
+   * @returns A promise that resolves once the relay is idle
    *
    * @example
    * ```typescript
@@ -440,134 +345,15 @@ export class Relay extends TypedEmitter<RelayEvents> {
    *
    * @see {@link Relay.start} To open the upstream
    */
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
     this.cancelIdleTimer();
-    if (this.state === 'idle' || this.state === 'stopping') return;
-    const inFlightStart = this.state === 'starting' ? this.startPromise : undefined;
-    this.state = 'stopping';
-
-    this.pullAbort?.abort();
-    if (inFlightStart) {
-      // A start is still in flight. Closing the source first aborts a pending
-      // open(); then wait for runStart to observe 'stopping' and unwind, so it
-      // cannot flip the relay to 'running' after this teardown completed.
-      try {
-        await this.source.close();
-      } catch (error) {
-        this.logger?.error?.('[rtsp] source close failed:', error);
-      }
-      await inFlightStart.catch(() => undefined);
-      await Promise.all([...this.channels].map((c) => c.close()));
-    } else {
-      await Promise.all([...this.channels].map((c) => c.close()));
-      try {
-        await this.source.close();
-      } catch (error) {
-        this.logger?.error?.('[rtsp] source close failed:', error);
-      }
-    }
-
-    this.streamInfo = undefined;
-    this.videoIndexes.clear();
-    this.startPromise = undefined;
-    this.state = 'idle';
-    this.emit('stop');
+    if (this.state === 'idle') return Promise.resolve();
+    this.stopping ??= this.teardown(false);
+    return this.stopping;
   }
 
   /**
-   * Wire up lazy transcoding of inbound viewer talkback to the camera's codec.
-   *
-   * Subscribes to the sink's `backchannel` event and, on the first inbound RTP
-   * packet, spins up a {@link BackchannelTranscoder} converting from the
-   * advertised codec to whatever the source's backchannel expects, forwarding the
-   * result upstream. The transcoder is created lazily, torn down when the relay
-   * stops, and discarded on pipeline failure so the next inbound packet rebuilds
-   * it instead of pushing into a dead pipeline forever.
-   *
-   * @param sink - The RTSP server sink emitting inbound viewer talkback
-   *
-   * @param advertise - The talkback codec advertised to viewers, used as the transcoder input format
-   *
-   * @internal
-   */
-  private wireBackchannelTranscode(sink: RtspServerSink, advertise: Exclude<RtspServerSinkOptions['backchannel'], boolean | undefined>): void {
-    let transcoder: BackchannelTranscoder | undefined;
-    let starting: Promise<void> | undefined;
-
-    const reset = (): void => {
-      const closing = transcoder;
-      transcoder = undefined;
-      starting = undefined;
-      // Fire-and-forget: close() reports its own failures via the logger.
-      void closing?.close();
-    };
-
-    sink.on('backchannel', (rtp) => {
-      const source = this.source;
-      if (!supportsBackchannel(source) || !source.backchannel) return;
-      if (!transcoder) {
-        const camera = source.backchannel;
-        transcoder = new BackchannelTranscoder({
-          from: advertise,
-          to: { codec: camera.codec, codecId: camera.codecId, sampleRate: camera.clockRate, channels: camera.channels, format: 'rtp' },
-          output: (buf) => source.sendBackchannel(buf),
-          onError: (error) => {
-            this.logger?.error?.('[rtsp] backchannel transcoder failed:', error);
-            reset();
-          },
-          logger: this.logger,
-        });
-        starting = transcoder.start();
-        starting.catch((error) => {
-          this.logger?.error?.('[rtsp] backchannel transcoder failed to start:', error);
-          reset();
-        });
-      }
-      // Start failures are handled above; the push chain only needs to not throw.
-      starting?.then(() => transcoder?.push(rtp)).catch(() => undefined);
-    });
-
-    this.on('stop', reset);
-  }
-
-  /**
-   * Tear down on end-of-stream, letting sinks flush their backlog first.
-   *
-   * Unlike {@link Relay.stop}, this drains each sink's queue before closing so
-   * buffered packets are not discarded, then closes the source and resets to
-   * idle. Used when the upstream ends on its own rather than on a caller request.
-   *
-   * @returns A promise that resolves once teardown is complete
-   *
-   * @internal
-   */
-  private async gracefulStop(): Promise<void> {
-    this.cancelIdleTimer();
-    if (this.state !== 'running') return;
-    this.state = 'stopping';
-
-    await Promise.all([...this.channels].map((c) => c.drainAndClose()));
-
-    try {
-      await this.source.close();
-    } catch (error) {
-      this.logger?.error?.('[rtsp] source close failed:', error);
-    }
-
-    this.streamInfo = undefined;
-    this.videoIndexes.clear();
-    this.startPromise = undefined;
-    this.state = 'idle';
-    this.emit('stop');
-  }
-
-  /**
-   * Perform the actual upstream open and transition into the running state.
-   *
-   * Opens the source, records the resolved stream info and video track indexes,
-   * initializes already-attached sinks before any packet flows, emits `start`,
-   * and launches the pump loop. On failure it resets to idle and re-raises after
-   * emitting `error`. Backs the idempotent {@link Relay.start} entry point.
+   * Open the source and go live.
    *
    * @returns A promise that resolves once the relay is running
    *
@@ -577,247 +363,231 @@ export class Relay extends TypedEmitter<RelayEvents> {
    */
   private async runStart(): Promise<void> {
     this.state = 'starting';
+    let info: StreamInfo;
     try {
-      const info = await this.source.open();
-      // stop() may have been requested while the open was in flight; it owns
-      // the teardown, so unwind quietly instead of going live on a closed source.
-      if (this.state !== 'starting') return;
-      this.streamInfo = info;
-      this.videoIndexes.clear();
-      for (const track of info.tracks) {
-        if (track.kind === 'video') this.videoIndexes.add(track.index);
-      }
-      const hadChannels = this.channels.size > 0;
-      // Initialize sinks that are already attached before any packet flows —
-      // otherwise a fast (non-realtime) source can drain before they're ready.
-      await Promise.all(
-        [...this.channels].map((c) =>
-          c.init(info).catch((error) => {
-            this.logger?.error?.('[rtsp] sink init failed:', error);
-            this.emit('sink:error', c.sink, error);
-            return c.close();
-          }),
-        ),
-      );
-      if (this.state !== 'starting') return;
-      this.state = 'running';
-      this.emit('start', info);
-      void this.pumpLoop();
-      // Every attached sink may have died during init. Explicit start()/autoStart
-      // with no sinks keeps running (sinks are piped later), but when sinks were
-      // present and are all gone, fall back to the idle teardown path — otherwise
-      // the upstream would pump into the void forever.
-      if (hadChannels && this.channels.size === 0) this.scheduleIdleStop();
+      info = await this.source.open();
     } catch (error) {
-      // An open aborted by a concurrent stop() is deliberate, not a failure.
-      if ((this.state as RelayState) !== 'starting') return;
-      this.startPromise = undefined;
+      // a stop() during the open aborted it on purpose
+      if (this.state !== 'starting') return;
+      this.starting = undefined;
       this.state = 'idle';
       this.emit('error', error);
       throw error;
     }
+    if (this.state !== 'starting') {
+      // teardown closed the source before this open finished, a source that ignored that close is open now
+      await this.closeSource();
+      return;
+    }
+
+    this.streamInfo = info;
+    for (const track of info.tracks) {
+      if (track.kind === 'video') this.videoIndexes.add(track.index);
+    }
+    // sinks must be ready before the first packet, a non-live source can drain before they are
+    await Promise.all([...this.channels].map((channel) => channel.init(info)));
+    if (this.state !== 'starting') return;
+
+    this.state = 'running';
+    this.emit('start', info);
+    void this.pump();
+    // all sinks left or failed during the start, do not pump into the void
+    if (this.sinkSeen && this.channels.size === 0) this.scheduleIdleStop();
   }
 
   /**
-   * Continuously pull packets from the source and dispatch them to sinks.
+   * Tear the upstream and the attached sinks down.
    *
-   * Iterates the source's packet stream under an abort controller until the
-   * signal is aborted or the stream ends. A natural end triggers graceful
-   * teardown; an unexpected error emits `error` and forces a stop. Aborted
-   * iterations exit quietly so explicit stops are not reported as failures.
+   * Sinks piped while this runs are left alone; they restart the relay once it
+   * is idle.
    *
-   * @returns A promise that resolves when the pump loop exits
+   * @param drain - Write each sink's backlog before closing it (upstream end)
+   *
+   * @returns A promise that resolves once the relay is idle
    *
    * @internal
    */
-  private async pumpLoop(): Promise<void> {
+  private async teardown(drain: boolean): Promise<void> {
+    const pendingStart = this.state === 'starting' ? this.starting : undefined;
+    this.state = 'stopping';
+    this.pullAbort?.abort();
+    this.pullAbort = undefined;
+    const channels = [...this.channels];
+
+    if (pendingStart) {
+      // closing the source aborts the pending open, runStart then sees 'stopping' and unwinds
+      await this.closeSource();
+      await pendingStart.catch(() => undefined);
+      await Promise.all(channels.map((channel) => channel.close()));
+    } else {
+      await Promise.all(channels.map((channel) => (drain ? channel.drainAndClose() : channel.close())));
+      await this.closeSource();
+    }
+
+    this.streamInfo = undefined;
+    this.videoIndexes.clear();
+    this.sinkSeen = this.channels.size > 0;
+    this.starting = undefined;
+    this.stopping = undefined;
+    this.state = 'idle';
+    this.emit('stop');
+  }
+
+  /**
+   * Pull packets from the source and fan them out until it ends, fails, stalls or is aborted.
+   *
+   * @returns A promise that resolves when the pull loop exits
+   *
+   * @internal
+   */
+  private async pump(): Promise<void> {
     const abort = new AbortController();
     this.pullAbort = abort;
 
-    // Silent-stall watchdog: a wedged live source delivers no packet, no EOF and
-    // no error, so the for-await below would suspend forever. A periodic check on
-    // the gap since the last packet aborts the pull when it exceeds stallTimeout;
-    // `stalled` distinguishes that from a deliberate stop() abort so it surfaces
-    // as an error rather than a clean end.
+    let lastPacketAt = performance.now();
     let stalled = false;
-    let lastPacketAt = Date.now();
-    let watchdog: ReturnType<typeof setInterval> | undefined;
+    let watchdog: NodeJS.Timeout | undefined;
     if (this.stallTimeout > 0) {
-      // Poll at a fraction of the timeout so detection latency stays well under it.
-      const interval = Math.max(250, Math.floor(this.stallTimeout / 4));
-      watchdog = setInterval(() => {
-        if (Date.now() - lastPacketAt >= this.stallTimeout) {
+      watchdog = setInterval(
+        () => {
+          if (performance.now() - lastPacketAt < this.stallTimeout) return;
           stalled = true;
           abort.abort();
-        }
-      }, interval);
-      watchdog.unref?.();
+        },
+        Math.max(MIN_STALL_CHECK_MS, Math.floor(this.stallTimeout / 4)),
+      );
+      watchdog.unref();
     }
 
+    let failure: unknown;
+    let failed = false;
     try {
       for await (const packet of this.source.packets(abort.signal)) {
-        lastPacketAt = Date.now();
         if (abort.signal.aborted) {
           packet.free();
           break;
         }
+        lastPacketAt = performance.now();
         this.dispatch(packet);
       }
-      if (stalled) {
-        const error = new Error(`upstream stalled: no packet within ${this.stallTimeout}ms`);
-        this.logger?.error?.('[rtsp] upstream stalled — tearing down:', error);
-        this.emit('error', error);
-        void this.stop();
-      } else if (!abort.signal.aborted) {
-        this.emit('end');
-        // Fire-and-forget: gracefulStop() handles its own failures internally.
-        void this.gracefulStop();
-      }
     } catch (error) {
-      if (stalled) {
-        const stallError = new Error(`upstream stalled: no packet within ${this.stallTimeout}ms`);
-        this.logger?.error?.('[rtsp] upstream stalled — tearing down:', stallError);
-        this.emit('error', stallError);
-        void this.stop();
-      } else if (!abort.signal.aborted) {
-        this.logger?.error?.('[rtsp] upstream pump failed:', error);
-        this.emit('error', error);
-        // Fire-and-forget: stop() handles its own failures internally.
-        void this.stop();
-      }
+      failure = error;
+      failed = true;
     } finally {
-      if (watchdog) clearInterval(watchdog);
+      clearInterval(watchdog);
     }
+
+    if (stalled) {
+      failure = new Error(`upstream stalled: no packet within ${this.stallTimeout}ms`);
+    } else if (abort.signal.aborted) {
+      return;
+    } else if (!failed) {
+      this.emit('end');
+      if (this.state === 'running') {
+        this.cancelIdleTimer();
+        this.stopping ??= this.teardown(true);
+      }
+      return;
+    }
+
+    this.logger?.error?.('[rtsp] upstream failed:', failure);
+    this.emit('error', failure);
+    void this.stop();
   }
 
   /**
-   * Fan one upstream packet out to every ready sink.
+   * Hand one upstream packet to every channel that wants it.
    *
-   * Offers an independently-owned clone to each keyframe-synced channel and frees
-   * the original once distribution is complete, ensuring single ownership per
-   * holder.
+   * Each interested channel but the last gets a clone, the last gets the
+   * original, so a single sink costs no clone at all.
    *
-   * @param packet - The demuxed packet to distribute; ownership is consumed here
+   * @param packet - The packet to distribute; ownership is consumed
    *
    * @internal
    */
   private dispatch(packet: MediaPacket): void {
-    // Clone per ready consumer (cheap, ref-counted for native packets); the
-    // original is freed once fanned out.
+    let target: SinkChannel | undefined;
     for (const channel of this.channels) {
-      if (channel.ready) channel.offer(packet.clone());
+      if (!channel.accepts(packet)) continue;
+      target?.offer(packet.clone());
+      target = channel;
     }
-    packet.free();
+    if (target) target.offer(packet);
+    else packet.free();
   }
 
   /**
-   * Bring a freshly-piped channel online.
+   * Start the upstream for a newly piped channel and initialize the channel.
    *
-   * Ensures the upstream is started, then initializes the channel against the
-   * resolved stream info if the relay is already running. If the upstream fails
-   * to start the channel is closed and dropped; if it was removed in the
-   * meantime no further work is done.
+   * @param channel - The channel to bring online
    *
-   * @param channel - The newly added sink channel to activate
-   *
-   * @returns A promise that resolves once activation completes
+   * @returns A promise that resolves once the channel is initialized or dropped
    *
    * @internal
    */
-  private async activateChannel(channel: SinkChannel): Promise<void> {
+  private async activate(channel: SinkChannel): Promise<void> {
     try {
       await this.start();
     } catch {
-      // start() already emitted 'error'; drop the freshly-added channel.
+      // start() already emitted 'error'
       await channel.close();
       return;
     }
-    if (!this.channels.has(channel)) return;
-    if (!this.streamInfo) return;
-    try {
-      await channel.init(this.streamInfo);
-    } catch (error) {
-      // A failing sink must not become an unhandled rejection (pipe() cannot
-      // await this); isolate it like any other sink failure.
-      this.logger?.error?.('[rtsp] sink init failed:', error);
-      this.emit('sink:error', channel.sink, error);
-      await channel.close();
-    }
+    if (this.channels.has(channel) && this.streamInfo) await channel.init(this.streamInfo);
   }
 
   /**
-   * Handle a channel that has closed itself.
+   * Forget a closed channel and schedule the idle teardown after the last one.
    *
-   * Removes the channel from the active set, emits `sink:removed`, and schedules
-   * idle teardown when the last sink leaves while the relay is running. Invoked
-   * via the channel's `onClosed` callback.
-   *
-   * @param channel - The channel that has closed
+   * @param channel - The channel that closed
    *
    * @internal
    */
   private handleChannelClosed(channel: SinkChannel): void {
-    if (this.channels.delete(channel)) {
-      this.emit('sink:removed', channel.sink);
-    }
-    if (this.channels.size === 0 && this.state === 'running') {
-      this.scheduleIdleStop();
-    }
+    if (this.channels.delete(channel)) this.emit('sink:removed', channel.sink);
+    if (this.channels.size === 0 && this.state === 'running') this.scheduleIdleStop();
   }
 
   /**
-   * Schedule (or immediately perform) teardown after the last sink leaves.
-   *
-   * When `idleTimeout` is zero or negative the relay stops at once; otherwise an
-   * unref'd timer is armed and the relay stops after the timeout only if no sink
-   * has reattached in the meantime, allowing reconnecting clients to reuse the
-   * still-open upstream.
+   * Stop now, or after {@link RelayOptions.idleTimeout} if no sink returned by then.
    *
    * @internal
    */
   private scheduleIdleStop(): void {
     this.cancelIdleTimer();
     if (this.idleTimeout <= 0) {
-      this.stop();
+      void this.stop();
       return;
     }
     this.idleTimer = setTimeout(() => {
       this.idleTimer = undefined;
-      if (this.channels.size === 0) this.stop();
+      if (this.channels.size === 0) void this.stop();
     }, this.idleTimeout);
-    this.idleTimer.unref?.();
+    this.idleTimer.unref();
   }
 
   /**
-   * Cancel any pending idle teardown timer.
-   *
-   * Clears the armed idle timer if one exists, so a newly attached sink keeps the
-   * upstream alive.
+   * Cancel a pending idle teardown.
    *
    * @internal
    */
   private cancelIdleTimer(): void {
-    if (this.idleTimer) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = undefined;
-    }
+    clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
   }
 
   /**
-   * Find the channel wrapping a given sink.
+   * Close the source, logging instead of throwing.
    *
-   * Linearly scans the active channels for the one bound to the supplied sink.
-   *
-   * @param sink - The sink to look up
-   *
-   * @returns The matching channel, or `undefined` if the sink is not attached
+   * @returns A promise that resolves once the source is closed
    *
    * @internal
    */
-  private findChannel(sink: Sink): SinkChannel | undefined {
-    for (const channel of this.channels) {
-      if (channel.sink === sink) return channel;
+  private async closeSource(): Promise<void> {
+    try {
+      await this.source.close();
+    } catch (error) {
+      this.logger?.error?.('[rtsp] source close failed:', error);
     }
-    return undefined;
   }
 }

@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
 
       # No --ignore-scripts: node-av's postinstall fetches the FFmpeg binary the tests need.
       - run: npm ci

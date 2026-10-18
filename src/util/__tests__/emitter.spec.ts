@@ -21,7 +21,7 @@ describe('TypedEmitter', () => {
 
   it("does not throw when 'error' is emitted without a listener", () => {
     const emitter = new TestEmitter();
-    // A raw Node EventEmitter would throw the payload here and crash the process.
+    // a plain EventEmitter would throw the payload here and crash the process
     expect(() => emitter.emit('error', new Error('boom'))).not.toThrow();
     expect(emitter.emit('error', new Error('boom'))).toBe(false);
   });

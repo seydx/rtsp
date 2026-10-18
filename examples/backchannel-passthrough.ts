@@ -1,9 +1,9 @@
 /**
  * Backchannel Pass-Through
  *
- * Two-way audio relay: pulls an RTSP camera with the ONVIF backchannel enabled and re-serves it
- * locally while advertising the camera's own talkback codec. Because the advertised codec matches
- * the upstream verbatim, inbound viewer RTP is forwarded straight to the camera with no transcoding.
+ * Two-way audio relay. Pulls a camera with its ONVIF backchannel and serves it
+ * again while advertising the camera's own talkback codec, so viewer audio is
+ * forwarded to the camera without transcoding.
  *
  * Usage: tsx examples/backchannel-passthrough.ts <rtsp_url>
  *
@@ -11,33 +11,28 @@
  *   tsx examples/backchannel-passthrough.ts rtsp://user:pass@camera.local/stream
  */
 
-import { Relay } from '../src/index.js';
-import { AvSource } from '../src/sources/index.js';
+import { AvSource, Relay, RtspServerSink } from '../src/index.js';
 
-// Camera URL is the first CLI arg; fall back to a placeholder so the file is self-contained.
 const input = process.argv[2] ?? 'rtsp://user:pass@camera.local/stream';
 
-// TCP transport is firewall-friendly; backchannel: true requests the camera's ONVIF talkback stream.
 const source = new AvSource(input, { transport: 'tcp', backchannel: true });
+const relay = new Relay({ source, idleTimeout: 10_000 });
 
-const relay = new Relay({ source });
+// true advertises the camera's talkback format as is
+const server = await new RtspServerSink(relay, { path: 'live', backchannel: true }).listen();
+console.log('two-way RTSP relay ready at', server.url);
 
-// backchannel: true advertises the upstream's own talkback codec, so viewer RTP is forwarded
-// as-is to the camera (pass-through) — no transcoding step is inserted.
-const server = await relay.serveRtsp({ path: 'live', backchannel: true });
+server.on('backchannel:start', () => console.log('viewer started talking'));
+server.on('backchannel:stop', () => console.log('viewer stopped talking'));
 
-console.log('Two-way RTSP relay ready at', server.url);
-
-// Open the upstream up front so we can confirm whether the camera actually advertised a backchannel.
+// open the upstream now to learn whether the camera offers talkback at all
 await relay.start();
-if (!source.backchannel) {
-  // Pass-through still serves video/audio downstream, but talkback will be silently unavailable.
-  console.warn('Camera advertised no backchannel — talkback is unavailable.');
-} else {
-  console.log(`Talkback codec: ${source.backchannel.codec} @ ${source.backchannel.clockRate}Hz`);
-}
+if (source.backchannel) console.log(`talkback codec: ${source.backchannel.codec} @ ${source.backchannel.clockRate} Hz`);
+else console.warn('the camera advertises no backchannel, talkback is unavailable');
 
-// Tear the relay (and its server sink) down cleanly on Ctrl+C.
 process.on('SIGINT', () => {
-  relay.stop().then(() => process.exit(0));
+  void server
+    .shutdown()
+    .then(() => relay.stop())
+    .then(() => process.exit(0));
 });

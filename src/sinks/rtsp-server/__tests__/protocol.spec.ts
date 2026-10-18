@@ -1,8 +1,6 @@
-import { createHash } from 'node:crypto';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
-import { RtspAuth } from '../auth.js';
-import { buildResponse, RtspParser } from '../protocol.js';
+import { buildResponse, RtspParser, uriPath } from '../protocol.js';
 
 describe('RtspParser', () => {
   it('parses a request split across chunks', () => {
@@ -10,116 +8,79 @@ describe('RtspParser', () => {
     expect(parser.push(Buffer.from('OPTIONS rtsp://h/live RTSP/1.0\r\nCSe'))).toEqual([]);
     const out = parser.push(Buffer.from('q: 2\r\n\r\n'));
     expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({ type: 'request' });
-    if (out[0].type === 'request') {
-      expect(out[0].request.method).toBe('OPTIONS');
-      expect(out[0].request.headers.cseq).toBe('2');
-    }
+    expect(out[0]).toMatchObject({ type: 'request', request: { method: 'OPTIONS', uri: 'rtsp://h/live', headers: { cseq: '2' } } });
+  });
+
+  it('lower-cases header names and upper-cases the method', () => {
+    const parser = new RtspParser();
+    const [message] = parser.push(Buffer.from('describe rtsp://h RTSP/1.0\r\nCSeq: 1\r\nX-Custom-Thing:  value \r\n\r\n'));
+    expect(message).toMatchObject({ type: 'request', request: { method: 'DESCRIBE', headers: { 'x-custom-thing': 'value' } } });
   });
 
   it('parses a request with a body via Content-Length', () => {
     const parser = new RtspParser();
-    const msg = 'ANNOUNCE rtsp://h/live RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 5\r\n\r\nhello';
-    const out = parser.push(Buffer.from(msg));
-    expect(out).toHaveLength(1);
-    if (out[0].type === 'request') expect(out[0].request.body?.toString()).toBe('hello');
+    const out = parser.push(Buffer.from('ANNOUNCE rtsp://h/live RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 5\r\n\r\nhel'));
+    expect(out).toEqual([]);
+    const [message] = parser.push(Buffer.from('lo'));
+    expect(message.type === 'request' && message.request.body?.toString()).toBe('hello');
   });
 
-  it('parses interleaved binary frames', () => {
+  it('parses interleaved binary frames, also when split', () => {
     const parser = new RtspParser();
     const payload = Buffer.from([1, 2, 3, 4]);
     const frame = Buffer.concat([Buffer.from([0x24, 2, 0, payload.length]), payload]);
-    const out = parser.push(frame);
-    expect(out).toHaveLength(1);
-    expect(out[0]).toEqual({ type: 'interleaved', frame: { channel: 2, data: payload } });
+    expect(parser.push(frame.subarray(0, 3))).toEqual([]);
+    expect(parser.push(frame.subarray(3))).toEqual([{ type: 'interleaved', channel: 2, data: payload }]);
   });
 
-  it('handles back-to-back messages in one chunk', () => {
+  it('keeps arrival order across mixed requests and frames', () => {
     const parser = new RtspParser();
-    const a = 'OPTIONS rtsp://h RTSP/1.0\r\nCSeq: 1\r\n\r\n';
-    const b = 'DESCRIBE rtsp://h RTSP/1.0\r\nCSeq: 2\r\n\r\n';
-    const out = parser.push(Buffer.from(a + b));
+    const frame = Buffer.from([0x24, 1, 0, 1, 0xff]);
+    const request = Buffer.from('GET_PARAMETER rtsp://h RTSP/1.0\r\nCSeq: 5\r\n\r\n');
+    const out = parser.push(Buffer.concat([frame, request, frame]));
+    expect(out.map((message) => message.type)).toEqual(['interleaved', 'request', 'interleaved']);
+  });
+
+  it('handles back-to-back requests in one chunk', () => {
+    const parser = new RtspParser();
+    const out = parser.push(Buffer.from('OPTIONS rtsp://h RTSP/1.0\r\nCSeq: 1\r\n\r\nDESCRIBE rtsp://h RTSP/1.0\r\nCSeq: 2\r\n\r\n'));
     expect(out).toHaveLength(2);
   });
 
-  it('rejects a request head that never terminates (buffer-growth DoS)', () => {
+  it('rejects a request head that never terminates', () => {
     const parser = new RtspParser();
-    // No CRLFCRLF anywhere — the parser must bail instead of buffering forever.
+    // no CRLFCRLF anywhere, buffering forever would let a client exhaust memory
     expect(() => parser.push(Buffer.alloc(17 * 1024, 0x41))).toThrow(/head exceeds/);
   });
 
-  it('rejects an oversized declared Content-Length', () => {
-    const parser = new RtspParser();
-    const msg = 'ANNOUNCE rtsp://h/live RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 999999999\r\n\r\n';
-    expect(() => parser.push(Buffer.from(msg))).toThrow(/Content-Length/);
-  });
-
-  it('rejects a malformed Content-Length', () => {
-    const parser = new RtspParser();
-    const msg = 'ANNOUNCE rtsp://h/live RTSP/1.0\r\nCSeq: 1\r\nContent-Length: -5\r\n\r\n';
-    expect(() => parser.push(Buffer.from(msg))).toThrow(/Content-Length/);
+  it('rejects an oversized or malformed Content-Length', () => {
+    expect(() => new RtspParser().push(Buffer.from('ANNOUNCE rtsp://h RTSP/1.0\r\nContent-Length: 999999999\r\n\r\n'))).toThrow(/Content-Length/);
+    expect(() => new RtspParser().push(Buffer.from('ANNOUNCE rtsp://h RTSP/1.0\r\nContent-Length: -5\r\n\r\n'))).toThrow(/Content-Length/);
+    expect(() => new RtspParser().push(Buffer.from('ANNOUNCE rtsp://h RTSP/1.0\r\nContent-Length: 1.5\r\n\r\n'))).toThrow(/Content-Length/);
   });
 });
 
 describe('buildResponse', () => {
   it('includes CSeq, Server and Content-Length for bodied responses', () => {
     const text = buildResponse({ status: 200, cseq: '3', headers: { 'Content-Type': 'application/sdp' }, body: 'v=0\r\n' }).toString();
-    expect(text).toContain('RTSP/1.0 200 OK');
-    expect(text).toContain('CSeq: 3');
+    expect(text.startsWith('RTSP/1.0 200 OK\r\nCSeq: 3\r\nServer: seydx-rtsp\r\n')).toBe(true);
     expect(text).toContain('Content-Type: application/sdp');
-    expect(text).toContain(`Content-Length: ${Buffer.byteLength('v=0\r\n')}`);
+    expect(text).toContain('Content-Length: 5');
+    expect(text.endsWith('\r\n\r\nv=0\r\n')).toBe(true);
+  });
+
+  it('ends a bodiless response with a blank line', () => {
+    const text = buildResponse({ status: 461 }).toString();
+    expect(text).toBe('RTSP/1.0 461 Unsupported Transport\r\nServer: seydx-rtsp\r\n\r\n');
   });
 });
 
-describe('RtspAuth (Digest)', () => {
-  const md5 = (s: string) => createHash('md5').update(s).digest('hex');
-
-  function digestHeader(nonce: string, uri = 'rtsp://h/live', method = 'DESCRIBE'): string {
-    const ha1 = md5('u:r:p');
-    const ha2 = md5(`${method}:${uri}`);
-    const response = md5(`${ha1}:${nonce}:${ha2}`);
-    return `Digest username="u", realm="r", nonce="${nonce}", uri="${uri}", response="${response}"`;
-  }
-
-  it('verifies a correct digest response and rejects a wrong one', () => {
-    const auth = new RtspAuth({ username: 'u', password: 'p', method: 'Digest', realm: 'r' });
-    const nonce = /nonce="([^"]+)"/.exec(auth.challenge())![1];
-    const uri = 'rtsp://h/live';
-    const header = digestHeader(nonce, uri);
-    const response = /response="([^"]+)"/.exec(header)![1];
-    expect(auth.verify('DESCRIBE', uri, header)).toBe(true);
-    expect(auth.verify('DESCRIBE', uri, header.replace(response, 'deadbeef'))).toBe(false);
-    expect(auth.verify('DESCRIBE', uri, undefined)).toBe(false);
-  });
-
-  it('issues a fresh nonce per challenge and accepts every unexpired one', () => {
-    const auth = new RtspAuth({ username: 'u', password: 'p', method: 'Digest', realm: 'r' });
-    const first = /nonce="([^"]+)"/.exec(auth.challenge())![1];
-    const second = /nonce="([^"]+)"/.exec(auth.challenge())![1];
-    expect(first).not.toBe(second);
-    // A client mid-handshake keeps using the nonce it was challenged with.
-    expect(auth.verify('DESCRIBE', 'rtsp://h/live', digestHeader(first))).toBe(true);
-    expect(auth.verify('DESCRIBE', 'rtsp://h/live', digestHeader(second))).toBe(true);
-  });
-
-  it('rejects a nonce the server never issued (replay from another instance)', () => {
-    const auth = new RtspAuth({ username: 'u', password: 'p', method: 'Digest', realm: 'r' });
-    auth.challenge();
-    expect(auth.verify('DESCRIBE', 'rtsp://h/live', digestHeader('feedfacefeedface'))).toBe(false);
-  });
-
-  it('expires nonces after their time-to-live window', () => {
-    vi.useFakeTimers();
-    try {
-      const auth = new RtspAuth({ username: 'u', password: 'p', method: 'Digest', realm: 'r' });
-      const nonce = /nonce="([^"]+)"/.exec(auth.challenge())![1];
-      expect(auth.verify('DESCRIBE', 'rtsp://h/live', digestHeader(nonce))).toBe(true);
-
-      vi.advanceTimersByTime(6 * 60 * 1000);
-      // Beyond the 5-minute window a captured Authorization header is useless.
-      expect(auth.verify('DESCRIBE', 'rtsp://h/live', digestHeader(nonce))).toBe(false);
-    } finally {
-      vi.useRealTimers();
-    }
+describe('uriPath', () => {
+  it('strips scheme, host, query and surrounding slashes', () => {
+    expect(uriPath('rtsp://127.0.0.1:8554/live/')).toBe('live');
+    expect(uriPath('rtsp://user:pass@host/cam/live/streamid=1?token=x')).toBe('cam/live/streamid=1');
+    expect(uriPath('/live')).toBe('live');
+    expect(uriPath('rtsp://host')).toBe('');
+    expect(uriPath('*')).toBe('*');
   });
 });

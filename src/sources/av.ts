@@ -1,491 +1,397 @@
-import { AV_NOPTS_VALUE, avGetCodecName, Demuxer } from 'node-av';
+import { avGetCodecName } from 'node-av/lib';
+import { Readable } from 'node:stream';
 
 import { wrapAvPacket } from '../av-packet.js';
+import { delay, linkAbort } from '../util/abort.js';
+import { captureLayout, DemuxInput, sameLayout } from './input.js';
 import { toTrackInfo } from './stream-info.js';
 
-import type { Packet } from 'node-av';
+import type { Packet } from 'node-av/lib';
 import type { BackchannelInfo, BackchannelSource, Logger, MediaPacket, Source, StreamInfo } from '../types.js';
+import type { AvInput, LayoutEntry } from './input.js';
 
 /**
- * Input accepted by an {@link AvSource}.
+ * Options for an {@link AvSource}.
  *
- * Mirrors everything node-av's `Demuxer.open` understands: a URL or path string
- * (`rtsp://`, `tcp://`, `http(s)://`, or a local file path) or an in-memory
- * `Buffer` of already-muxed bytes. The string form is also what enables RTSP
- * specific behaviour such as transport selection and the ONVIF backchannel.
- */
-export type AvInput = string | Buffer;
-
-/**
- * Options controlling how an {@link AvSource} opens and reads its input.
- *
- * Every field is optional; the defaults are tuned for inherently live inputs
- * such as RTSP cameras. Options that map onto libav demuxer settings (transport,
- * timeout, format) are forwarded to node-av's `Demuxer.open`, while pacing and
- * looping are applied by the source itself.
+ * Every field is optional. The defaults suit live inputs such as RTSP cameras;
+ * pacing and looping turn a finite input into a continuous live stream.
  */
 export interface AvSourceOptions {
   /**
-   * Force a specific input demuxer instead of relying on auto-detection.
+   * Input format to use instead of probing, for example `h264`, `mjpeg` or `mpegts`.
    *
-   * Useful for raw or headerless inputs where libav cannot probe the container,
-   * for example `h264` or `mpegts`. When omitted, the format is detected from
-   * the URL scheme and the input bytes.
+   * Needed for raw inputs without a container that libav cannot detect.
    */
   format?: string;
 
   /**
-   * Lower-layer transport used for RTSP inputs.
+   * RTSP lower transport.
    *
-   * Shorthand for the `rtsp_transport` demuxer option: `tcp` is interleaved and
-   * firewall-friendly, `udp` lowers latency at the cost of possible packet loss.
-   * Ignored for non-RTSP inputs. When omitted, libav chooses its own default.
+   * `tcp` interleaves media on the RTSP connection and passes firewalls, `udp`
+   * has lower latency but may lose packets. Ignored for other inputs.
    */
   transport?: 'tcp' | 'udp';
 
   /**
-   * Open and read timeout in microseconds.
+   * Socket timeout in milliseconds for opening and reading network inputs.
    *
-   * Passed through as the libav `timeout` (a.k.a. `stimeout`) option; the I/O
-   * layer aborts if no data arrives within this window. Note the unit is
-   * microseconds, so one second is `1_000_000`. When omitted, libav blocks
-   * indefinitely.
+   * libav gives up when no data arrives within this window, which ends or
+   * reconnects the source instead of hanging. Without it libav waits forever.
    */
   timeout?: number;
 
   /**
-   * Throttle delivery to a multiple of real time, like ffmpeg's `-re` flag.
+   * Deliver packets at a multiple of real time, like ffmpeg's `-re`.
    *
-   * A value of `1` paces packets to the source's own timestamps, which is
-   * required to serve a non-realtime input (such as a file) as a live stream;
-   * larger values play faster than real time. Omit for inherently live inputs
-   * (e.g. RTSP), which already arrive at their natural rate.
+   * `1` paces packets by their own timestamps, which is needed to serve a file
+   * as a live stream. Leave it unset for live inputs, they already arrive at
+   * their natural rate.
    */
   readrate?: number;
 
   /**
-   * Reopen the input automatically when it reaches the end.
+   * Reopen the input when it ends and keep streaming.
    *
-   * Enables looping a finite file or reconnecting a stream that terminates:
-   * after the input drains, the source closes and reopens it, continuing to
-   * yield packets on the same wall clock. Packet timestamps are shifted so the
-   * outgoing timeline stays continuous across passes — consumers never see
-   * time jump back to zero at a loop boundary. When `false` (the default), the
-   * packet iterator completes once the input ends.
+   * Timestamps continue across the restart, so consumers never see time jump
+   * back. A pass that produced packets and then failed to read is restarted
+   * too. Not available for `Readable` inputs.
+   *
+   * @default false
    */
   loop?: boolean;
 
   /**
-   * Automatically reopen the input after a read failure.
+   * Reopen the input after a read failure, with exponential backoff.
    *
-   * Without this, a mid-stream error (camera reboot, network blip) ends the
-   * packet iterator and surfaces the error to the consumer. With reconnect
-   * enabled, the source instead closes and reopens the input with an
-   * exponential backoff, resuming packet delivery once the upstream answers
-   * again. An unexpected end-of-stream is also treated as a disconnect when
-   * {@link AvSourceOptions.loop} is not set. Pass `true` for the defaults or an
-   * {@link AvReconnectOptions} to tune the backoff. Packet timestamps are
-   * shifted so the outgoing timeline stays continuous across the reconnect.
-   * The reconnected input is assumed to expose the same stream layout as the
-   * original; downstream sinks are not re-initialized.
+   * Without it, a failure (camera reboot, network drop) ends the packet stream
+   * with an error. With it, the source reopens the input and resumes; without
+   * {@link AvSourceOptions.loop} an unexpected end counts as a failure too.
+   * The reopened input must have the same stream layout, otherwise the stream
+   * fails so the relay can restart cleanly. Not available for `Readable`
+   * inputs.
+   *
+   * @default false
    */
   reconnect?: boolean | AvReconnectOptions;
 
   /**
-   * Request the ONVIF backchannel (talkback) on an RTSP input.
+   * Stamp packets with their arrival time instead of the input timestamps.
    *
-   * When enabled, `backchannel=1` is appended to the RTSP URL and, once the
-   * input is open, the camera's advertised send-only stream is exposed via
-   * {@link BackchannelSource}. If the camera advertises no backchannel, a
-   * warning is logged and the feature is silently unavailable.
+   * For live inputs without usable timestamps, such as MJPEG over HTTP or raw
+   * elementary streams. Audio keeps a gapless sample timeline while it stays
+   * close to the arrival time, so bursty delivery does not cause jitter.
+   *
+   * @default false
+   */
+  wallclock?: boolean;
+
+  /**
+   * Request the ONVIF backchannel (talkback) of an RTSP camera.
+   *
+   * Appends `backchannel=1` to the URL and exposes the camera's send-only
+   * stream through {@link AvSource.backchannel}. A camera without a
+   * backchannel logs a warning and streams normally.
+   *
+   * @default false
    */
   backchannel?: boolean;
 
   /**
-   * Extra format-specific demuxer options passed straight through to libav.
+   * Extra libav demuxer options, for example `{ probesize: 32768 }`.
    *
-   * Merged underneath the dedicated fields ({@link AvSourceOptions.transport}
-   * and {@link AvSourceOptions.timeout} take precedence over identically named
-   * keys here). Use this to set any libav option that has no first-class field.
+   * {@link AvSourceOptions.transport} and {@link AvSourceOptions.timeout} win
+   * over keys of the same name.
    */
   options?: Record<string, string | number>;
 
   /**
-   * Optional logger for diagnostic output.
-   *
-   * Receives debug messages when the input is opened and warnings or errors when
-   * the backchannel is missing or teardown fails. When omitted, the source runs
-   * silently.
+   * Logger for open, reconnect and backchannel diagnostics.
    */
   logger?: Logger;
 }
 
 /**
- * Backoff tuning for {@link AvSourceOptions.reconnect}.
- *
- * Controls how aggressively the source retries reopening its input after a
- * read failure. Every field is optional; the defaults reconnect quickly at
- * first and back off exponentially so an unreachable camera is not hammered.
+ * Backoff for {@link AvSourceOptions.reconnect}.
  */
 export interface AvReconnectOptions {
   /**
-   * Initial delay before the first reopen attempt, in milliseconds.
+   * Delay before the first reopen attempt in milliseconds.
    *
-   * Doubled on every consecutive failed attempt up to
-   * {@link AvReconnectOptions.maxDelayMs}. Defaults to `1000`.
+   * Doubles with every consecutive failed attempt up to
+   * {@link AvReconnectOptions.maxDelay}.
+   *
+   * @default 1000
    */
-  delayMs?: number;
+  delay?: number;
 
   /**
-   * Upper bound for the exponential backoff delay, in milliseconds.
+   * Upper bound of the backoff delay in milliseconds.
    *
-   * Defaults to `30000`.
+   * @default 30000
    */
-  maxDelayMs?: number;
+  maxDelay?: number;
 
   /**
-   * Maximum number of consecutive failed attempts before giving up.
+   * Consecutive failed attempts before the source gives up and fails.
    *
-   * Counts attempts since the last successfully delivered packet; once
-   * exceeded, the original error is thrown to the consumer. Defaults to
-   * unlimited retries.
+   * The count resets once a reopened input delivers packets again.
+   *
+   * @default Infinity
    */
   maxRetries?: number;
 }
 
 /**
- * Resolved reconnect policy with all defaults applied.
+ * Reconnect policy with defaults applied.
  *
  * @internal
  */
 interface ReconnectPolicy {
-  delayMs: number;
-  maxDelayMs: number;
+  delay: number;
+  maxDelay: number;
   maxRetries: number;
 }
 
-/**
- * Per-stream timestamp continuity state across input reopens.
- *
- * @internal
- */
-interface TimelineState {
-  /** Offset (in the stream's time base) added to every packet timestamp. */
-  offset: bigint;
-
-  /** End of the timeline seen so far: last adjusted timestamp plus duration. */
-  end: bigint;
-
-  /** Set after a reopen; the next packet of this stream re-anchors the offset. */
-  rebase: boolean;
-}
+const MS_TO_US = 1000;
 
 /**
- * Normalize the user-facing reconnect option into a concrete policy.
+ * Source backed by the node-av demuxer.
  *
- * @param option - The raw `reconnect` option value
- *
- * @returns The resolved policy, or `undefined` when reconnecting is disabled
- *
- * @internal
- */
-function resolveReconnect(option: boolean | AvReconnectOptions | undefined): ReconnectPolicy | undefined {
-  if (!option) return undefined;
-  const opts = option === true ? {} : option;
-  return {
-    delayMs: opts.delayMs ?? 1000,
-    maxDelayMs: opts.maxDelayMs ?? 30_000,
-    maxRetries: opts.maxRetries ?? Number.POSITIVE_INFINITY,
-  };
-}
-
-/**
- * Compute the exponential backoff delay for the given attempt number.
- *
- * @param policy - The resolved reconnect policy
- *
- * @param attempt - 1-based count of consecutive failed attempts
- *
- * @returns The delay in milliseconds, capped at the policy's maximum
- *
- * @internal
- */
-function backoffDelay(policy: ReconnectPolicy, attempt: number): number {
-  return Math.min(policy.delayMs * 2 ** (attempt - 1), policy.maxDelayMs);
-}
-
-/**
- * Append `backchannel=1` to an RTSP URL, preserving any existing query string.
- *
- * Returns the URL unchanged if a `backchannel` query parameter is already
- * present, so it is safe to call more than once.
- *
- * @param input - RTSP URL to augment
- *
- * @returns The URL with the backchannel query parameter ensured
- *
- * @internal
- */
-function withBackchannel(input: string): string {
-  if (/[?&]backchannel=/.test(input)) return input;
-  return input + (input.includes('?') ? '&' : '?') + 'backchannel=1';
-}
-
-/**
- * Wait for the given duration, resolving early if the signal aborts.
- *
- * Used by the read-rate pacer so that an in-flight delay does not hold up
- * shutdown when the consumer aborts mid-stream.
- *
- * @param ms - Delay in milliseconds
- *
- * @param signal - Abort signal that resolves the delay immediately when fired
- *
- * @returns A promise that settles after `ms` or on abort, whichever is first
- *
- * @internal
- */
-function delay(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const done = (): void => {
-      clearTimeout(timer);
-      signal.removeEventListener('abort', done);
-      resolve();
-    };
-    const timer = setTimeout(done, ms);
-    signal.addEventListener('abort', done, { once: true });
-  });
-}
-
-/**
- * A relay source backed by node-av's demuxer.
- *
- * Because libav handles the input, a single instance covers RTSP, TCP, HTTP(S),
- * local files and raw byte streams behind one uniform interface — the relay
- * never sees the difference. When pointed at an RTSP camera, it can also expose
- * the ONVIF backchannel so viewer audio can be sent back upstream, and it can
- * pace or loop finite inputs to behave like a continuous live stream.
+ * One class covers RTSP, HTTP(S), TCP, local files, in-memory buffers and
+ * readable byte streams, because libav does the input handling. For RTSP
+ * cameras it can expose the ONVIF backchannel so viewer audio reaches the
+ * camera, and it can pace and loop finite inputs so they behave like a live
+ * stream.
  *
  * @example
  * ```typescript
  * import { AvSource, Relay } from '@seydx/rtsp';
  *
- * // Live RTSP camera over TCP with talkback enabled.
  * const source = new AvSource('rtsp://user:pass@camera.local/stream', {
  *   transport: 'tcp',
+ *   timeout: 5000,
+ *   reconnect: true,
  *   backchannel: true,
  * });
- *
  * const relay = new Relay({ source });
- * await relay.start();
  * ```
  *
  * @example
  * ```typescript
  * import { AvSource } from '@seydx/rtsp';
  *
- * // Serve a file as a looping live stream paced to real time.
+ * // serve a file as an endless live stream
  * const source = new AvSource('/media/clip.mp4', { readrate: 1, loop: true });
  * ```
  *
- * @see {@link Source} For the relay source contract
+ * @example
+ * ```typescript
+ * import { AvSource } from '@seydx/rtsp';
  *
- * @see {@link BackchannelSource} For the talkback contract this source implements
+ * // MJPEG camera, stamped with the arrival time of each frame
+ * const source = new AvSource('http://camera.local/video.mjpg', { wallclock: true });
+ * ```
  *
- * @see {@link Relay} For wiring a source to one or more sinks
+ * @see {@link Source} For the source contract
+ *
+ * @see {@link BackchannelSource} For the talkback contract
+ *
+ * @see {@link MultiSource} For merging several inputs
+ *
+ * @see {@link Relay} For fanning the source out
  */
 export class AvSource implements Source, BackchannelSource {
-  private demuxer?: Demuxer;
-  private _backchannel?: BackchannelInfo;
-
-  /** Aborts the demuxer reads on teardown so close() never frees the demuxer mid-read. */
-  private abort?: AbortController;
-
-  /** Resolves when the active packets() read loop has fully unwound; awaited by close(). */
+  private readonly input: DemuxInput;
+  private readonly logger?: Logger;
+  private readonly reconnect?: ReconnectPolicy;
+  private lifecycle?: AbortController;
   private reading?: Promise<void>;
-
-  /** Per-stream timestamp continuity across loop/reconnect reopens, keyed by stream index. */
-  private readonly timeline = new Map<number, TimelineState>();
+  private layout: LayoutEntry[] = [];
+  private talkback?: BackchannelInfo;
 
   /**
-   * Create a source for the given input.
+   * Create a source for one input. Nothing is opened until {@link AvSource.open}.
    *
-   * No I/O happens here; the input is opened lazily by {@link AvSource.open}.
+   * @param input - URL, path, buffer or readable stream to demux
    *
-   * @param input - URL, path, or in-memory buffer to demux
+   * @param options - Transport, timeout, pacing, looping, reconnect and backchannel options
    *
-   * @param opts - Options controlling transport, timeout, pacing, looping and the backchannel
+   * @throws {Error} If a `Readable` input is combined with `loop` or `reconnect`
+   *
+   * @example
+   * ```typescript
+   * const source = new AvSource('rtsp://camera.local/stream', { transport: 'tcp' });
+   * ```
    */
   constructor(
-    private readonly input: AvInput,
-    private readonly opts: AvSourceOptions = {},
-  ) {}
+    input: AvInput,
+    private readonly options: AvSourceOptions = {},
+  ) {
+    if (input instanceof Readable && (options.loop || options.reconnect)) {
+      throw new Error('AvSource cannot loop or reconnect a Readable input, it can only be read once');
+    }
+    this.input = new DemuxInput(options.backchannel && typeof input === 'string' ? withBackchannel(input) : input, {
+      format: options.format,
+      options: demuxOptions(options),
+      wallclock: options.wallclock,
+      logger: options.logger,
+    });
+    this.logger = options.logger;
+    this.reconnect = resolveReconnect(options.reconnect);
+  }
 
   /**
-   * The upstream talkback format, once known.
+   * Talkback format of the camera, once the input is open.
    *
-   * Populated by {@link AvSource.open} when {@link AvSourceOptions.backchannel}
-   * is enabled and the camera advertises a send-only stream; otherwise
-   * `undefined`.
+   * `undefined` while closed, when {@link AvSourceOptions.backchannel} is off
+   * or when the camera advertises no backchannel.
    *
    * @example
    * ```typescript
    * await source.open();
-   * if (source.backchannel) {
-   *   console.log('talkback codec:', source.backchannel.codec);
-   * }
+   * console.log(source.backchannel?.codec);
    * ```
    */
   get backchannel(): BackchannelInfo | undefined {
-    return this._backchannel;
+    return this.talkback;
   }
 
   /**
    * Open the input and resolve its stream layout.
    *
-   * Establishes the demuxer connection and, when the backchannel is requested,
-   * reads the camera's talkback descriptor. Must be called once before
-   * {@link AvSource.packets}.
+   * @returns The tracks and, if requested and available, the backchannel format
    *
-   * @returns The resolved stream info, including tracks and an optional backchannel descriptor
-   *
-   * @throws {Error} If node-av fails to open the input
+   * @throws {Error} If the input cannot be opened or {@link AvSource.close} aborted the open
    *
    * @example
    * ```typescript
-   * const source = new AvSource('rtsp://camera.local/stream');
    * const info = await source.open();
-   * console.log(info.tracks.map((t) => t.codec));
+   * console.log(info.tracks.map((track) => track.codec));
    * ```
    */
   async open(): Promise<StreamInfo> {
-    this.abort = new AbortController();
-    this.timeline.clear();
-    this.demuxer = await this.openDemuxer();
-    if (this.opts.backchannel) this._backchannel = this.readBackchannel();
-    return { tracks: this.demuxer.streams.map(toTrackInfo), backchannel: this._backchannel };
+    const lifecycle = new AbortController();
+    this.lifecycle = lifecycle;
+    this.input.resetTimeline();
+    this.logger?.debug?.('[rtsp] AvSource opening', redact(this.input.input));
+
+    const streams = await this.input.open(lifecycle.signal);
+    this.layout = captureLayout(streams);
+    this.talkback = this.options.backchannel ? this.readBackchannel() : undefined;
+    return { tracks: this.input.tracks.map((stream) => toTrackInfo(stream)), backchannel: this.talkback };
   }
 
   /**
-   * Send one RTP packet of talkback audio back to the camera.
+   * Send one RTP packet of talkback audio to the camera.
    *
-   * The payload must already be encoded in the backchannel codec described by
-   * {@link AvSource.backchannel}. The call is a no-op when the input is not open
-   * or no backchannel is available, and send failures are logged rather than
-   * thrown.
+   * The packet must already use the codec and payload type of
+   * {@link AvSource.backchannel}. Does nothing while closed or without a
+   * backchannel; send failures are logged, not thrown.
    *
-   * @param rtp - A single RTP packet in the backchannel codec
+   * @param rtp - One RTP packet in the backchannel codec
    *
    * @example
    * ```typescript
-   * if (source.backchannel) {
-   *   source.sendBackchannel(rtpPacket);
-   * }
+   * if (source.backchannel) source.sendBackchannel(rtpPacket);
    * ```
    */
   sendBackchannel(rtp: Buffer): void {
-    if (!this.demuxer || !this._backchannel) return;
-    this.demuxer
+    const demuxer = this.input.current;
+    const talkback = this.talkback;
+    if (!demuxer || !talkback) return;
+    // node-av writes it on the reader thread between two reads, which keeps the order
+    demuxer
       .getFormatContext()
-      .sendRTSPPacket(this._backchannel.streamIndex, rtp)
-      .catch((error) => this.opts.logger?.debug?.('[rtsp] sendBackchannel failed:', error));
+      .sendRTSPPacket(talkback.streamIndex, rtp)
+      .catch((error: unknown) => this.logger?.debug?.('[rtsp] backchannel send failed:', error));
   }
 
   /**
-   * Yield demuxed media packets until the signal aborts or the input ends.
+   * Yield packets until the signal aborts, the input ends or it fails for good.
    *
-   * Drives one read pass over the input; when {@link AvSourceOptions.loop} is
-   * enabled, the input is reopened on completion and streaming continues on the
-   * same wall clock until aborted. With {@link AvSourceOptions.reconnect}, read
-   * failures (and unexpected end-of-stream) reopen the input under an
-   * exponential backoff instead of ending iteration. {@link AvSource.open} must
-   * have been called first.
+   * With {@link AvSourceOptions.loop} the input restarts when it ends; with
+   * {@link AvSourceOptions.reconnect} failures reopen it under backoff.
    *
-   * @param signal - Abort signal that stops iteration and aborts any in-flight pacing delay
+   * @param signal - Stops the iteration and interrupts a blocked read
    *
-   * @yields {MediaPacket} Demuxed media packets (each must be freed by the caller)
+   * @yields {MediaPacket} Demuxed packets, owned by the caller
    *
-   * @throws {Error} If called before {@link AvSource.open}, or when a read fails
-   * and reconnecting is disabled or its retries are exhausted
+   * @throws {Error} If called before {@link AvSource.open}, if a read fails
+   * without reconnect, if the retries are exhausted or if a reconnected input
+   * changed its stream layout
    *
    * @example
    * ```typescript
-   * const ac = new AbortController();
-   * await source.open();
-   * for await (const packet of source.packets(ac.signal)) {
+   * const controller = new AbortController();
+   * for await (const packet of source.packets(controller.signal)) {
    *   handle(packet);
    *   packet.free();
    * }
    * ```
    */
   async *packets(signal: AbortSignal): AsyncIterable<MediaPacket> {
-    if (!this.demuxer) throw new Error('AvSource.open() must be called before packets()');
+    const lifecycle = this.lifecycle;
+    if (!lifecycle || !this.input.current) throw new Error('AvSource.open() must be called before packets()');
 
-    // Tie the relay's pull signal to our internal abort so aborting either one
-    // stops the demuxer read (and lets close() unblock a stalled read).
-    const onAbort = (): void => this.abort?.abort();
-    if (signal.aborted) onAbort();
-    else signal.addEventListener('abort', onAbort, { once: true });
+    const unlink = linkAbort(signal, lifecycle);
+    let finish!: () => void;
+    // close() waits for this, freeing the demuxer under a running read crashes the process
+    this.reading = new Promise<void>((resolve) => (finish = resolve));
+    let attempts = 0;
 
-    const reconnect = resolveReconnect(this.opts.reconnect);
-    // Consecutive failed attempts; reset once a reopened input delivers packets.
-    const retry = { attempts: 0 };
-
-    // Expose the read loop's lifetime so close() can wait for it to unwind before
-    // freeing the demuxer — closing a demuxer mid-read is a process-killing UAF.
-    let done!: () => void;
-    this.reading = new Promise<void>((resolve) => (done = resolve));
     try {
-      while (!signal.aborted) {
-        let readError: Error | undefined;
+      for (;;) {
+        let failure: unknown;
+        let failed = false;
         let produced = false;
         try {
-          produced = yield* this.readOnce(signal);
-        } catch (error) {
-          if (signal.aborted || this.abort?.signal.aborted) break;
-          readError = error instanceof Error ? error : new Error(String(error));
-        }
-        if (signal.aborted) break;
-        if (produced) retry.attempts = 0;
-
-        if (readError === undefined && !this.opts.loop && !reconnect) break;
-
-        if (readError !== undefined || !this.opts.loop) {
-          // A read failure — or, with reconnect but no loop, an unexpected
-          // end-of-stream (a live input that "ends" has disconnected) — gates
-          // the reopen behind the backoff.
-          retry.attempts++;
-          if (!reconnect || retry.attempts > reconnect.maxRetries) {
-            if (readError !== undefined) throw readError;
-            break;
+          for await (const packet of this.readPass(lifecycle.signal)) {
+            produced = true;
+            yield wrapAvPacket(packet);
           }
-          if (readError !== undefined) this.opts.logger?.warn?.('[rtsp] AvSource read failed — reconnecting:', readError);
-          else this.opts.logger?.warn?.('[rtsp] AvSource input ended — reconnecting');
-          // Wait on the internal abort: it fires for both a consumer abort (via
-          // the onAbort bridge) and a direct close(), so teardown never has to
-          // sit out a long backoff.
-          await delay(backoffDelay(reconnect, retry.attempts), this.abort!.signal);
-          if (signal.aborted || this.abort?.signal.aborted) break;
+        } catch (error) {
+          failure = error;
+          failed = true;
+        }
+        if (lifecycle.signal.aborted) return;
+        if (produced) attempts = 0;
+        // some demuxers (mpjpeg) report the end of a file as invalid data, a loop restarts after it like after a clean end
+        if (failed && produced && this.options.loop) {
+          this.logger?.debug?.('[rtsp] AvSource pass ended with a read error, looping:', failure);
+          failed = false;
         }
 
-        // Reopen the input (loop restart or reconnect attempt) and keep
-        // streaming on the same wall clock.
-        if (!(await this.reopen(signal, reconnect, retry))) break;
+        // a pass without packets does not loop, it would spin on an empty input
+        if (failed || !this.options.loop || !produced) {
+          if (!this.reconnect || ++attempts > this.reconnect.maxRetries) {
+            if (failed) throw failure;
+            return;
+          }
+          const wait = backoff(this.reconnect, attempts);
+          if (failed) this.logger?.warn?.(`[rtsp] AvSource read failed, reconnecting in ${wait}ms:`, failure);
+          else this.logger?.warn?.(`[rtsp] AvSource input ended, reconnecting in ${wait}ms`);
+          await delay(wait, lifecycle.signal);
+          if (lifecycle.signal.aborted) return;
+        }
+
+        attempts = await this.reopen(lifecycle.signal, attempts);
+        if (lifecycle.signal.aborted) return;
       }
     } finally {
-      done();
+      unlink();
       this.reading = undefined;
+      finish();
     }
   }
 
   /**
-   * Release the input and all associated native resources.
+   * Close the input and release its native resources.
    *
-   * Safe to call more than once and at any time, including before
-   * {@link AvSource.open}. After closing, the source can be reopened with a fresh
-   * {@link AvSource.open} call.
+   * Aborts a pending open or read first and waits for the read loop to unwind.
+   * Safe to call at any time and more than once; the source can be opened
+   * again afterwards.
    *
-   * @returns A promise that resolves once the source is fully closed
+   * @returns A promise that resolves once the input is closed
    *
    * @example
    * ```typescript
@@ -493,105 +399,91 @@ export class AvSource implements Source, BackchannelSource {
    * ```
    */
   async close(): Promise<void> {
-    // Abort the read, wait for the packets() loop to fully unwind, then free the
-    // demuxer — never close it while a read is still in flight.
-    this.abort?.abort();
+    this.lifecycle?.abort();
     await this.reading;
-    await this.closeDemuxer();
+    await this.input.dispose();
+    this.talkback = undefined;
   }
 
   /**
-   * Open the underlying node-av demuxer for the configured input.
+   * Read one pass over the open input, paced by {@link AvSourceOptions.readrate}.
    *
-   * Builds the demuxer options bag, layering the dedicated transport and timeout
-   * fields over any caller-supplied options, and appends the backchannel query
-   * to string inputs when talkback is requested.
+   * @param signal - Ends the pass and shortens a pacing wait
    *
-   * @returns The opened demuxer
+   * @yields {Packet} Native packets, owned by the caller
    *
-   * @throws {Error} If node-av fails to open the input
+   * @throws {Error} If a read fails
    *
    * @internal
    */
-  private async openDemuxer(): Promise<Demuxer> {
-    const options: Record<string, string | number> = { ...this.opts.options };
-    if (this.opts.transport) options.rtsp_transport = this.opts.transport;
-    if (this.opts.timeout != null) options.timeout = this.opts.timeout;
+  private async *readPass(signal: AbortSignal): AsyncGenerator<Packet> {
+    const readrate = this.options.readrate ?? 0;
+    let anchor: { wall: number; media: number } | undefined;
 
-    let input = this.input;
-    if (this.opts.backchannel && typeof input === 'string') input = withBackchannel(input);
-
-    this.opts.logger?.debug?.('[rtsp] AvSource opening', input);
-    return Demuxer.open(input, {
-      format: this.opts.format as never,
-      options: options as never,
-      signal: this.abort?.signal,
-    });
+    for await (const packet of this.input.packets()) {
+      if (signal.aborted) {
+        packet.free();
+        return;
+      }
+      if (readrate > 0) {
+        const timeBase = packet.timeBase;
+        const dts = packet.dts;
+        if (timeBase.den > 0 && dts >= 0n) {
+          const media = (Number(dts) * timeBase.num) / timeBase.den / readrate;
+          anchor ??= { wall: performance.now(), media };
+          const wait = (media - anchor.media) * 1000 - (performance.now() - anchor.wall);
+          if (wait > 1) await delay(wait, signal);
+        }
+      }
+      yield packet;
+    }
   }
 
   /**
-   * Close the current input and reopen it, retrying under the reconnect policy.
+   * Close and reopen the input, retrying under the reconnect policy.
    *
-   * Backs both the plain `loop` restart (a failed reopen throws immediately when
-   * reconnecting is disabled, as before) and the reconnect path, where reopen
-   * failures are retried with exponential backoff until the policy's retry
-   * budget is exhausted.
+   * @param signal - Cancels the retries
    *
-   * @param signal - Abort signal that cancels retries and in-flight delays
+   * @param attempts - Consecutive failed attempts so far
    *
-   * @param reconnect - Resolved reconnect policy, or `undefined` when disabled
+   * @returns The updated attempt count; the caller checks `signal` for an abort
    *
-   * @param retry - Shared retry state across read and reopen failures
-   *
-   * @param retry.attempts - Count of consecutive failed attempts, reset by the caller once packets flow
-   *
-   * @returns `true` once the input is open again, `false` when aborted
-   *
-   * @throws {Error} If a reopen fails and reconnecting is disabled or its
-   * retries are exhausted
+   * @throws {Error} If reopening fails without reconnect, the retries are
+   * exhausted or the reopened input has a different stream layout
    *
    * @internal
    */
-  private async reopen(signal: AbortSignal, reconnect: ReconnectPolicy | undefined, retry: { attempts: number }): Promise<boolean> {
-    this.opts.logger?.debug?.('[rtsp] AvSource reopening input (loop/reconnect)');
-    await this.closeDemuxer();
+  private async reopen(signal: AbortSignal, attempts: number): Promise<number> {
+    await this.input.close();
     for (;;) {
-      if (signal.aborted || this.abort?.signal.aborted) return false;
+      if (signal.aborted) return attempts;
       try {
-        this.demuxer = await this.openDemuxer();
-        // The reopened input restarts its own clock (a looped file begins at
-        // zero again); re-anchor every stream so the outgoing timeline stays
-        // continuous — downstream muxers and viewers must never see time
-        // jump backwards.
-        for (const state of this.timeline.values()) state.rebase = true;
-        return true;
+        const streams = await this.input.open(signal);
+        if (!sameLayout(this.layout, streams)) throw new Error('AvSource input changed its stream layout after reopening');
+        if (this.options.backchannel) this.talkback = this.readBackchannel();
+        return attempts;
       } catch (error) {
-        if (signal.aborted || this.abort?.signal.aborted) return false;
-        retry.attempts++;
-        if (!reconnect || retry.attempts > reconnect.maxRetries) throw error;
-        this.opts.logger?.warn?.('[rtsp] AvSource reopen failed — retrying:', error);
-        // Internal abort covers both consumer aborts and direct close().
-        await delay(backoffDelay(reconnect, retry.attempts), this.abort!.signal);
+        if (signal.aborted) return attempts;
+        if (!this.reconnect || ++attempts > this.reconnect.maxRetries || this.input.current) throw error;
+        const wait = backoff(this.reconnect, attempts);
+        this.logger?.warn?.(`[rtsp] AvSource reopen failed, retrying in ${wait}ms:`, error);
+        await delay(wait, signal);
       }
     }
   }
 
   /**
-   * Read the camera's backchannel descriptor from the open demuxer.
+   * Read the send-only stream a camera advertises for talkback.
    *
-   * Looks for a send-only RTSP stream and maps its codec, payload type and clock
-   * parameters into a {@link BackchannelInfo}. Returns `undefined` (and logs a
-   * warning) when no backchannel was advertised.
-   *
-   * @returns The talkback descriptor, or `undefined` if none is available
+   * @returns The backchannel format, or `undefined` if the camera has none
    *
    * @internal
    */
   private readBackchannel(): BackchannelInfo | undefined {
-    const info = this.demuxer?.getFormatContext().getRTSPStreamInfo();
-    const send = info?.find((s) => s.direction === 'sendonly');
+    const streams = this.input.current?.getFormatContext().getRTSPStreamInfo();
+    const send = streams?.find((stream) => stream.direction === 'sendonly');
     if (!send) {
-      this.opts.logger?.warn?.('[rtsp] backchannel requested but the camera advertised none');
+      this.logger?.warn?.('[rtsp] backchannel requested but the camera advertises none');
       return undefined;
     }
     return {
@@ -603,131 +495,82 @@ export class AvSource implements Source, BackchannelSource {
       channels: send.channels ?? 1,
     };
   }
+}
 
-  /**
-   * Run a single read pass over the currently open demuxer.
-   *
-   * Iterates the demuxer's packets, applying optional read-rate pacing relative
-   * to the first packet's wall-clock arrival, and wraps each native packet as a
-   * relay {@link MediaPacket}. Aborting frees any in-flight packet and ends the
-   * pass.
-   *
-   * @param signal - Abort signal that stops iteration and shortcuts pacing delays
-   *
-   * @yields {MediaPacket} Media packets for one pass over the input (each must be freed by the caller)
-   *
-   * @returns `true` if the pass yielded at least one packet, letting the caller
-   * reset its reconnect backoff only once media actually flowed again
-   *
-   * @internal
-   */
-  private async *readOnce(signal: AbortSignal): AsyncGenerator<MediaPacket, boolean, void> {
-    const demuxer = this.demuxer!;
-    const readrate = this.opts.readrate;
-    let wallStart = 0;
-    let baseSeconds = 0;
-    let paced = false;
-    let produced = false;
+/**
+ * Build the libav demuxer options from the dedicated fields and the raw option bag.
+ *
+ * @param options - The source options
+ *
+ * @returns The merged option bag
+ *
+ * @internal
+ */
+function demuxOptions(options: AvSourceOptions): Record<string, string | number> {
+  const merged: Record<string, string | number> = { ...options.options };
+  if (options.transport) merged.rtsp_transport = options.transport;
+  if (options.timeout !== undefined) merged.timeout = Math.round(options.timeout * MS_TO_US);
+  return merged;
+}
 
-    try {
-      for await (const packet of demuxer.packets()) {
-        // node-av yields `null` as an end/flush sentinel — nothing to relay.
-        if (!packet) continue;
-        if (signal.aborted) {
-          packet.free();
-          return produced;
-        }
+/**
+ * Apply the defaults to the `reconnect` option.
+ *
+ * @param option - The raw option value
+ *
+ * @returns The policy, or `undefined` when reconnecting is off
+ *
+ * @internal
+ */
+function resolveReconnect(option: boolean | AvReconnectOptions | undefined): ReconnectPolicy | undefined {
+  if (!option) return undefined;
+  const config = option === true ? {} : option;
+  return {
+    delay: config.delay ?? 1000,
+    maxDelay: config.maxDelay ?? 30_000,
+    maxRetries: config.maxRetries ?? Number.POSITIVE_INFINITY,
+  };
+}
 
-        // Keep the outgoing timeline continuous across loop/reconnect reopens.
-        this.makeContinuous(packet);
+/**
+ * Exponential backoff delay for an attempt.
+ *
+ * @param policy - The reconnect policy
+ *
+ * @param attempt - 1-based count of consecutive failed attempts
+ *
+ * @returns The delay in milliseconds
+ *
+ * @internal
+ */
+function backoff(policy: ReconnectPolicy, attempt: number): number {
+  return Math.min(policy.delay * 2 ** (attempt - 1), policy.maxDelay);
+}
 
-        if (readrate && readrate > 0) {
-          const tb = packet.timeBase;
-          const dts = packet.dts;
-          if (tb && tb.den > 0 && dts >= 0n) {
-            const seconds = (Number(dts) * tb.num) / tb.den / readrate;
-            if (!paced) {
-              // Anchor the wall clock to the first paced packet so timing is relative, not absolute.
-              wallStart = Date.now();
-              baseSeconds = seconds;
-              paced = true;
-            }
-            const waitMs = (seconds - baseSeconds) * 1000 - (Date.now() - wallStart);
-            // Internal abort covers both consumer aborts and direct close().
-            if (waitMs > 1) await delay(waitMs, this.abort?.signal ?? signal);
-          }
-        }
+/**
+ * Append `backchannel=1` to an RTSP URL unless it already carries the parameter.
+ *
+ * @param url - The RTSP URL
+ *
+ * @returns The URL with the backchannel parameter
+ *
+ * @internal
+ */
+function withBackchannel(url: string): string {
+  if (/[?&]backchannel=/.test(url)) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}backchannel=1`;
+}
 
-        produced = true;
-        yield wrapAvPacket(packet);
-      }
-    } catch (error) {
-      // A read aborted by teardown (close()/abort) is expected; only surface real errors.
-      if (!signal.aborted && !this.abort?.signal.aborted) throw error;
-    }
-    return produced;
-  }
-
-  /**
-   * Shift a packet's timestamps so the outgoing timeline never jumps backwards.
-   *
-   * Each reopened input restarts its own clock (a looped file begins at zero;
-   * a reconnected camera may reset its RTP mapping), which would hand every
-   * downstream muxer and viewer a non-monotonic stream. On the first packet of
-   * each stream after a reopen, the offset is re-anchored so that packet lands
-   * exactly where the previous pass ended — for an input that reset to zero the
-   * shift equals the accumulated duration, for an upstream that kept counting
-   * it is roughly zero. The first pass is never modified.
-   *
-   * @param packet - The native packet to adjust in place
-   *
-   * @internal
-   */
-  private makeContinuous(packet: Packet): void {
-    const raw = packet.dts !== AV_NOPTS_VALUE ? packet.dts : packet.pts;
-    if (raw === AV_NOPTS_VALUE) return; // untimed packet — nothing to anchor on
-
-    let state = this.timeline.get(packet.streamIndex);
-    if (!state) {
-      state = { offset: 0n, end: 0n, rebase: false };
-      this.timeline.set(packet.streamIndex, state);
-    }
-    if (state.rebase) {
-      state.rebase = false;
-      state.offset = state.end - raw;
-    }
-    if (state.offset !== 0n) {
-      if (packet.pts !== AV_NOPTS_VALUE) packet.pts = packet.pts + state.offset;
-      if (packet.dts !== AV_NOPTS_VALUE) packet.dts = packet.dts + state.offset;
-    }
-
-    // Track the end of the timeline (last timestamp plus duration); a packet
-    // with unknown duration still advances by one tick so the next pass can
-    // never collide with it.
-    const adjusted = raw + state.offset;
-    const advance = packet.duration > 0n ? packet.duration : 1n;
-    if (adjusted + advance > state.end) state.end = adjusted + advance;
-  }
-
-  /**
-   * Close the current demuxer and clear the reference.
-   *
-   * Detaches the demuxer first so a concurrent abort cannot double-close it, then
-   * closes it. Close failures are logged and swallowed so teardown always
-   * completes.
-   *
-   * @returns A promise that resolves once the demuxer is closed
-   *
-   * @internal
-   */
-  private async closeDemuxer(): Promise<void> {
-    const demuxer = this.demuxer;
-    this.demuxer = undefined;
-    if (!demuxer) return;
-    try {
-      await demuxer.close();
-    } catch (error) {
-      this.opts.logger?.error?.('[rtsp] AvSource close failed:', error);
-    }
-  }
+/**
+ * Describe an input for logging without leaking URL credentials.
+ *
+ * @param input - The input to describe
+ *
+ * @returns A printable description
+ *
+ * @internal
+ */
+function redact(input: AvInput): string {
+  if (typeof input !== 'string') return Buffer.isBuffer(input) ? `<buffer ${input.length} bytes>` : '<stream>';
+  return input.replace(/\/\/[^/@]*@/, '//***@');
 }

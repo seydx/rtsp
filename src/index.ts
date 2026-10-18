@@ -1,46 +1,39 @@
-// Core relay
-export { Relay } from './relay.js';
-export type { RelayEvents, RelayOptions, RelayState } from './relay.js';
-
-// Shared contracts and types
-export { supportsBackchannel } from './types.js';
-export type { BackchannelInfo, BackchannelSource, Logger, MediaPacket, Sink, Source, StreamInfo, TrackInfo, TrackKind } from './types.js';
-
-// FFmpeg (node-av) log bridging
+export { requireAvPacket, wrapAvPacket } from './av-packet.js';
 export { installNativeLogging } from './native-logging.js';
+export { Relay } from './relay.js';
+export { CallbackSink, FfmpegSink, RtspAuth, RtspServerSink } from './sinks/index.js';
+export { AvSource, MultiSource } from './sources/index.js';
+export { BackchannelTranscoder, buildAacEldConfig, RawAudioTranscoder, TranscodeSink } from './transcode/index.js';
+export { supportsBackchannel } from './types.js';
+export { TypedEmitter } from './util/emitter.js';
+
 export type { NativeLoggingHandle, NativeLoggingOptions } from './native-logging.js';
-
-// Sources
-export { AvSource } from './sources/av.js';
-export type { AvInput, AvReconnectOptions, AvSourceOptions } from './sources/av.js';
-
-export { MultiSource } from './sources/multi.js';
-export type { MultiSourceInput } from './sources/multi.js';
-
-export { buildAacEldConfig, RawAudioTranscoder } from './sources/raw-audio-transcoder.js';
-export type { RawAudioInput, RawAudioTarget, RawAudioTranscoderOptions } from './sources/raw-audio-transcoder.js';
-
-// Sinks
-export { CallbackSink } from './sinks/callback.js';
-export type { CallbackSinkHandlers } from './sinks/callback.js';
-
-export { FfmpegSink } from './sinks/ffmpeg.js';
-export type { FfmpegOutput, FfmpegSinkOptions } from './sinks/ffmpeg.js';
-
-export { BackchannelTranscoder, ForwardAudioTranscoder, RtspAuth, RtspServerSink } from './sinks/rtsp-server/index.js';
+export type { RelayEvents, RelayOptions, RelayState } from './relay.js';
 export type {
-  AudioTranscodeTarget,
-  BackchannelAdvertise,
+  CallbackSinkHandlers,
+  FfmpegOutput,
+  FfmpegSinkOptions,
+  RtspAuthConfig,
+  RtspAuthResult,
+  RtspBackchannelOptions,
+  RtspServerEvents,
+  RtspServerSinkOptions,
+} from './sinks/index.js';
+export type { AvInput, AvReconnectOptions, AvSourceOptions, MultiSourceInput, MultiSourceOptions } from './sources/index.js';
+export type {
+  AudioTranscodeOptions,
   BackchannelInput,
   BackchannelTarget,
   BackchannelTranscoderOptions,
-  RtspAuthConfig,
-  RtspServerEvents,
-  RtspServerSinkOptions,
-} from './sinks/rtsp-server/index.js';
-
-// Packet helpers
-export { requireAvPacket, wrapAvPacket } from './av-packet.js';
-
-// node-av type re-exports
-export type { AVCodecID, IOOutputCallbacks, IRational, Packet, Stream } from 'node-av';
+  HardwareSetting,
+  RawAudioInput,
+  RawAudioTarget,
+  RawAudioTranscoderOptions,
+  TranscodeOptions,
+  TranscodeSinkOptions,
+  VideoTranscodeOptions,
+} from './transcode/index.js';
+export type { BackchannelFormat, BackchannelInfo, BackchannelSource, Logger, MediaPacket, Sink, Source, StreamInfo, TrackInfo, TrackKind } from './types.js';
+export type { HardwareContext, HardwareOptions, IOOutputCallbacks } from 'node-av/api';
+export type { AVCodecID } from 'node-av/constants';
+export type { IRational, Packet, Stream } from 'node-av/lib';
