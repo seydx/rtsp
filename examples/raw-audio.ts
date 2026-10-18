@@ -37,7 +37,7 @@ console.log(`serving at ${server.url}`);
 process.on('SIGINT', () => {
   clearInterval(timer);
   transcoder.close();
-  void server
+  server
     .shutdown()
     .then(() => relay.stop())
     .then(() => process.exit(0));

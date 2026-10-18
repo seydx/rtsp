@@ -287,7 +287,7 @@ suite('RtspServerSink stream lifecycle', () => {
       const text = await sdp;
       expect(text).toContain('m=video');
       expect(text).not.toContain('m=audio');
-      e remaining track keeps its id, viewers may have cached it
+      // the remaining track keeps its id, viewers may have cached it
       expect(text).toContain(`a=control:streamid=${info.tracks.indexOf(video)}`);
       expect(sink.trackKind(info.tracks.findIndex((track) => track.kind === 'audio'))).toBeUndefined();
     } finally {
@@ -330,13 +330,13 @@ suite('RtspServerSink stream lifecycle', () => {
       { detachDelay: 150, sdpTimeout: 0 },
     );
     try {
-      void sink.describe({} as never).catch(() => undefined);
+      sink.describe({} as never).catch(() => undefined);
       sink.sessionClosed({} as never);
       expect(calls.unpipe).toBe(0);
 
       // a DESCRIBE inside the window keeps the warm stream
       await delay(50);
-      void sink.describe({} as never).catch(() => undefined);
+      sink.describe({} as never).catch(() => undefined);
       await delay(250);
       expect(calls.unpipe).toBe(0);
       expect(calls.pipe).toBe(1);

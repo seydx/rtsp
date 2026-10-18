@@ -1,4 +1,5 @@
 export { requireAvPacket, wrapAvPacket } from './av-packet.js';
+export { grabFrame } from './grab-frame.js';
 export { installNativeLogging } from './native-logging.js';
 export { Relay } from './relay.js';
 export { CallbackSink, FfmpegSink, RtspAuth, RtspServerSink } from './sinks/index.js';
@@ -7,6 +8,7 @@ export { BackchannelTranscoder, buildAacEldConfig, RawAudioTranscoder, Transcode
 export { supportsBackchannel } from './types.js';
 export { TypedEmitter } from './util/emitter.js';
 
+export type { GrabFrameOptions } from './grab-frame.js';
 export type { NativeLoggingHandle, NativeLoggingOptions } from './native-logging.js';
 export type { RelayEvents, RelayOptions, RelayState } from './relay.js';
 export type {

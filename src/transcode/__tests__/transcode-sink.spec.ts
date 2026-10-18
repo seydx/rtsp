@@ -37,8 +37,8 @@ interface Seen {
 function recorder(): { sink: CallbackSink; seen: Seen } {
   const seen: Seen = { inits: [], packets: [], closes: 0 };
   const sink = new CallbackSink({
-    onInit: (info: StreamInfo) =>
-      void seen.inits.push(
+    onInit: (info: StreamInfo) => {
+      seen.inits.push(
         info.tracks.map((track) => {
           const par = track.native?.codecpar;
           return {
@@ -52,9 +52,14 @@ function recorder(): { sink: CallbackSink; seen: Seen } {
             channels: par?.channelLayout.nbChannels ?? 0,
           };
         }),
-      ),
-    onPacket: (packet) => void seen.packets.push({ index: packet.streamIndex, keyframe: packet.isKeyframe }),
-    onClose: () => void seen.closes++,
+      );
+    },
+    onPacket: (packet) => {
+      seen.packets.push({ index: packet.streamIndex, keyframe: packet.isKeyframe });
+    },
+    onClose: () => {
+      seen.closes++;
+    },
   });
   return { sink, seen };
 }
@@ -216,7 +221,9 @@ suite('TranscodeSink', () => {
         const { avgFrameRate } = info.tracks[0].native!;
         rates.push(avgFrameRate.num / avgFrameRate.den);
       },
-      onPacket: () => void count++,
+      onPacket: () => {
+        count++;
+      },
     });
     const relay = new Relay({ source: new AvSource(feed, { format: 'mpjpeg', wallclock: true }) });
     const stopped = new Promise<void>((resolve) => relay.on('stop', () => resolve()));
@@ -281,7 +288,10 @@ suite('TranscodeSink', () => {
     await run(
       new AvSource(av),
       new TranscodeSink(sink, {
-        video: (track) => void asked.push(`video ${track.codec}`),
+        video: (track) => {
+          asked.push(`video ${track.codec}`);
+          return undefined;
+        },
         audio: (track) => {
           asked.push(`audio ${track.codec}`);
           return { codec: 'libopus' };

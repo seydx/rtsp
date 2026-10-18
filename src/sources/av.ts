@@ -3,12 +3,14 @@ import { Readable } from 'node:stream';
 
 import { wrapAvPacket } from '../av-packet.js';
 import { delay, linkAbort } from '../util/abort.js';
-import { captureLayout, DemuxInput, sameLayout } from './input.js';
+import { captureLayout, DemuxInput } from './input.js';
+import { backoff, reopen, resolveReconnect } from './reconnect.js';
 import { toTrackInfo } from './stream-info.js';
 
 import type { Packet } from 'node-av/lib';
 import type { BackchannelInfo, BackchannelSource, Logger, MediaPacket, Source, StreamInfo } from '../types.js';
 import type { AvInput, LayoutEntry } from './input.js';
+import type { ReconnectPolicy } from './reconnect.js';
 
 /**
  * Options for an {@link AvSource}.
@@ -79,7 +81,10 @@ export interface AvSourceOptions {
    *
    * For live inputs without usable timestamps, such as MJPEG over HTTP or raw
    * elementary streams. Audio keeps a gapless sample timeline while it stays
-   * close to the arrival time, so bursty delivery does not cause jitter.
+   * close to the arrival time, so bursty delivery does not cause jitter. Audio
+   * that a burst of buffered data keeps more than 200 ms ahead for a whole
+   * second, as after an open that read ahead or after a stall, is cut back
+   * once by dropping that much, so it lines up with the video again.
    *
    * @default false
    */
@@ -139,17 +144,6 @@ export interface AvReconnectOptions {
    * @default Infinity
    */
   maxRetries?: number;
-}
-
-/**
- * Reconnect policy with defaults applied.
- *
- * @internal
- */
-interface ReconnectPolicy {
-  delay: number;
-  maxDelay: number;
-  maxRetries: number;
 }
 
 const MS_TO_US = 1000;
@@ -374,8 +368,13 @@ export class AvSource implements Source, BackchannelSource {
           if (lifecycle.signal.aborted) return;
         }
 
-        attempts = await this.reopen(lifecycle.signal, attempts);
+        attempts = await reopen(
+          { input: this.input, layout: this.layout, policy: this.reconnect, name: 'AvSource input', logger: this.logger },
+          attempts,
+          lifecycle.signal,
+        );
         if (lifecycle.signal.aborted) return;
+        if (this.options.backchannel) this.talkback = this.readBackchannel();
       }
     } finally {
       unlink();
@@ -440,39 +439,6 @@ export class AvSource implements Source, BackchannelSource {
   }
 
   /**
-   * Close and reopen the input, retrying under the reconnect policy.
-   *
-   * @param signal - Cancels the retries
-   *
-   * @param attempts - Consecutive failed attempts so far
-   *
-   * @returns The updated attempt count; the caller checks `signal` for an abort
-   *
-   * @throws {Error} If reopening fails without reconnect, the retries are
-   * exhausted or the reopened input has a different stream layout
-   *
-   * @internal
-   */
-  private async reopen(signal: AbortSignal, attempts: number): Promise<number> {
-    await this.input.close();
-    for (;;) {
-      if (signal.aborted) return attempts;
-      try {
-        const streams = await this.input.open(signal);
-        if (!sameLayout(this.layout, streams)) throw new Error('AvSource input changed its stream layout after reopening');
-        if (this.options.backchannel) this.talkback = this.readBackchannel();
-        return attempts;
-      } catch (error) {
-        if (signal.aborted) return attempts;
-        if (!this.reconnect || ++attempts > this.reconnect.maxRetries || this.input.current) throw error;
-        const wait = backoff(this.reconnect, attempts);
-        this.logger?.warn?.(`[rtsp] AvSource reopen failed, retrying in ${wait}ms:`, error);
-        await delay(wait, signal);
-      }
-    }
-  }
-
-  /**
    * Read the send-only stream a camera advertises for talkback.
    *
    * @returns The backchannel format, or `undefined` if the camera has none
@@ -511,40 +477,6 @@ function demuxOptions(options: AvSourceOptions): Record<string, string | number>
   if (options.transport) merged.rtsp_transport = options.transport;
   if (options.timeout !== undefined) merged.timeout = Math.round(options.timeout * MS_TO_US);
   return merged;
-}
-
-/**
- * Apply the defaults to the `reconnect` option.
- *
- * @param option - The raw option value
- *
- * @returns The policy, or `undefined` when reconnecting is off
- *
- * @internal
- */
-function resolveReconnect(option: boolean | AvReconnectOptions | undefined): ReconnectPolicy | undefined {
-  if (!option) return undefined;
-  const config = option === true ? {} : option;
-  return {
-    delay: config.delay ?? 1000,
-    maxDelay: config.maxDelay ?? 30_000,
-    maxRetries: config.maxRetries ?? Number.POSITIVE_INFINITY,
-  };
-}
-
-/**
- * Exponential backoff delay for an attempt.
- *
- * @param policy - The reconnect policy
- *
- * @param attempt - 1-based count of consecutive failed attempts
- *
- * @returns The delay in milliseconds
- *
- * @internal
- */
-function backoff(policy: ReconnectPolicy, attempt: number): number {
-  return Math.min(policy.delay * 2 ** (attempt - 1), policy.maxDelay);
 }
 
 /**

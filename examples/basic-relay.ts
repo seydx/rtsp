@@ -22,7 +22,7 @@ const server = await new RtspServerSink(relay, { path: 'live' }).listen();
 console.log('RTSP relay ready at', server.url);
 
 process.on('SIGINT', () => {
-  void server
+  server
     .shutdown()
     .then(() => relay.stop())
     .then(() => process.exit(0));

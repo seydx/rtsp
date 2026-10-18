@@ -26,6 +26,8 @@ export interface DemuxSettings {
   options?: Record<string, string | number>;
   /** Replace the input timestamps with the arrival time. */
   wallclock?: boolean;
+  /** After a reopen, skip the time the input was gone, to stay aligned with inputs that kept running. */
+  catchUp?: boolean;
   logger?: Logger;
 }
 
@@ -44,6 +46,8 @@ export interface LayoutEntry {
 const WALLCLOCK_TIME_BASE = new Rational(1, 90_000);
 // audio keeps its sample timeline while it stays this close to the wallclock
 const WALLCLOCK_TOLERANCE_S = 0.2;
+// audio that stays ahead by more than the tolerance for this long is cut back
+const WALLCLOCK_LEAD_WINDOW_S = 1;
 
 /**
  * Keeps the timestamps of one stream usable.
@@ -55,10 +59,19 @@ const WALLCLOCK_TOLERANCE_S = 0.2;
  * synthesized from their duration or the stream's frame rate. The first pass of
  * a timed input is never modified.
  *
+ * With catch-up, the timeline also skips the time between the last packet
+ * before and the first packet after a reopen, so an input that reconnected
+ * stays aligned with other inputs that kept running meanwhile.
+ *
  * In wallclock mode every packet is stamped with its arrival time instead.
  * Audio packets continue their own sample timeline while it stays within a
  * small tolerance of the wallclock, so bursty arrival does not turn into
- * audible jitter.
+ * audible jitter. A burst of buffered audio, as an input delivers what it read
+ * ahead while opening or what piled up during a stall, would keep that
+ * timeline ahead of the picture for good. Once it stays ahead by more than the
+ * tolerance for a whole window, as much audio as it is ahead is dropped.
+ * Devices that send their audio in large chunks fall back to no lead with
+ * every chunk and are left alone.
  *
  * @internal
  */
@@ -66,6 +79,11 @@ class TrackClock {
   private offset = 0n;
   private end = 0n;
   private rebase = false;
+  private resume?: number;
+  private last = 0n;
+  private arrival?: number;
+  private window?: { start: bigint; lead: bigint };
+  private skipUntil?: bigint;
   private readonly frameDuration: bigint;
   private readonly ticksPerSecond: number;
   private readonly tolerance: bigint;
@@ -75,11 +93,17 @@ class TrackClock {
    *
    * @param epoch - Wallclock origin in `performance.now()` milliseconds, set in wallclock mode
    *
+   * @param catchUp - Skip the time the input was gone on a reopen
+   *
+   * @param logger - Reports audio that is cut back to the wallclock
+   *
    * @internal
    */
   constructor(
     stream: Stream,
     private readonly epoch?: number,
+    private readonly catchUp = false,
+    private readonly logger?: Logger,
   ) {
     const timeBase = stream.timeBase;
     this.frameDuration = frameDuration(stream);
@@ -91,10 +115,13 @@ class TrackClock {
   /**
    * Re-anchor the timeline on the next timed packet.
    *
+   * @param opened - When the reopen started, in `performance.now()` milliseconds
+   *
    * @internal
    */
-  restart(): void {
+  restart(opened: number): void {
     this.rebase = true;
+    this.resume = this.arrival !== undefined ? opened : undefined;
   }
 
   /**
@@ -102,27 +129,34 @@ class TrackClock {
    *
    * @param packet - The packet to adjust
    *
+   * @returns `false` if the packet is dropped to bring wallclock audio back in line
+   *
    * @internal
    */
-  stamp(packet: Packet): void {
-    if (this.epoch !== undefined) {
-      this.stampArrival(packet, this.epoch);
-      return;
-    }
+  stamp(packet: Packet): boolean {
+    if (this.epoch !== undefined) return this.stampArrival(packet, this.epoch);
 
     const pts = packet.pts;
     const dts = packet.dts;
     const duration = packet.duration;
     const raw = dts !== AV_NOPTS_VALUE ? dts : pts;
 
+    if (this.resume !== undefined) {
+      // what the open read ahead arrives in one burst after it, but dates from when the reopen started
+      const gone = BigInt(Math.round(((this.resume - (this.arrival ?? 0)) / 1000) * this.ticksPerSecond));
+      this.resume = undefined;
+      if (this.last + gone > this.end) this.end = this.last + gone;
+    }
+
     if (raw === AV_NOPTS_VALUE) {
       const step = duration > 0n ? duration : this.frameDuration;
       // no basis for a clock, leave it untimed rather than collapse every packet onto one instant
-      if (step <= 0n) return;
+      if (step <= 0n) return true;
       packet.pts = this.end;
       packet.dts = this.end;
+      this.mark(this.end);
       this.end += step;
-      return;
+      return true;
     }
 
     if (this.rebase) {
@@ -133,9 +167,24 @@ class TrackClock {
       if (pts !== AV_NOPTS_VALUE) packet.pts = pts + this.offset;
       if (dts !== AV_NOPTS_VALUE) packet.dts = dts + this.offset;
     }
+    this.mark(raw + this.offset);
     // a packet without duration still advances one tick so the next pass never collides with it
     const next = raw + this.offset + (duration > 0n ? duration : 1n);
     if (next > this.end) this.end = next;
+    return true;
+  }
+
+  /**
+   * Remember the newest timestamp and when it arrived, for catching up after a reopen.
+   *
+   * @param timestamp - The packet's adjusted decode timestamp
+   *
+   * @internal
+   */
+  private mark(timestamp: bigint): void {
+    if (!this.catchUp) return;
+    this.last = timestamp;
+    this.arrival = performance.now();
   }
 
   /**
@@ -145,16 +194,53 @@ class TrackClock {
    *
    * @param epoch - Wallclock origin in `performance.now()` milliseconds
    *
+   * @returns `false` if the packet is dropped to bring audio back in line
+   *
    * @internal
    */
-  private stampArrival(packet: Packet, epoch: number): void {
+  private stampArrival(packet: Packet, epoch: number): boolean {
     const now = BigInt(Math.round(((performance.now() - epoch) / 1000) * this.ticksPerSecond));
     const duration = this.tolerance >= 0n ? packet.duration : 0n;
+    if (duration > 0n && this.skipUntil !== undefined) {
+      if (now < this.skipUntil) return false;
+      this.skipUntil = undefined;
+    }
     const slack = duration > 0n ? this.tolerance : 0n;
     const pts = now > this.end + slack ? now : this.end;
     packet.pts = pts;
     packet.dts = pts;
     this.end = pts + (duration > 0n ? duration : 1n);
+    if (duration > 0n) this.watchLead(pts - now, now);
+    return true;
+  }
+
+  /**
+   * Track how far audio runs ahead of the wallclock and cut back a lead that never drops.
+   *
+   * @param lead - How far the packet's timestamp is ahead of its arrival, in ticks
+   *
+   * @param now - Arrival time in ticks
+   *
+   * @internal
+   */
+  private watchLead(lead: bigint, now: bigint): void {
+    const window = this.window;
+    if (!window) {
+      this.window = { start: now, lead };
+      return;
+    }
+    if (lead < window.lead) window.lead = lead;
+    if (now - window.start < BigInt(Math.round(WALLCLOCK_LEAD_WINDOW_S * this.ticksPerSecond))) return;
+
+    if (window.lead > this.tolerance) {
+      // timestamps cannot go back, so the audio that arrives while the wallclock catches up is dropped
+      this.skipUntil = now + window.lead;
+      this.window = undefined;
+      this.logger?.debug?.(`[rtsp] audio ran ${Math.round((Number(window.lead) / this.ticksPerSecond) * 1000)}ms ahead of the wallclock, dropping that much`);
+      return;
+    }
+    // the closing packet opens the next window, a chunk start counts in both
+    this.window = { start: now, lead };
   }
 }
 
@@ -219,6 +305,7 @@ export class DemuxInput {
    * @internal
    */
   async open(signal: AbortSignal): Promise<Stream[]> {
+    const opened = performance.now();
     // node-av closes a demuxer whose open raced the abort and rethrows the abort
     const demuxer = await Demuxer.open(this.input as string, {
       format: this.settings.format,
@@ -226,11 +313,11 @@ export class DemuxInput {
       signal,
     });
     this.demuxer = demuxer;
-    for (const clock of this.clocks.values()) clock.restart();
+    for (const clock of this.clocks.values()) clock.restart(opened);
     for (const stream of demuxer.streams) {
       if (this.settings.wallclock && stream.timeBase.num * WALLCLOCK_TIME_BASE.den > stream.timeBase.den) stream.timeBase = WALLCLOCK_TIME_BASE;
       if (!this.clocks.has(stream.index)) {
-        this.clocks.set(stream.index, new TrackClock(stream, this.settings.wallclock ? this.epoch : undefined));
+        this.clocks.set(stream.index, new TrackClock(stream, this.settings.wallclock ? this.epoch : undefined, this.settings.catchUp, this.settings.logger));
       }
     }
     if (!this.snapshot) this.copies = this.copyStreams(demuxer.streams);
@@ -253,7 +340,11 @@ export class DemuxInput {
     for await (const packet of this.demuxer.packets()) {
       // node-av yields null as its end sentinel
       if (!packet) continue;
-      this.clocks.get(packet.streamIndex)?.stamp(packet);
+      const clock = this.clocks.get(packet.streamIndex);
+      if (clock && !clock.stamp(packet)) {
+        packet.free();
+        continue;
+      }
       yield packet;
     }
   }

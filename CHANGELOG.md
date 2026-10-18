@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `MultiSource` inputs can reconnect on their own with `reconnect`, which takes the same backoff options as on `AvSource`. Only that input is reopened while the others keep delivering, so a separate audio stream that drops leaves the video running. Its timeline skips the time it was gone and stays aligned with the other inputs. When the retries are exhausted, the whole source fails as before.
+- `MultiSource` inputs accept `timeout` in milliseconds, like `AvSource`, so a stalled input fails or reconnects instead of hanging unnoticed next to inputs that keep delivering.
+- `MultiSource` inputs can be `optional`: one that cannot be opened is left out with a warning instead of failing the source, so a missing audio stream does not keep the video from starting. The next open of the source tries it again.
+- `grabFrame(relay)` takes the next frame of a relay's video track from the shared upstream: a complete JPEG for MJPEG sources, without decoding or re-encoding, so single-client cameras serve snapshots and viewers over one connection. New `GrabFrameOptions` type and `examples/snapshot.ts`.
+
+### Changed
+
+- `RtspServerSink` lets one viewer talk at a time. The first one to send keeps the backchannel until it stays silent for `idleTimeout` or leaves, talkback of other viewers is dropped meanwhile; before, two talkers were interleaved into one RTP stream that no decoder could follow. `backchannel:stop` also fires as soon as the talking viewer disconnects.
+
+### Fixed
+
+- Wallclock audio no longer stays behind the picture after a burst of buffered data, which an input delivers after an open that read ahead (a PCM WAV reads 64 KiB, four seconds at 8 kHz) or after a stall. When the audio timeline stays more than 200 ms ahead of the arrival time for a whole second, that much audio is dropped once. Devices that send audio in large chunks fall back to no lead with every chunk and are not affected.
+
 ## [2.0.0] - 2026-10-18
 
 Version 2 is a rework of the whole library: one shared demux and audio pipeline instead of several near-duplicates, a synchronous in-process transcoding path, video re-encoding (MJPEG to H.264 with hardware acceleration), a stricter RTSP server and a test suite that covers every module. The public surface is smaller and more consistent, which breaks some imports and option names; the migration section lists every change.

@@ -33,7 +33,7 @@ const server = await new RtspServerSink(relay, { host: '0.0.0.0', port: 8554, pa
 console.log(`serving ${inputs.length} merged input(s) at ${server.url}`);
 
 process.on('SIGINT', () => {
-  void server
+  server
     .shutdown()
     .then(() => relay.stop())
     .then(() => process.exit(0));

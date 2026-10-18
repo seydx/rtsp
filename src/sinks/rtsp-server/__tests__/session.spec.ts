@@ -64,10 +64,10 @@ function makeHost(overrides: Partial<RtspSessionHost> = {}): RtspSessionHost & {
     },
     trackKind: (id) => (id === 0 ? 'video' : id === 1 ? 'audio' : undefined),
     rtpInfo: () => undefined,
-    sessionPlaying: () => void calls.playing++,
-    sessionPaused: () => void calls.paused++,
-    sessionClosed: () => void calls.closed++,
-    backchannelRtp: (rtp) => calls.backchannel.push(rtp),
+    sessionPlaying: () => calls.playing++,
+    sessionPaused: () => calls.paused++,
+    sessionClosed: () => calls.closed++,
+    backchannelRtp: (_session, rtp) => calls.backchannel.push(rtp),
     ...overrides,
   };
 }

@@ -31,7 +31,7 @@ if (source.backchannel) console.log(`talkback codec: ${source.backchannel.codec}
 else console.warn('the camera advertises no backchannel, talkback is unavailable');
 
 process.on('SIGINT', () => {
-  void server
+  server
     .shutdown()
     .then(() => relay.stop())
     .then(() => process.exit(0));

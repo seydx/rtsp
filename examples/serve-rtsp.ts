@@ -44,7 +44,7 @@ server.on('viewer:added', (count) => console.log(`[server] viewer joined (${coun
 server.on('viewer:removed', (count) => console.log(`[server] viewer left (${count} playing)`));
 
 process.on('SIGINT', () => {
-  void server
+  server
     .shutdown()
     .then(() => relay.stop())
     .then(() => process.exit(0));

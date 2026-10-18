@@ -36,7 +36,7 @@ server.on('backchannel:start', () => console.log('talkback started'));
 server.on('backchannel:stop', () => console.log('talkback stopped'));
 
 process.on('SIGINT', () => {
-  void server
+  server
     .shutdown()
     .then(() => relay.stop())
     .then(() => process.exit(0));

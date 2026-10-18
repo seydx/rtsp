@@ -9,6 +9,7 @@ import { RtspServerSink } from '../rtsp-server-sink.js';
 
 import type { BackchannelInfo, MediaPacket, StreamInfo } from '../../../types.js';
 import type { RtspServerSinkOptions } from '../rtsp-server-sink.js';
+import type { RtspSession } from '../session.js';
 
 const suite = hasFfmpeg ? describe : describe.skip;
 
@@ -60,6 +61,39 @@ suite('RtspServerSink talkback over RTSP', () => {
       await relay.stop();
     }
   }, 30_000);
+
+  it('lets a second viewer talk only once the first one went quiet', async () => {
+    const relay = new Relay({ source: new AvSource(video, { readrate: 1, loop: true }) });
+    const server = await new RtspServerSink(relay, {
+      backchannel: { advertise: { codec: 'pcm_mulaw', payloadType: 0, clockRate: 8000, channels: 1 }, idleTimeout: 300 },
+    }).listen();
+    const received: number[] = [];
+    server.on('backchannel', (rtp) => received.push(rtp[12]));
+
+    const first = new AvSource(server.url, { transport: 'tcp', backchannel: true });
+    const second = new AvSource(server.url, { transport: 'tcp', backchannel: true });
+    // the payload byte tells the talkers apart
+    const talk = (client: AvSource, value: number, seq: number): void => client.sendBackchannel(buildRtp(0, seq, seq * 160, Buffer.alloc(160, value)));
+    try {
+      await Promise.all([first.open(), second.open()]);
+      for (let i = 0; i < 5; i++) {
+        talk(first, 0x11, i);
+        talk(second, 0x22, i);
+        await delay(20);
+      }
+      await until(() => received.length >= 5, 3000, 'the first talker');
+      await delay(100);
+      expect(new Set(received)).toEqual(new Set([0x11]));
+
+      await delay(400);
+      talk(second, 0x22, 10);
+      await until(() => received.includes(0x22), 3000, 'the second talker');
+    } finally {
+      await Promise.all([first.close(), second.close()]);
+      await server.shutdown();
+      await relay.stop();
+    }
+  }, 30_000);
 });
 
 suite('RtspServerSink talkback forwarding', () => {
@@ -102,13 +136,16 @@ suite('RtspServerSink talkback forwarding', () => {
   }
 
   const MULAW_CAMERA: BackchannelInfo = { streamIndex: 2, codec: 'pcm_mulaw', payloadType: 0, clockRate: 8000, channels: 1 };
+  // the server only compares sessions, it never calls into them here
+  const viewer = {} as RtspSession;
+  const other = {} as RtspSession;
 
   it('passes matching talkback through unchanged', () => {
     const { sent, relay } = camera(MULAW_CAMERA);
     const server = sink(relay, { advertise: { codec: 'pcm_mulaw', payloadType: 0, clockRate: 8000, channels: 1 } });
     try {
       const rtp = buildRtp(0, 1, 0, MULAW_SILENCE);
-      server.backchannelRtp(rtp);
+      server.backchannelRtp(viewer, rtp);
       expect(sent).toEqual([rtp]);
       expect(sent[0]).toBe(rtp);
     } finally {
@@ -122,7 +159,7 @@ suite('RtspServerSink talkback forwarding', () => {
     try {
       const rtp = buildRtp(0, 1, 0, MULAW_SILENCE);
       rtp[1] |= 0x80;
-      server.backchannelRtp(rtp);
+      server.backchannelRtp(viewer, rtp);
       // marker bit kept, payload untouched, original left alone
       expect(sent[0][1]).toBe(0x80 | 110);
       expect(sent[0].subarray(2)).toEqual(rtp.subarray(2));
@@ -164,7 +201,7 @@ suite('RtspServerSink talkback forwarding', () => {
     server.on('backchannel:start', () => events.push('start'));
     server.on('backchannel:stop', () => events.push('stop'));
     try {
-      for (let i = 0; i < 10; i++) server.backchannelRtp(buildRtp(8, i, i * 160, ALAW_SILENCE));
+      for (let i = 0; i < 10; i++) server.backchannelRtp(viewer, buildRtp(8, i, i * 160, ALAW_SILENCE));
       expect(sent.length).toBeGreaterThan(0);
       expect(sent.every((rtp) => !isRtcp(rtp) && (rtp[1] & 0x7f) === 0)).toBe(true);
       // alaw silence is the smallest positive step, mu-law codes it at the top of its range
@@ -175,8 +212,36 @@ suite('RtspServerSink talkback forwarding', () => {
 
       // a new burst starts a fresh transcoder
       const before = sent.length;
-      server.backchannelRtp(buildRtp(8, 100, 16000, ALAW_SILENCE));
+      server.backchannelRtp(viewer, buildRtp(8, 100, 16000, ALAW_SILENCE));
       expect(sent.length).toBeGreaterThan(before);
+    } finally {
+      server.close();
+    }
+    expect(events).toEqual(['start', 'stop', 'start', 'stop']);
+  });
+
+  it('lets one viewer talk at a time', () => {
+    const { sent, relay } = camera(MULAW_CAMERA);
+    const server = sink(relay, { advertise: { codec: 'pcm_mulaw', payloadType: 0, clockRate: 8000, channels: 1 } });
+    const received: Buffer[] = [];
+    const events: string[] = [];
+    server.on('backchannel', (rtp) => received.push(rtp));
+    server.on('backchannel:start', () => events.push('start'));
+    server.on('backchannel:stop', () => events.push('stop'));
+    try {
+      const first = buildRtp(0, 1, 0, MULAW_SILENCE);
+      server.backchannelRtp(viewer, first);
+      server.backchannelRtp(other, buildRtp(0, 500, 8000, MULAW_SILENCE));
+      expect(received).toEqual([first]);
+      expect(sent).toEqual([first]);
+
+      // the speaker leaving ends the burst at once, the next viewer may talk
+      server.sessionClosed(viewer);
+      expect(events).toEqual(['start', 'stop']);
+      const next = buildRtp(0, 501, 8160, MULAW_SILENCE);
+      server.backchannelRtp(other, next);
+      expect(received).toEqual([first, next]);
+      expect(events).toEqual(['start', 'stop', 'start']);
     } finally {
       server.close();
     }
@@ -189,7 +254,7 @@ suite('RtspServerSink talkback forwarding', () => {
     const received: Buffer[] = [];
     server.on('backchannel', (rtp) => received.push(rtp));
     try {
-      server.backchannelRtp(buildRtp(0, 1, 0, MULAW_SILENCE));
+      server.backchannelRtp(viewer, buildRtp(0, 1, 0, MULAW_SILENCE));
       expect(received).toHaveLength(0);
       expect(sent).toHaveLength(0);
     } finally {

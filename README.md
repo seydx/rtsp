@@ -29,6 +29,7 @@ Demuxing, decoding, encoding and muxing are done by [node-av](https://github.com
 - [Transcoding](#transcoding)
 - [Two-Way Audio](#two-way-audio)
 - [Raw Audio Frames](#raw-audio-frames)
+- [Snapshots](#snapshots)
 - [Lifecycle](#lifecycle)
 - [Examples](#examples)
 - [License](#license)
@@ -87,6 +88,16 @@ import { MultiSource } from '@seydx/rtsp';
 const source = new MultiSource([
   { input: videoStream, format: 'h264', options: { framerate: 15 } },
   { input: audioStream, format: 'aac' },
+]);
+```
+
+If one input fails, the whole source fails, unless that input reconnects on its own. Only the reconnecting input is reopened, the others keep delivering, and its timeline skips the time it was gone. A `timeout` makes a stalled input fail instead of hanging, and an `optional` input that cannot be opened is left out instead of keeping the others from starting:
+
+```typescript
+const source = new MultiSource([
+  { input: 'http://camera.local/video.mjpg', format: 'mpjpeg', wallclock: true },
+  // missing audio does not hold the video back, a dropped one comes back by itself
+  { input: 'http://camera.local/audio.wav', wallclock: true, timeout: 5000, reconnect: true, optional: true },
 ]);
 ```
 
@@ -185,7 +196,7 @@ await new RtspServerSink(relay, {
 }).listen();
 ```
 
-The server emits every talkback packet as `backchannel` and the bursts as `backchannel:start` and `backchannel:stop`, so devices with proprietary talkback can be fed with a `BackchannelTranscoder`.
+The server emits every talkback packet as `backchannel` and the bursts as `backchannel:start` and `backchannel:stop`, so devices with proprietary talkback can be fed with a `BackchannelTranscoder`. One viewer talks at a time: the first one to send keeps the backchannel until it stays silent for `idleTimeout` or leaves, talkback of other viewers is dropped meanwhile.
 
 ## Raw Audio Frames
 
@@ -204,6 +215,19 @@ const source = new MultiSource([
   { input: videoStream, format: 'h264' },
   { input: audio.stream, format: 'aac' },
 ]);
+```
+
+## Snapshots
+
+`grabFrame` takes the next frame of a relay's video track from the shared upstream, so a camera that accepts a single client serves snapshots and viewers over one connection. The frame comes as the source encoded it: for an MJPEG camera a complete JPEG, without decoding or re-encoding.
+
+```typescript
+import { AvSource, grabFrame, Relay } from '@seydx/rtsp';
+
+// keep the camera open for 10s, so snapshots in a row reuse the connection
+const relay = new Relay({ source: new AvSource('http://camera.local/video.mjpg', { format: 'mpjpeg', wallclock: true }), idleTimeout: 10_000 });
+
+const jpeg = await grabFrame(relay, { timeout: 5000 });
 ```
 
 ## Lifecycle
@@ -228,6 +252,7 @@ Runnable examples live in [`examples/`](https://github.com/seydx/rtsp/tree/main/
 ```bash
 tsx examples/basic-relay.ts rtsp://user:pass@camera.local/stream
 tsx examples/mjpeg-to-h264.ts http://camera.local/video.mjpg
+tsx examples/snapshot.ts http://camera.local/video.mjpg snapshot.jpg
 tsx examples/transcode-sink.ts rtsp://user:pass@camera.local/stream camera.mp4
 ```
 

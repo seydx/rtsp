@@ -28,7 +28,7 @@ export interface RtspSessionHost {
   sessionPlaying(session: RtspSession): void;
   sessionPaused(session: RtspSession): void;
   sessionClosed(session: RtspSession): void;
-  backchannelRtp(rtp: Buffer): void;
+  backchannelRtp(session: RtspSession, rtp: Buffer): void;
 }
 
 /**
@@ -194,7 +194,7 @@ export class RtspSession {
     }
     for (const message of messages) {
       if (message.type === 'interleaved') {
-        if (message.channel === this.backchannelChannel) this.host.backchannelRtp(message.data);
+        if (message.channel === this.backchannelChannel) this.host.backchannelRtp(this, message.data);
         continue;
       }
       const { request } = message;

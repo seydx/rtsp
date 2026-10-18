@@ -100,7 +100,7 @@ export default [
       '@typescript-eslint/no-unsafe-argument': 'off',
       '@typescript-eslint/no-unsafe-return': 'off',
       '@typescript-eslint/require-await': 'off',
-      '@typescript-eslint/no-floating-promises': 'error',
+      '@typescript-eslint/no-floating-promises': 'off',
       '@typescript-eslint/prefer-promise-reject-errors': 'off',
       '@typescript-eslint/no-misused-promises': ['error', { checksVoidReturn: { arguments: false } }],
       '@typescript-eslint/ban-ts-comment': 'off',

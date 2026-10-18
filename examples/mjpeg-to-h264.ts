@@ -34,7 +34,7 @@ const server = await new RtspServerSink(relay, {
 console.log(`serving ${input} as H.264 at ${server.url}`);
 
 process.on('SIGINT', () => {
-  void server
+  server
     .shutdown()
     .then(() => relay.stop())
     .then(() => process.exit(0));

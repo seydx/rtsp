@@ -46,7 +46,7 @@ relay.on('error', (error) => console.error('relay error:', error));
 
 // stop() drains the encoders and writes the mp4 trailer, without it the file is unplayable
 process.on('SIGINT', () => {
-  void relay.stop().then(() => process.exit(0));
+  relay.stop().then(() => process.exit(0));
 });
 
 await relay.start();

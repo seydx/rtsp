@@ -13,6 +13,7 @@ Most examples take an input URL as the first argument and fall back to a placeho
 | [basic-relay.ts](https://github.com/seydx/rtsp/tree/main/examples/basic-relay.ts) | Pull one RTSP camera and serve it again as a local RTSP endpoint, connecting to the camera only while someone watches. |
 | [serve-rtsp.ts](https://github.com/seydx/rtsp/tree/main/examples/serve-rtsp.ts) | Fan one upstream out to many RTSP viewers with reconnect, stall detection, optional auth and lifecycle logging. Optional `[port] [path]`. |
 | [mjpeg-to-h264.ts](https://github.com/seydx/rtsp/tree/main/examples/mjpeg-to-h264.ts) | Serve an MJPEG camera as H.264 over RTSP, re-encoded with hardware acceleration when available. Optional `[port] [path]`. |
+| [snapshot.ts](https://github.com/seydx/rtsp/tree/main/examples/snapshot.ts) | Save the next frame of an MJPEG camera as a JPEG file, taken from the shared upstream without re-encoding. Optional `[output]`. |
 | [transcode-sink.ts](https://github.com/seydx/rtsp/tree/main/examples/transcode-sink.ts) | Record a camera as scaled H.264 with AAC, decoded, scaled and encoded on the GPU when available. Optional `[output] [height] [--software]`. |
 | [ffmpeg-sink.ts](https://github.com/seydx/rtsp/tree/main/examples/ffmpeg-sink.ts) | Record a relayed source into a container file without re-encoding. Optional `[output] [format]`. |
 | [callback-sink.ts](https://github.com/seydx/rtsp/tree/main/examples/callback-sink.ts) | Observe the keyframe-gated packet flow of a source in a callback. |

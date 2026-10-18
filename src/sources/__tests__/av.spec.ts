@@ -92,7 +92,13 @@ suite('AvSource', () => {
     await new Promise<void>((resolve, reject) => {
       relay.on('stop', resolve);
       relay.on('error', reject);
-      relay.pipe(new CallbackSink({ onPacket: (packet) => void seen.push({ index: packet.streamIndex, keyframe: packet.isKeyframe, native: packet.av !== undefined }) }));
+      relay.pipe(
+        new CallbackSink({
+          onPacket: (packet) => {
+            seen.push({ index: packet.streamIndex, keyframe: packet.isKeyframe, native: packet.av !== undefined });
+          },
+        }),
+      );
     });
 
     expect(seen.length).toBeGreaterThan(20);
@@ -262,7 +268,7 @@ suite('AvSource', () => {
   it('stamps a live MJPEG feed with arrival times on a fine clock', async () => {
     const data = await readFile(await fixtures.clip('mjpeg', 1));
     const feed = new PassThrough();
-    const source = new AvSource(feed, { formatjpeg', wallclock: true });
+    const source = new AvSource(feed, { format: 'mpjpeg', wallclock: true });
 
     // deliver the 15 frames over about a second, as a camera would
     const chunks = 30;
@@ -280,7 +286,9 @@ suite('AvSource', () => {
       expect(info.tracks[0].timeBase).toEqual({ num: 1, den: 90_000 });
       const pts: number[] = [];
       // mpjpeg reports the end of the feed as invalid data
-      await collect(source, 1000, (packet) => void pts.push(packet.pts!)).catch(() => undefined);
+      await collect(source, 1000, (packet) => {
+        pts.push(packet.pts!);
+      }).catch(() => undefined);
       await writing;
 
       expect(pts.length).toBeGreaterThan(8);

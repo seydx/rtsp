@@ -61,9 +61,9 @@ export interface RtspServerSinkOptions {
    *
    * `true` advertises the upstream's own talkback format. An object can
    * advertise a different format, for example PCMA for browsers while the
-   * camera expects AAC. Received audio is always emitted as `backchannel`. If
-   * the source supports talkback, it is also forwarded to it, transcoded when
-   * the formats differ.
+   * camera expects AAC. One viewer talks at a time, its audio is always
+   * emitted as `backchannel`. If the source supports talkback, it is also
+   * forwarded to it, transcoded when the formats differ.
    *
    * @default false
    */
@@ -114,6 +114,10 @@ export interface RtspBackchannelOptions {
   /**
    * Time in milliseconds without talkback packets after which `backchannel:stop` is emitted.
    *
+   * One viewer talks at a time. The first one to send keeps the backchannel
+   * until it stays silent for this long or leaves, talkback of other viewers
+   * is dropped meanwhile.
+   *
    * @default 2000
    */
   idleTimeout?: number;
@@ -138,19 +142,23 @@ export interface RtspServerEvents {
   'viewer:removed': (count: number) => void;
 
   /**
-   * A viewer sent one talkback RTP packet in the advertised format.
+   * The talking viewer sent one talkback RTP packet in the advertised format.
+   *
+   * Packets of other viewers who talk at the same time are not emitted, see
+   * {@link RtspBackchannelOptions.idleTimeout}.
    *
    * @param rtp - The RTP packet
    */
   backchannel: (rtp: Buffer) => void;
 
   /**
-   * Talkback started after being idle.
+   * A viewer started talking while nobody else did.
    */
   'backchannel:start': () => void;
 
   /**
-   * No talkback arrived for {@link RtspBackchannelOptions.idleTimeout}, or the stream stopped.
+   * The talking viewer stayed silent for {@link RtspBackchannelOptions.idleTimeout}
+   * or left, or the stream stopped.
    */
   'backchannel:stop': () => void;
 }
@@ -184,7 +192,10 @@ interface Talkback {
   format: BackchannelFormat;
   track: number;
   idleTimeout: number;
-  active: boolean;
+  /** The viewer whose talkback is forwarded, while one talks. */
+  speaker?: RtspSession;
+  /** Another viewer's talkback was dropped during this burst, logged once. */
+  contested: boolean;
   timer?: NodeJS.Timeout;
   transcoder?: BackchannelTranscoder;
 }
@@ -607,22 +618,30 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     this.sessions.delete(session);
     this.bound.delete(session);
     if (this.playing.delete(session)) this.emit('viewer:removed', this.playing.size);
+    if (this.talkback?.speaker === session) this.stopTalkback();
     if (this.sessions.size === 0 && this.piped) this.scheduleDetach();
   }
 
   /**
    * Handle one talkback RTP packet from a viewer.
    *
+   * @param session - The viewer that sent it
+   *
    * @param rtp - The RTP packet in the advertised format
    *
    * @internal
    */
-  backchannelRtp(rtp: Buffer): void {
+  backchannelRtp(session: RtspSession, rtp: Buffer): void {
     const talkback = this.talkback;
     if (!talkback) return;
-    if (!talkback.active) {
-      talkback.active = true;
+    if (!talkback.speaker) {
+      talkback.speaker = session;
       this.emit('backchannel:start');
+    } else if (talkback.speaker !== session) {
+      // two viewers at once would interleave two RTP streams with their own sequence and clock into one decoder
+      if (!talkback.contested) this.logger?.debug?.('[rtsp] talkback of a second viewer dropped while another one talks');
+      talkback.contested = true;
+      return;
     }
     clearTimeout(talkback.timer);
     talkback.timer = setTimeout(() => this.stopTalkback(), talkback.idleTimeout);
@@ -653,7 +672,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
       format: { codec, payloadType, clockRate, channels, fmtp },
       track: this.tracks.length,
       idleTimeout: config.idleTimeout ?? DEFAULT_TALKBACK_IDLE_MS,
-      active: false,
+      contested: false,
     };
   }
 
@@ -711,8 +730,9 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     talkback.timer = undefined;
     talkback.transcoder?.close();
     talkback.transcoder = undefined;
-    if (talkback.active) {
-      talkback.active = false;
+    talkback.contested = false;
+    if (talkback.speaker) {
+      talkback.speaker = undefined;
       this.emit('backchannel:stop');
     }
   }
