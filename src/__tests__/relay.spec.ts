@@ -140,7 +140,7 @@ describe('Relay start and stop races', () => {
     const first = collector();
     relay.pipe(first.sink);
     await flush();
-    void relay.unpipe(first.sink);
+    relay.unpipe(first.sink);
     await flush(5);
     expect(relay.status).toBe('stopping');
 
@@ -195,7 +195,7 @@ describe('Relay start and stop races', () => {
   it('starts again after a stop that interrupted a start', async () => {
     const source = new FakeSource(AV_INFO, { openDelay: 10 });
     const relay = createRelay({ source });
-    void relay.start();
+    relay.start();
     await relay.stop();
     await flush(30);
 

@@ -205,7 +205,7 @@ export class Relay extends TypedEmitter<RelayEvents> {
     this.stallTimeout = options.stallTimeout ?? 0;
 
     // runStart already reports the failure through 'error'
-    if (options.autoStart) void this.start().catch(() => undefined);
+    if (options.autoStart) this.start().catch(() => undefined);
   }
 
   /**
@@ -275,7 +275,7 @@ export class Relay extends TypedEmitter<RelayEvents> {
     this.sinkSeen = true;
     this.cancelIdleTimer();
     this.emit('sink:added', sink);
-    void this.activate(channel);
+    this.activate(channel);
     return sink;
   }
 
@@ -390,7 +390,7 @@ export class Relay extends TypedEmitter<RelayEvents> {
 
     this.state = 'running';
     this.emit('start', info);
-    void this.pump();
+    this.pump();
     // all sinks left or failed during the start, do not pump into the void
     if (this.sinkSeen && this.channels.size === 0) this.scheduleIdleStop();
   }
@@ -492,7 +492,7 @@ export class Relay extends TypedEmitter<RelayEvents> {
 
     this.logger?.error?.('[rtsp] upstream failed:', failure);
     this.emit('error', failure);
-    void this.stop();
+    this.stop();
   }
 
   /**
@@ -556,12 +556,12 @@ export class Relay extends TypedEmitter<RelayEvents> {
   private scheduleIdleStop(): void {
     this.cancelIdleTimer();
     if (this.idleTimeout <= 0) {
-      void this.stop();
+      this.stop();
       return;
     }
     this.idleTimer = setTimeout(() => {
       this.idleTimer = undefined;
-      if (this.channels.size === 0) void this.stop();
+      if (this.channels.size === 0) this.stop();
     }, this.idleTimeout);
     this.idleTimer.unref();
   }

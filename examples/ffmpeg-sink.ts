@@ -32,7 +32,7 @@ relay.on('error', (error) => console.error('relay error:', error));
 
 // stop() waits for the muxer to write its trailer, without it an mp4 is unplayable
 process.on('SIGINT', () => {
-  void relay.stop().then(() => process.exit(0));
+  relay.stop().then(() => process.exit(0));
 });
 
 await relay.start();

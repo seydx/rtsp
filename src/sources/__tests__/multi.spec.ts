@@ -87,7 +87,7 @@ suite('MultiSource', () => {
         [2, 'h264'],
       ]);
       const counts = new Map<number, number>();
-      await drain(source, (packet) => void counts.set(packet.streamIndex, (counts.get(packet.streamIndex) ?? 0) + 1));
+      await drain(source, (packet) => counts.set(packet.streamIndex, (counts.get(packet.streamIndex) ?? 0) + 1));
       expect(counts.get(0)).toBe(15);
       expect(counts.get(2)).toBe(15);
       expect(counts.get(1)).toBeGreaterThan(40);

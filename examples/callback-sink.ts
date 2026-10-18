@@ -33,5 +33,5 @@ await relay.start();
 console.log(`relaying ${url}, press Ctrl+C to stop`);
 
 process.on('SIGINT', () => {
-  void relay.stop().then(() => process.exit(0));
+  relay.stop().then(() => process.exit(0));
 });

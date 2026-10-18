@@ -287,7 +287,7 @@ suite('RtspServerSink stream lifecycle', () => {
       const text = await sdp;
       expect(text).toContain('m=video');
       expect(text).not.toContain('m=audio');
-      // the remaining track keeps its id, viewers may have cached it
+      e remaining track keeps its id, viewers may have cached it
       expect(text).toContain(`a=control:streamid=${info.tracks.indexOf(video)}`);
       expect(sink.trackKind(info.tracks.findIndex((track) => track.kind === 'audio'))).toBeUndefined();
     } finally {

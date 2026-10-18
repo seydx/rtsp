@@ -197,7 +197,7 @@ export class RtspTestClient {
     const lines = [`${method} ${uri} RTSP/1.0`, `CSeq: ${++this.cseq}`, ...Object.entries(headers).map(([key, value]) => `${key}: ${value}`)];
     return new Promise((resolve, reject) => {
       this.waiting = resolve;
-      void this.closedPromise.then(() => reject(new Error(`connection closed before the ${method} response`)));
+      this.closedPromise.then(() => reject(new Error(`connection closed before the ${method} response`)));
       this.socket.write(`${lines.join('\r\n')}\r\n\r\n`);
     });
   }

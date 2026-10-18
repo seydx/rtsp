@@ -110,7 +110,7 @@ export class SinkChannel {
       return;
     }
     this.queue.push(packet);
-    void this.drain();
+    this.drain();
   }
 
   /**
@@ -192,7 +192,7 @@ export class SinkChannel {
       this.options.logger?.warn?.(`[rtsp] sink queue overflow (${this.queue.length} packets, ${age}), skipping to the newest buffered keyframe`);
       for (const dropped of this.queue.splice(0, cut)) dropped.free();
       this.queue.push(packet);
-      void this.drain();
+      this.drain();
       return;
     }
 
@@ -204,7 +204,7 @@ export class SinkChannel {
       return;
     }
     this.queue.push(packet);
-    void this.drain();
+    this.drain();
   }
 
   /**
@@ -229,7 +229,7 @@ export class SinkChannel {
         } catch (error) {
           this.options.logger?.error?.('[rtsp] sink write failed, closing channel:', error);
           this.options.onError?.(this, error);
-          void this.close();
+          this.close();
           return;
         } finally {
           packet.free();

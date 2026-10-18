@@ -67,7 +67,7 @@ function makeHost(overrides: Partial<RtspSessionHost> = {}): RtspSessionHost & {
     sessionPlaying: () => void calls.playing++,
     sessionPaused: () => void calls.paused++,
     sessionClosed: () => void calls.closed++,
-    backchannelRtp: (rtp) => void calls.backchannel.push(rtp),
+    backchannelRtp: (rtp) => calls.backchannel.push(rtp),
     ...overrides,
   };
 }

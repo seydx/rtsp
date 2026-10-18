@@ -262,7 +262,7 @@ suite('AvSource', () => {
   it('stamps a live MJPEG feed with arrival times on a fine clock', async () => {
     const data = await readFile(await fixtures.clip('mjpeg', 1));
     const feed = new PassThrough();
-    const source = new AvSource(feed, { format: 'mpjpeg', wallclock: true });
+    const source = new AvSource(feed, { formatjpeg', wallclock: true });
 
     // deliver the 15 frames over about a second, as a camera would
     const chunks = 30;
