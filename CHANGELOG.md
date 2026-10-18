@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-18
+
 ### Added
 
 - `MultiSource` inputs can reconnect on their own with `reconnect`, which takes the same backoff options as on `AvSource`. Only that input is reopened while the others keep delivering, so a separate audio stream that drops leaves the video running. Its timeline skips the time it was gone and stays aligned with the other inputs. When the retries are exhausted, the whole source fails as before.
