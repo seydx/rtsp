@@ -60,7 +60,7 @@
     "eslint": "9.39.2",
     "eslint-plugin-jsdoc": "^65.4.5",
     "globals": "^17.14.0",
-    "node-av": "^7.0.2",
+    "node-av": "^7.0.3",
     "prettier": "^3.10.1",
     "rimraf": "^6.1.4",
     "tsx": "^4.23.15",
