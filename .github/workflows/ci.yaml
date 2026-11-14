@@ -21,7 +21,6 @@ jobs:
         with:
           node-version: "24"
 
-      # No --ignore-scripts: node-av's postinstall fetches the FFmpeg binary the tests need.
       - run: npm ci
 
       - name: Lint

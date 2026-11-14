@@ -48,19 +48,20 @@
     "prepublishOnly": "npm i --package-lock-only && npm run lint:fix && npm run format && npm run build"
   },
   "peerDependencies": {
-    "node-av": "^6.2.0 || ^7.0.2"
+    "node-av": "^6.2.0 || ^7.0.2 || ^7.1.0-beta.2"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.2",
-    "@stylistic/eslint-plugin": "^5.10.0",
+    "@seydx/node-av-ffmpeg-light": "^7.1.0",
+    "@stylistic/eslint-plugin": "^6.0.0",
     "@types/node": "^24.19.2",
     "@typescript-eslint/parser": "^8.72.2",
     "@vitest/coverage-v8": "^5.1.0",
     "cpy-cli": "^7.0.0",
     "eslint": "9.39.2",
-    "eslint-plugin-jsdoc": "^65.4.5",
+    "eslint-plugin-jsdoc": "^65.4.7",
     "globals": "^17.14.0",
-    "node-av": "^7.0.3",
+    "node-av": "npm:node-av-light@^7.1.0",
     "prettier": "^3.10.1",
     "rimraf": "^6.1.4",
     "tsx": "^4.23.15",
@@ -103,6 +104,6 @@
   "allowScripts": {
     "esbuild@0.28.1": true,
     "fsevents@2.3.3": true,
-    "node-av@6.2.0-beta.32": true
+    "node-av-light": true
   }
 }

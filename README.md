@@ -40,7 +40,7 @@ Demuxing, decoding, encoding and muxing are done by [node-av](https://github.com
 npm install @seydx/rtsp node-av
 ```
 
-Requires Node.js 24 or newer. node-av brings its own FFmpeg, no separate install is needed.
+Requires Node.js 24 or newer. node-av brings its own FFmpeg, no separate install is needed. The lgpl and light builds of node-av work too, installed under the node-av name: `npm install @seydx/rtsp node-av@npm:node-av-light`.
 
 ## Quick Start
 
