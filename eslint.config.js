@@ -118,6 +118,7 @@ export default [
       '@stylistic/generator-star-spacing': ['error', { before: true, after: false }],
 
       // Stylistic specific rules
+      '@stylistic/list-style': 'off',
       '@stylistic/max-len': ['error', { code: 170, tabWidth: 2 }],
       '@stylistic/quotes': ['error', 'single', { avoidEscape: true }],
       '@stylistic/operator-linebreak': 'off',
