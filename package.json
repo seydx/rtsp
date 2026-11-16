@@ -24,6 +24,7 @@
     }
   },
   "scripts": {
+    "audit": "npm audit fix --min-release-age=0",
     "build": "rimraf dist && vite build",
     "type-check": "tsc --noEmit",
     "type-check:examples": "tsc -p tsconfig.examples.json",
@@ -102,8 +103,8 @@
     "url": "git+https://github.com/seydx/rtsp.git"
   },
   "allowScripts": {
-    "esbuild@0.28.1": true,
-    "fsevents@2.3.3": true,
+    "esbuild": true,
+    "fsevents": true,
     "node-av-light": true
   }
 }
