@@ -62,7 +62,7 @@
     "eslint": "9.39.2",
     "eslint-plugin-jsdoc": "^65.4.7",
     "globals": "^17.14.0",
-    "node-av": "npm:node-av-light@^7.1.0",
+    "node-av": "npm:node-av-light@^7.1.1-beta.1",
     "prettier": "^3.10.1",
     "rimraf": "^6.1.4",
     "tsx": "^4.23.15",
