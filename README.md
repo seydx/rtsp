@@ -198,6 +198,16 @@ await new RtspServerSink(relay, {
 
 The server emits every talkback packet as `backchannel` and the bursts as `backchannel:start` and `backchannel:stop`, so devices with proprietary talkback can be fed with a `BackchannelTranscoder`. One viewer talks at a time: the first one to send keeps the backchannel until it stays silent for `idleTimeout` or leaves, talkback of other viewers is dropped meanwhile.
 
+A server without relay offers only the talkback media, for devices whose viewers get the video from elsewhere, for example a second source next to the camera's own RTSP stream in go2rtc:
+
+```typescript
+const talk = await new RtspServerSink(undefined, {
+  path: 'talk',
+  backchannel: { advertise: { codec: 'pcm_alaw', payloadType: 8, clockRate: 8000, channels: 1 } },
+}).listen();
+talk.on('backchannel', (rtp) => transcoder.push(rtp));
+```
+
 ## Raw Audio Frames
 
 Some devices deliver bare audio frames without any container, for example raw AAC-ELD. `RawAudioTranscoder` turns them into an ADTS stream that a source can demux:
