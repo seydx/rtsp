@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `RtspServerSink` works without a relay: `new RtspServerSink(undefined, { backchannel: { advertise } })` offers only the talkback media. It suits devices whose viewers get the video from elsewhere, as a second source next to the camera's own stream.
+
+### Fixed
+
+- `BackchannelTranscoder` keeps talkback whose RTP timestamp does not advance. go2rtc sends audio files played to a camera that way, and most of it was dropped.
+- `BackchannelTranscoder.close()` hands out the audio the encoder still holds, so the end of a talk burst is no longer cut short.
+
 ## [2.1.0] - 2026-10-18
 
 ### Added
