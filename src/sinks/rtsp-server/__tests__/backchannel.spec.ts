@@ -1,7 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { buildRtp, Fixtures, hasFfmpeg, until } from '../../../__tests__/helpers/media.js';
+import { buildRtp, Fixtures, hasFfmpeg, RtspTestClient, until } from '../../../__tests__/helpers/media.js';
 import { Relay } from '../../../relay.js';
 import { AvSource } from '../../../sources/av.js';
 import { isRtcp } from '../../../util/rtp.js';
@@ -260,5 +260,51 @@ suite('RtspServerSink talkback forwarding', () => {
     } finally {
       server.close();
     }
+  });
+});
+
+describe('RtspServerSink without relay', () => {
+  const advertise = { codec: 'pcm_mulaw', payloadType: 0, clockRate: 8000, channels: 1 };
+
+  it('serves the talkback media alone and emits what a viewer sends', async () => {
+    const server = await new RtspServerSink(undefined, { path: 'talk', backchannel: { advertise, idleTimeout: 300 } }).listen();
+    const port = Number(/:(\d+)\//.exec(server.url)![1]);
+    const base = `rtsp://127.0.0.1:${port}/talk`;
+    const received: Buffer[] = [];
+    const events: string[] = [];
+    server.on('backchannel', (rtp) => received.push(rtp));
+    server.on('backchannel:start', () => events.push('start'));
+    server.on('backchannel:stop', () => events.push('stop'));
+
+    const client = await RtspTestClient.connect(port);
+    try {
+      const describe = await client.request('DESCRIBE', base, { Require: 'www.onvif.org/ver20/backchannel' });
+      expect(describe.status).toBe(200);
+      expect(describe.body.match(/^m=/gm)).toHaveLength(1);
+      expect(describe.body).toContain('m=audio 0 RTP/AVP 0');
+      expect(describe.body).toContain('a=sendonly');
+      expect(describe.body).toContain('a=control:streamid=0');
+
+      const setup = await client.request('SETUP', `${base}/streamid=0`, { Transport: 'RTP/AVP/TCP;unicast;interleaved=0-1' });
+      expect(setup.status).toBe(200);
+      const play = await client.request('PLAY', base, { Session: setup.headers.session.split(';')[0] });
+      expect(play.status).toBe(200);
+      expect(server.viewers).toBe(1);
+
+      const packet = buildRtp(0, 1, 0, MULAW_SILENCE);
+      client.sendInterleaved(0, packet);
+      await until(() => received.length === 1, 3000, 'talkback packet');
+      expect(received[0]).toEqual(packet);
+      await until(() => events.length === 2, 3000, 'talkback idle stop');
+      expect(events).toEqual(['start', 'stop']);
+    } finally {
+      client.close();
+      await server.shutdown();
+    }
+  });
+
+  it('needs an advertised format', () => {
+    expect(() => new RtspServerSink(undefined, { backchannel: true })).toThrow(/backchannel\.advertise/);
+    expect(() => new RtspServerSink(undefined)).toThrow(/backchannel\.advertise/);
   });
 });

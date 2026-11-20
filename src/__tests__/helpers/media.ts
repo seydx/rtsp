@@ -202,6 +202,12 @@ export class RtspTestClient {
     });
   }
 
+  sendInterleaved(channel: number, payload: Buffer): void {
+    const header = Buffer.from([0x24, channel, 0, 0]);
+    header.writeUInt16BE(payload.length, 2);
+    this.socket.write(Buffer.concat([header, payload]));
+  }
+
   waitClosed(): Promise<void> {
     return this.closedPromise;
   }

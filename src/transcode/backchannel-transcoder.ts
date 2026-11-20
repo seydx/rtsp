@@ -105,6 +105,7 @@ export interface BackchannelTranscoderOptions {
 }
 
 const AAC_FRAME_SAMPLES = 1024;
+const PCM_SAMPLE_BYTES: Record<string, number> = { pcm_mulaw: 1, pcm_alaw: 1, pcm_s16be: 2 };
 
 /**
  * Converts talkback RTP from one audio codec to another.
@@ -136,6 +137,7 @@ export class BackchannelTranscoder {
   private pipeline?: AudioPipeline;
   private output?: ByteOutput;
   private clock = new RtpClock();
+  private nextPts?: bigint;
   private readonly aac: boolean;
   private readonly rtpOutput: boolean;
 
@@ -201,6 +203,7 @@ export class BackchannelTranscoder {
     }
     this.pipeline = pipeline;
     this.clock = new RtpClock();
+    this.nextPts = undefined;
   }
 
   /**
@@ -224,10 +227,11 @@ export class BackchannelTranscoder {
     const packet = parseRtp(rtp);
     if (packet?.payloadType !== this.options.from.payloadType || packet.payload.length === 0) return;
 
-    const pts = this.clock.extend(packet.timestamp);
+    const units = this.aac ? splitAacAccessUnits(packet.payload) : undefined;
+    const samples = units ? units.length * AAC_FRAME_SAMPLES : pcmSamples(this.options.from, packet.payload.length);
+    const pts = this.continuous(this.clock.extend(packet.timestamp), samples);
     try {
-      if (this.aac) {
-        const units = splitAacAccessUnits(packet.payload);
+      if (units) {
         for (let i = 0; i < units.length; i++) output.write(pipeline.transcodeData(units[i], pts + BigInt(i * AAC_FRAME_SAMPLES)));
       } else {
         output.write(pipeline.transcodeData(packet.payload, pts));
@@ -240,7 +244,8 @@ export class BackchannelTranscoder {
   }
 
   /**
-   * Release the codecs. Safe to call more than once; {@link BackchannelTranscoder.start} works again afterwards.
+   * Hand out the audio the encoder still holds and release the codecs. Safe to
+   * call more than once; {@link BackchannelTranscoder.start} works again afterwards.
    *
    * @example
    * ```typescript
@@ -253,9 +258,11 @@ export class BackchannelTranscoder {
     this.pipeline = undefined;
     this.output = undefined;
     try {
+      // the encoder still holds the tail of the audio
+      if (pipeline && output) output.write(pipeline.flush());
       output?.close();
     } catch (error) {
-      this.options.logger?.debug?.('[rtsp] backchannel muxer close failed:', error);
+      this.options.logger?.debug?.('[rtsp] backchannel flush failed:', error);
     }
     pipeline?.close();
   }
@@ -272,4 +279,41 @@ export class BackchannelTranscoder {
     if (this.rtpOutput && isRtcp(chunk)) return;
     this.options.output(chunk);
   }
+
+  /**
+   * Start a packet no earlier than the end of the previous one.
+   *
+   * Some senders repeat one RTP timestamp for every packet, go2rtc does it for
+   * audio files played to a camera. The encoder would drop such overlapping
+   * audio, so the timeline continues where the previous packet ended.
+   *
+   * @param pts - The packet's timestamp on the extended RTP timeline
+   *
+   * @param samples - Samples in the packet, `undefined` when the codec does not tell without decoding
+   *
+   * @returns The timestamp to transcode the packet at
+   *
+   * @internal
+   */
+  private continuous(pts: bigint, samples: number | undefined): bigint {
+    const start = this.nextPts !== undefined && pts < this.nextPts ? this.nextPts : pts;
+    this.nextPts = samples === undefined ? undefined : start + BigInt(samples);
+    return start;
+  }
+}
+
+/**
+ * Samples in a PCM or G.711 payload.
+ *
+ * @param format - The input format
+ *
+ * @param bytes - Payload size
+ *
+ * @returns The sample count, `undefined` for compressed codecs
+ *
+ * @internal
+ */
+function pcmSamples(format: BackchannelFormat, bytes: number): number | undefined {
+  const width = PCM_SAMPLE_BYTES[format.codec] as number | undefined;
+  return width ? Math.floor(bytes / (width * format.channels)) : undefined;
 }

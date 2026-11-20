@@ -65,6 +65,9 @@ export interface RtspServerSinkOptions {
    * emitted as `backchannel`. If the source supports talkback, it is also
    * forwarded to it, transcoded when the formats differ.
    *
+   * A server without relay offers only this talkback media and needs
+   * `advertise`.
+   *
    * @default false
    */
   backchannel?: boolean | RtspBackchannelOptions;
@@ -201,6 +204,8 @@ interface Talkback {
 }
 
 const DEFAULT_TALKBACK_IDLE_MS = 2000;
+// session part of the SDP of a server without relay, the talkback media follows
+const TALKBACK_ONLY_SDP = ['v=0', 'o=- 0 0 IN IP4 127.0.0.1', 's=Talkback', 'c=IN IP4 0.0.0.0', 't=0 0'].join('\r\n');
 
 /**
  * Serves a relay to many viewers over RTSP.
@@ -242,6 +247,17 @@ const DEFAULT_TALKBACK_IDLE_MS = 2000;
  * }).listen();
  * ```
  *
+ * @example
+ * ```typescript
+ * import { RtspServerSink } from '@seydx/rtsp';
+ *
+ * // talkback only, for a camera whose video viewers get from elsewhere
+ * const server = await new RtspServerSink(undefined, {
+ *   backchannel: { advertise: { codec: 'pcm_alaw', payloadType: 8, clockRate: 8000, channels: 1 } },
+ * }).listen();
+ * server.on('backchannel', (rtp) => speaker.push(rtp));
+ * ```
+ *
  * @see {@link Relay} For the stream it serves
  *
  * @see {@link RtspAuth} For viewer authentication
@@ -279,9 +295,12 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
   /**
    * Create a server for a relay. Nothing listens until {@link RtspServerSink.listen}.
    *
-   * @param relay - The relay to serve; the server pipes itself into it on demand
+   * @param relay - The relay to serve; the server pipes itself into it on demand.
+   * `undefined` serves talkback only, see {@link RtspServerSinkOptions.backchannel}
    *
    * @param options - Network, auth, transcoding and talkback options
+   *
+   * @throws {Error} Without relay and without `backchannel.advertise`
    *
    * @example
    * ```typescript
@@ -289,7 +308,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    * ```
    */
   constructor(
-    private readonly relay: Relay,
+    private readonly relay: Relay | undefined,
     private readonly options: RtspServerSinkOptions = {},
   ) {
     super();
@@ -303,6 +322,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     this.logger = options.logger;
     // the relay feeds the transcoder, which initializes this server once every track has output
     this.attachment = options.transcode ? new TranscodeSink(this, { ...options.transcode, timeout: this.sdpTimeout, logger: this.logger }) : this;
+    if (!relay) this.serveTalkbackOnly();
   }
 
   /**
@@ -408,7 +428,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     const server = this.server;
     this.server = undefined;
     if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
-    if (this.piped) await this.relay.unpipe(this.attachment);
+    if (this.piped) await this.relay?.unpipe(this.attachment);
   }
 
   /**
@@ -539,7 +559,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
     this.cancelDetach();
     // only yield when needed, a close in between would swap the SDP this describe has to wait for
     if (this.detaching) await this.detaching;
-    if (!this.piped) {
+    if (this.relay && !this.piped) {
       this.piped = true;
       this.relay.pipe(this.attachment);
     }
@@ -652,6 +672,21 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
   }
 
   /**
+   * Publish the SDP of a server without relay: the talkback media alone, at track 0.
+   *
+   * @throws {Error} Without `backchannel.advertise`
+   *
+   * @internal
+   */
+  private serveTalkbackOnly(): void {
+    const option = this.options.backchannel;
+    if (typeof option !== 'object' || !option.advertise) throw new Error('RtspServerSink: a server without relay needs backchannel.advertise');
+    this.setupTalkback(undefined);
+    this.sdpReady = true;
+    this.sdp.resolve(appendTalkback(TALKBACK_ONLY_SDP, this.talkback));
+  }
+
+  /**
    * Decide the advertised talkback format for this stream.
    *
    * @param upstream - The upstream's talkback format, if any
@@ -686,8 +721,8 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    * @internal
    */
   private forwardTalkback(talkback: Talkback, rtp: Buffer): void {
-    const source = this.relay.source;
-    if (!supportsBackchannel(source)) return;
+    const source = this.relay?.source;
+    if (!source || !supportsBackchannel(source)) return;
     const camera = source.backchannel;
     if (!camera) return;
 
@@ -876,7 +911,7 @@ export class RtspServerSink extends TypedEmitter<RtspServerEvents> implements Si
    * @internal
    */
   private detachNow(): void {
-    if (this.sessions.size > 0 || !this.piped) return;
+    if (this.sessions.size > 0 || !this.piped || !this.relay) return;
     this.detaching = this.relay.unpipe(this.attachment).finally(() => (this.detaching = undefined));
   }
 

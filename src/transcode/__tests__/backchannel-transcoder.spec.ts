@@ -24,6 +24,12 @@ function run(options: Omit<BackchannelTranscoderOptions, 'output'>, inbound: Buf
   return out;
 }
 
+function adtsFrames(chunks: Buffer[]): number {
+  return chunks.reduce((count, chunk) => count + (chunk[0] === 0xff && (chunk[1] & 0xf0) === 0xf0 ? 1 : 0), 0);
+}
+
+const AAC_16K = { codec: 'aac', sampleRate: 16000, channels: 1, format: 'adts' } as const;
+
 suite('BackchannelTranscoder', () => {
   let fixtures: Fixtures;
   let mulaw: Buffer[];
@@ -59,6 +65,20 @@ suite('BackchannelTranscoder', () => {
     const out = run({ from: MULAW, to: { codec: 'pcm_s16le', sampleRate: 8000, channels: 1, format: 's16le' } }, mulaw);
     // one second of 8 kHz mono s16
     expect(Buffer.concat(out).length).toBe(16_000);
+  });
+
+  it('keeps the timeline moving when the sender repeats one RTP timestamp', () => {
+    const frozen = mulaw.map((rtp) => {
+      const copy = Buffer.from(rtp);
+      copy.writeUInt32BE(1234, 4);
+      return copy;
+    });
+    expect(adtsFrames(run({ from: MULAW, to: AAC_16K }, frozen))).toBe(adtsFrames(run({ from: MULAW, to: AAC_16K }, mulaw)));
+  });
+
+  it('hands out the tail the encoder holds when it closes', () => {
+    // one second at 16 kHz fills 15.6 frames of 1024 samples
+    expect(adtsFrames(run({ from: MULAW, to: AAC_16K }, mulaw))).toBeGreaterThanOrEqual(16);
   });
 
   it('encodes AAC as ADTS with resampling', () => {
