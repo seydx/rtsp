@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.12] - 2026-11-20
+
 ### Added
 
 - `RtspServerSink` works without a relay: `new RtspServerSink(undefined, { backchannel: { advertise } })` offers only the talkback media. It suits devices whose viewers get the video from elsewhere, as a second source next to the camera's own stream.
